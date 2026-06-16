@@ -9,29 +9,26 @@
 #include <event2/event.h>
 #include <xquic/xquic.h>
 
-#define PORT 8443
+
 #define MAX_MSG 1024
 
-/* Target configuration for the hardcoded backend service */
+// config
 #define BACKEND_IP "127.0.0.1"
 #define BACKEND_PORT 7778
-
 #define QUIC_PORT 8000
 
 static struct event_base *eb = NULL;
 static xqc_engine_t *engine = NULL;
 static struct event *timer_ev = NULL;
-static int listen_fd = -1;
+static int quic_fd = -1;
 
+// ctx structure
 typedef struct {
     xqc_engine_t *engine;
-    int quic_fd;
     xqc_connection_t *conn;
     int udp_fd;
     struct sockaddr_in udp_client;
 } quic_ctx_t;
-
-/* Global reference pointer to track active proxy context across data-plane handlers */
 static quic_ctx_t *g_proxy_ctx = NULL;
 
 static xqc_usec_t get_timestamp(void) {
@@ -40,7 +37,7 @@ static xqc_usec_t get_timestamp(void) {
     return (xqc_usec_t)tv.tv_sec * 1000000 + tv.tv_usec;
 }
 
-/* Asynchronous handler for incoming third-party UDP traffic from backend service */
+// UDP socket callback
 static void proxy_udp_read_cb(int fd, short what, void *arg) {
     quic_ctx_t *ctx = (quic_ctx_t *)arg;
     unsigned char buf[1500];
@@ -61,14 +58,16 @@ static void proxy_udp_read_cb(int fd, short what, void *arg) {
     }
 }
 
+// QUIC logging callback
 static void log_write(xqc_log_level_t lvl, const void *buf, size_t size, void *arg) {
     printf("%.*s", (int)size, (char*)buf);
 }
 
+// QUIC socket callbacks
 static ssize_t write_socket(const unsigned char *buf, size_t size,
                             const struct sockaddr *peer_addr, socklen_t peer_addrlen,
                             void *user_data) {
-    return sendto(listen_fd, buf, size, 0, peer_addr, peer_addrlen);
+    return sendto(quic_fd, buf, size, 0, peer_addr, peer_addrlen);
 }
 
 static ssize_t write_socket_ex(uint64_t path_id, const unsigned char *buf, size_t size,
@@ -77,11 +76,11 @@ static ssize_t write_socket_ex(uint64_t path_id, const unsigned char *buf, size_
     return write_socket(buf, size, peer_addr, peer_addrlen, user_data);
 }
 
+// QUIC server accept callback
 static int server_accept(xqc_engine_t *eng, xqc_connection_t *conn,
                          const xqc_cid_t *cid, void *user_data) {
-    printf("[server] New connection accepted\n");
+    printf("[server] new connection accepted\n");
 
-    // Instantiation: Allocate memory for context on new client tunnel connection
     quic_ctx_t *ctx = malloc(sizeof(quic_ctx_t));
     if (!ctx) {
         return -1;
@@ -90,6 +89,7 @@ static int server_accept(xqc_engine_t *eng, xqc_connection_t *conn,
     ctx->engine = eng;
     ctx->conn = conn;
 
+    // create UDP socket
     ctx->udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (ctx->udp_fd >= 0) {
         fcntl(ctx->udp_fd, F_SETFL, O_NONBLOCK);
@@ -103,23 +103,19 @@ static int server_accept(xqc_engine_t *eng, xqc_connection_t *conn,
             perror("[server-proxy] bind backend proxy port failed");
         }
 
-        // Add back to event base to capture incoming backend traffic
+        // add UDP socket to libevent loop
         struct event *proxy_ev = event_new(eb, ctx->udp_fd, EV_READ | EV_PERSIST, proxy_udp_read_cb, ctx);
         event_add(proxy_ev, NULL);
-        printf("[server-proxy] Listening for external backend traffic on port 6000...\n");
+        printf("[server-proxy] listening for external backend traffic on port 6000...\n");
     }
-
-    /* FIX: Explicitly hardcode the default backend target address variables here */
     memset(&ctx->udp_client, 0, sizeof(ctx->udp_client));
     ctx->udp_client.sin_family = AF_INET;
     ctx->udp_client.sin_port = htons(BACKEND_PORT);
     inet_pton(AF_INET, BACKEND_IP, &ctx->udp_client.sin_addr);
-    printf("[server-proxy] Hardcoded backend target set to %s:%d\n", BACKEND_IP, BACKEND_PORT);
 
-    // Cache to global reference to safeguard layer callbacks
+    // save global ctx
     g_proxy_ctx = ctx;
 
-    // Bind instance inside connection's internal ALPN layer data structures
     xqc_conn_set_alp_user_data(conn, ctx);
 
     return 0;
@@ -130,14 +126,16 @@ static int cert_verify_cb(const unsigned char *certs[], const size_t cert_len[],
     return 1;
 }
 
+// QUIC stream callbacks
 static int stream_create_notify(xqc_stream_t *strm, void *user_data) { return 0; }
 static int stream_close_notify(xqc_stream_t *strm, void *user_data) { return 0; }
 static int stream_read_notify(xqc_stream_t *strm, void *user_data) { return 0; }
 static int stream_write_notify(xqc_stream_t *strm, void *user_data) { return 0; }
 
+// QUIC connection callbacks
 static int conn_create_notify(xqc_connection_t *conn, const xqc_cid_t *cid, void *user_data, void *proto_data) { return 0; }
 static int conn_close_notify(xqc_connection_t *conn, const xqc_cid_t *cid, void *user_data, void *proto_data) { 
-    printf("[server] Connection closed\n");
+    printf("[server] connection closed\n");
     quic_ctx_t *ctx = g_proxy_ctx;
     if (ctx) {
         if (ctx->udp_fd >= 0) close(ctx->udp_fd);
@@ -148,43 +146,37 @@ static int conn_close_notify(xqc_connection_t *conn, const xqc_cid_t *cid, void 
     }
     return 0; 
 }
-
 static void conn_handshake_finished(xqc_connection_t *conn, void *user_data, void *proto_data) {
-    printf("[server] Handshake finished\n");
+    printf("[server] handshake finished\n");
 }
 
-/* Forwards packet payload received over QUIC straight to your hardcoded Netcat backend */
+// QUIC datagram callbacks
 static void datagram_read_notify(xqc_connection_t *conn, void *user_data, const void *data, size_t data_len, uint64_t flags) {
     printf("[server] Received %zd bytes over MPQUIC tunnel: %.*s\n", data_len, (int)data_len, (char*)data);
     
-    // Read from the active cached proxy context pointer safely
     quic_ctx_t *ctx = g_proxy_ctx;
-
     if (ctx == NULL) {
         fprintf(stderr, "[server-proxy] Error: Global target proxy context is uninitialized!\n");
         return;
     }
 
-    // Forward down to backend target structure initialized in server_accept
+    // if udp client, forward datagram
     if (ctx->udp_client.sin_port != 0) {
-        printf("[server-proxy] Routing reply back out through UDP port 6000 to hardcoded backend target port %d...\n", 
-               ntohs(ctx->udp_client.sin_port));
-        
         ssize_t sent = sendto(ctx->udp_fd, data, data_len, 0, 
                               (struct sockaddr*)&ctx->udp_client, sizeof(ctx->udp_client));
         if (sent < 0) {
             fprintf(stderr, "[server-proxy] sendto failed with error: %s\n", strerror(errno));
         }
     } else {
-        printf("[server-proxy] Warning: No proxy target destination structure active.\n");
+        printf("[server-proxy] warning: No proxy target destination structure active.\n");
     }
 }
-
 static void datagram_write_notify(xqc_connection_t *conn, void *user_data) {}
 
+// QUIC multipath callbacks
 void ready_to_create_path_notify(const xqc_cid_t *cid, void *user_data) {}
 int path_created_notify(xqc_connection_t *conn, const xqc_cid_t *cid, uint64_t path_id, void *user_data){  
-    printf("[multipath] Sub-path %lu established successfully.\n", path_id);
+    printf("[multipath] sub-path %lu established successfully.\n", path_id);
     return 0;
 }
 
@@ -226,11 +218,13 @@ static void engine_timer_cb(int fd, short what, void *arg) {
     event_add(timer_ev, &tv);
 }
 
+// QUIC packet read callback
 static void packet_read_cb(int fd, short what, void *arg) {
     unsigned char buf[1500];
     struct sockaddr_in peer_addr, local_addr;
     socklen_t local_len = sizeof(local_addr);
 
+    // parse dst addr of incoming packet
     struct iovec iov;
     iov.iov_base = buf;
     iov.iov_len = sizeof(buf);
@@ -276,16 +270,19 @@ int main(void) {
     xqc_transport_callbacks_t trans_cb = {0};
     struct sockaddr_in addr;
 
-    printf("[server] Starting\n");
+    printf("[server] starting\n");
     eb = event_base_new();
     if (!eb) return -1;
 
     xqc_engine_get_default_config(&cfg, XQC_ENGINE_SERVER);
     cfg.cfg_log_level = XQC_LOG_INFO;
     eng_cb.set_event_timer = set_event_timer;
+
+    // define QUIC engine callbacks
     eng_cb.log_callbacks.xqc_log_write_err = log_write;
     eng_cb.log_callbacks.xqc_log_write_stat = log_write;
 
+    // define QUIC transport callbacks
     trans_cb.server_accept = server_accept;
     trans_cb.write_socket = write_socket;
     trans_cb.write_socket_ex = write_socket_ex;
@@ -293,11 +290,13 @@ int main(void) {
     trans_cb.ready_to_create_path_notify = ready_to_create_path_notify;
     trans_cb.path_created_notify = path_created_notify;
 
+    // define SSL config
     ssl_cfg.private_key_file = "server.key";
     ssl_cfg.cert_file = "server.crt";
     ssl_cfg.ciphers = XQC_TLS_CIPHERS;
     ssl_cfg.groups = XQC_TLS_GROUPS;
 
+    // define QUIC connection settings
     conn_settings.proto_version = XQC_VERSION_V1;
     conn_settings.enable_multipath = 1;
     conn_settings.max_datagram_frame_size = 65535;
@@ -306,30 +305,33 @@ int main(void) {
     conn_settings.reinj_ctl_callback = xqc_dgram_reinj_ctl_cb;
     conn_settings.mp_ping_on = 1;
 
+    // create QUIC engine
     engine = xqc_engine_create(XQC_ENGINE_SERVER, &cfg, &ssl_cfg, &eng_cb, &trans_cb, NULL);
     if (!engine) { fprintf(stderr, "Engine creation failed\n"); return -1; }
-    printf("Engine created\n");
-
+    printf("engine created\n");
     xqc_server_set_conn_settings(engine, &conn_settings);
-
     if (register_alpn(engine) != 0) { fprintf(stderr, "ALPN registration failed\n"); return -1; }
 
-    listen_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (listen_fd < 0) return -1;
-    fcntl(listen_fd, F_SETFL, O_NONBLOCK);
+    // create QUIC socket
+    quic_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (quic_fd < 0) return -1;
+    fcntl(quic_fd, F_SETFL, O_NONBLOCK);
     int reuse = 1;
-    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    setsockopt(quic_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
     int opt = 1;
-    setsockopt(listen_fd, IPPROTO_IP, IP_PKTINFO, &opt, sizeof(opt));
+    setsockopt(quic_fd, IPPROTO_IP, IP_PKTINFO, &opt, sizeof(opt));
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
     addr.sin_port = htons(QUIC_PORT);
-    if (bind(listen_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) { perror("bind"); return -1; }
-    printf("Listening on port %d\n", QUIC_PORT);
+    if (bind(quic_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) { perror("bind"); return -1; }
+    printf("listening on port %d\n", QUIC_PORT);
 
-    struct event *sock_ev = event_new(eb, listen_fd, EV_READ | EV_PERSIST, packet_read_cb, NULL);
+    // add QUIC socket to libevent loop
+    struct event *sock_ev = event_new(eb, quic_fd, EV_READ | EV_PERSIST, packet_read_cb, NULL);
     event_add(sock_ev, NULL);
+
+    // add engine timer to libevent loop
     timer_ev = event_new(eb, -1, 0, engine_timer_cb, NULL);
     struct timeval tv = {0, 10000};
     event_add(timer_ev, &tv);
@@ -337,7 +339,7 @@ int main(void) {
     event_base_dispatch(eb);
 
     xqc_engine_destroy(engine);
-    close(listen_fd);
+    close(quic_fd);
     event_base_free(eb);
     return 0;
 }

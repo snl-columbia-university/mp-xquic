@@ -9,9 +9,15 @@
 #include <event2/event.h>
 #include <xquic/xquic.h>
 
-#define PORT 8443
+
 #define MAX_MSG 1024
 #define MAX_PATHS 2
+
+// config
+#define UDP_PORT 7778
+#define PATH1_IP "45.63.15.235"
+#define PATH2_IP "184.164.242.64"
+#define PATH_PORT 8000
 
 static struct event_base *eb = NULL;
 static xqc_engine_t *engine = NULL;
@@ -20,6 +26,7 @@ static int sock_fd = -1;
 static xqc_cid_t cid;
 static xqc_stream_t *stream = NULL;
 
+// ctx structure
 typedef struct {
     xqc_engine_t *engine;
     int quic_fd;
@@ -36,33 +43,33 @@ static xqc_usec_t get_timestamp(void) {
     return (xqc_usec_t)tv.tv_sec * 1000000 + tv.tv_usec;
 }
 
-/* Asynchronous handler for incoming third-party UDP traffic */
+// UDP socket callback
 static void proxy_udp_read_cb(int fd, short what, void *arg) {
     quic_ctx_t *ctx = (quic_ctx_t *)arg;
     unsigned char buf[1500];
     struct sockaddr_in src_addr;
     socklen_t src_len = sizeof(src_addr);
 
-    // Drain the local UDP socket
+    // recv from UDP socket
     while (1) {
         ssize_t n = recvfrom(fd, buf, sizeof(buf), 0, (struct sockaddr*)&src_addr, &src_len);
         if (n <= 0) {
-            break; // No more packets left to process right now
+            break;
         }
         ctx->udp_client = src_addr;
-        // If the MPQUIC path tunnel is established, pipe it straight out
+        // send to QUIC datagram API
         if (ctx->conn) {
             xqc_datagram_send(ctx->conn, buf, n, NULL, 1);
         }
     }
 }
 
-/* Log callback */
+// QUIC logging callback
 static void log_write(xqc_log_level_t lvl, const void *buf, size_t size, void *arg) {
     printf("%.*s", (int)size, (char*)buf);
 }
 
-/* Socket write */
+// QUIC socket callbacks
 static ssize_t write_socket(const unsigned char *buf, size_t size,
                             const struct sockaddr *peer_addr, socklen_t peer_addrlen,
                             void *user_data) {
@@ -74,6 +81,7 @@ static ssize_t write_socket_ex(uint64_t path_id, const unsigned char *buf, size_
                                void *user_data) {
     quic_ctx_t *ctx = (quic_ctx_t *)user_data;  
     struct sockaddr_in *srv_addr;
+    // ignore QUIC provided addr, forward to correct path
     switch (path_id) {
         case 0:
             srv_addr = &ctx->server_addrs[0];
@@ -82,7 +90,7 @@ static ssize_t write_socket_ex(uint64_t path_id, const unsigned char *buf, size_
             srv_addr = &ctx->server_addrs[1];
             break;
         default:
-            fprintf(stderr, "Invalid path_id: %lu\n", path_id);
+            fprintf(stderr, "invalid path_id: %lu\n", path_id);
             return -1;
     }           
     return write_socket(buf, size, (const struct sockaddr *)srv_addr, sizeof(*srv_addr), user_data);
@@ -95,29 +103,23 @@ static int cert_verify_cb(const unsigned char *certs[], const size_t cert_len[],
     return 1;
 }
 
-/* Stream callbacks */
-static int stream_create_notify(xqc_stream_t *strm, void *user_data) { 
-    printf("[client] Stream created\n");
-    return 0; 
-}
-static int stream_close_notify(xqc_stream_t *strm, void *user_data) { 
-    printf("[client] Stream closed\n");
-    return 0; 
-}
-static int stream_read_notify(xqc_stream_t *strm, void *user_data) { return 0;}
+// QUIC stream callbacks
+static int stream_create_notify(xqc_stream_t *strm, void *user_data) { return 0; }
+static int stream_close_notify(xqc_stream_t *strm, void *user_data) { return 0; }
+static int stream_read_notify(xqc_stream_t *strm, void *user_data) { return 0; }
 static int stream_write_notify(xqc_stream_t *strm, void *user_data) { return 0; }
 
-/* Connection callbacks */
+// QUIC connection callbacks
 static int conn_create_notify(xqc_connection_t *conn, const xqc_cid_t *cid, void *user_data, void *proto_data) { 
-    printf("[client] Connection created\n");
+    printf("[client] connection created\n");
     return 0; 
 }
 static int conn_close_notify(xqc_connection_t *conn, const xqc_cid_t *cid, void *user_data, void *proto_data) { 
-    printf("[client] Connection closed\n");
+    printf("[client] connection closed\n");
     return 0; 
 }
 static void conn_handshake_finished(xqc_connection_t *conn, void *user_data, void *proto_data) {
-    printf("[client] Handshake finished, proxy routing is now active.\n");
+    printf("[client] handshake finished, proxy routing is now active.\n");
     quic_ctx_t *ctx = (quic_ctx_t *)user_data;
     ctx->conn = conn;
 }
@@ -125,40 +127,33 @@ static void conn_handshake_finished(xqc_connection_t *conn, void *user_data, voi
 static void save_token_cb(const unsigned char *token, unsigned int token_len, void *user_data) { return; }
 static void save_session_cb(const  char *data, size_t data_len, void *user_data) { return; }
 
+// QUIC multipath callbacks
 void ready_to_create_path_notify(const xqc_cid_t *cid, void *user_data) 
 {
-    printf("[multipath] handshake complete.\n");
     quic_ctx_t *ctx = (quic_ctx_t *)user_data; 
     uint64_t new_path_id = 0;
+    // create a new path
     int ret = xqc_conn_create_path(ctx->engine, cid, &new_path_id, 0);
-
     if (ret < 0) {
         printf("[multipath] failed to create new path. Error code: %d\n", ret);
     } else {
-        printf("[multipath] successfully initiated path id: %li\n", new_path_id);
+        printf("[multipath] created new path with id %lu\n", new_path_id);
     }
 }
+int path_created_notify(xqc_connection_t *conn, const xqc_cid_t *cid, uint64_t path_id, void *user_data) { return 0; }
 
-int path_created_notify(xqc_connection_t *conn, const xqc_cid_t *cid, uint64_t path_id, void *user_data){  
-    printf("[multipath] path created.\n");
-    return 0;
-}
-
+// QUIC datagram callbacks
 static void datagram_read_notify(xqc_connection_t *conn, void *user_data, const void *data, size_t data_len, uint64_t flags) {
     printf("[client] Received echo back from server: %.*s\n", (int)data_len, (char*)data);
     
     quic_ctx_t *ctx = g_proxy_ctx;
-
-    // Safety guard to ensure context initialization completed cleanly
     if (ctx == NULL) {
         fprintf(stderr, "[proxy] Error: Global proxy context memory block is uninitialized!\n");
         return;
     }
 
-    // Verify we actually have a valid client address stored
+    // if udp client, forward datagram
     if (ctx->udp_client.sin_port != 0) {
-        printf("[proxy] Routing reply back out through UDP port 5000...\n");
-        
         // Push the payload back out to your local UDP client ('nc')
         sendto(ctx->udp_fd, data, data_len, 0, 
                (struct sockaddr*)&ctx->udp_client, sizeof(ctx->udp_client));
@@ -166,7 +161,6 @@ static void datagram_read_notify(xqc_connection_t *conn, void *user_data, const 
 }
 static void datagram_write_notify(xqc_connection_t *conn, void *user_data) {}
 
-/* ALPN registration */
 static int register_alpn(xqc_engine_t *eng, quic_ctx_t *ctx) {
     xqc_conn_callbacks_t conn_cbs = {
         .conn_create_notify = conn_create_notify,
@@ -192,8 +186,6 @@ static int register_alpn(xqc_engine_t *eng, quic_ctx_t *ctx) {
     const char *alpn = "raw";
     return xqc_engine_register_alpn(eng, alpn, strlen(alpn), &ap_cbs, ctx);
 }
-
-/* Engine timer */
 static void set_event_timer(xqc_usec_t wake_after, void *user_data) {
     struct timeval tv;
     tv.tv_sec = wake_after / 1000000;
@@ -206,6 +198,8 @@ static void engine_timer_cb(int fd, short what, void *arg) {
     struct timeval tv = {0, 10000};
     event_add(timer_ev, &tv);
 }
+
+// QUIC packet read callback
 static void packet_read_cb(int fd, short what, void *arg) {
     unsigned char buf[1500];
     struct sockaddr_in peer_addr, local_addr;
@@ -231,16 +225,19 @@ int main(void) {
     xqc_transport_callbacks_t trans_cb = {0};
     struct sockaddr_in server_addr;
 
-    printf("[client] Starting\n");
+    printf("[client] starting\n");
     eb = event_base_new();
     if (!eb) return -1;
 
     xqc_engine_get_default_config(&cfg, XQC_ENGINE_CLIENT);
     cfg.cfg_log_level = XQC_LOG_INFO;
+
+    // define QUIC engine callbacks
     eng_cb.set_event_timer = set_event_timer;
     eng_cb.log_callbacks.xqc_log_write_err = log_write;
     eng_cb.log_callbacks.xqc_log_write_stat = log_write;
 
+    // define QUIC transport callbacks
     trans_cb.write_socket = write_socket;
     trans_cb.write_socket_ex = write_socket_ex;
     trans_cb.cert_verify_cb = cert_verify_cb;
@@ -249,59 +246,63 @@ int main(void) {
     trans_cb.ready_to_create_path_notify = ready_to_create_path_notify;
     trans_cb.path_created_notify = path_created_notify;
 
-
+    // define SSL/TLS settings
     ssl_cfg.ciphers = XQC_TLS_CIPHERS;
     ssl_cfg.groups = XQC_TLS_GROUPS;
 
+    // initialize global QUIC context
     quic_ctx_t ctx;
     g_proxy_ctx = &ctx;
 
+    // create QUIC engine
     ctx.engine = xqc_engine_create(XQC_ENGINE_CLIENT, &cfg, &ssl_cfg, &eng_cb, &trans_cb, &ctx);
     if (!ctx.engine) { fprintf(stderr, "Engine creation failed\n"); return -1; }
-    printf("Engine created\n");
-
+    printf("quic engine created\n");
     if (register_alpn(ctx.engine, &ctx) != 0) { fprintf(stderr, "ALPN registration failed\n"); return -1; }
 
+    // create QUIC socket
     ctx.quic_fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (ctx.quic_fd < 0) return -1;
     fcntl(ctx.quic_fd, F_SETFL, O_NONBLOCK);
     ctx.server_addrs[0].sin_family = AF_INET;
-    ctx.server_addrs[0].sin_port = htons(8443); 
-    inet_pton(AF_INET, "127.0.0.1", &ctx.server_addrs[0].sin_addr);
+    ctx.server_addrs[0].sin_port = htons(PATH_PORT); 
+    inet_pton(AF_INET, PATH1_IP, &ctx.server_addrs[0].sin_addr);
     ctx.server_addrs[1].sin_family = AF_INET;
-    ctx.server_addrs[1].sin_port = htons(8443); 
-    inet_pton(AF_INET, "127.0.0.2", &ctx.server_addrs[1].sin_addr);
+    ctx.server_addrs[1].sin_port = htons(PATH_PORT); 
+    inet_pton(AF_INET, PATH2_IP, &ctx.server_addrs[1].sin_addr);
 
+    // add QUIC socket to libevent loop
     struct event *sock_ev = event_new(eb, ctx.quic_fd, EV_READ | EV_PERSIST, packet_read_cb, &ctx);
     event_add(sock_ev, NULL);
     
-    // 1. Create a secondary UDP listening port (e.g., port 5000) for your proxy traffic
+    // create UDP socket
     ctx.udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (ctx.udp_fd < 0) return -1;
     fcntl(ctx.udp_fd, F_SETFL, O_NONBLOCK);
-    memset(&ctx.udp_client, 0, sizeof(ctx.udp_client)); // Clear address initialization
-
+    memset(&ctx.udp_client, 0, sizeof(ctx.udp_client));
     struct sockaddr_in proxy_local_addr;
     memset(&proxy_local_addr, 0, sizeof(proxy_local_addr));
     proxy_local_addr.sin_family = AF_INET;
-    proxy_local_addr.sin_port = htons(5000); // <-- Port where you will send raw traffic
+    proxy_local_addr.sin_port = htons(UDP_PORT);
     proxy_local_addr.sin_addr.s_addr = htonl(INADDR_ANY);
     bind(ctx.udp_fd, (struct sockaddr *)&proxy_local_addr, sizeof(proxy_local_addr));
 
-    // 2. Add the proxy handle to your existing libevent loop base 'eb'
+    // add UDP socket to libevent loop
     struct event *proxy_ev = event_new(eb, ctx.udp_fd, EV_READ | EV_PERSIST, proxy_udp_read_cb, &ctx);
     event_add(proxy_ev, NULL);
-    printf("[proxy] Listening for external UDP traffic on port 5000...\n");
+    printf("[proxy] Listening for external UDP traffic on port %d...\n", UDP_PORT);
 
+    // add QUIC engine timer to libevent loop
     timer_ev = event_new(eb, -1, 0, engine_timer_cb, &ctx);
     struct timeval tv = {0, 10000};
     event_add(timer_ev, &tv);
 
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(PORT);
-    inet_pton(AF_INET, "127.0.0.1", &server_addr.sin_addr);
+    server_addr.sin_port = htons(PATH_PORT);
+    inet_pton(AF_INET, PATH1_IP, &server_addr.sin_addr);
 
+    // define QUIC connection settings
     conn_settings.proto_version = XQC_VERSION_V1;
     conn_settings.enable_multipath = 1;
     conn_settings.max_datagram_frame_size = 65535;
@@ -310,6 +311,7 @@ int main(void) {
     conn_settings.reinj_ctl_callback = xqc_dgram_reinj_ctl_cb;
     conn_settings.mp_ping_on = 1;
 
+    // connect to QUIC server
     const xqc_cid_t *cidp = xqc_connect(ctx.engine, &conn_settings, NULL, 0, "localhost", 0,
                                         &conn_ssl_config,
                                         (struct sockaddr*)&server_addr,
