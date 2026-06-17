@@ -30,7 +30,6 @@ static xqc_stream_t *stream = NULL;
 typedef struct {
     xqc_engine_t *engine;
     int quic_fd;
-    struct sockaddr_in server_addrs[MAX_PATHS];
     xqc_connection_t *conn;
     int udp_fd;
     struct sockaddr_in udp_client;
@@ -78,22 +77,10 @@ static ssize_t write_socket(const unsigned char *buf, size_t size,
 }
 static ssize_t write_socket_ex(uint64_t path_id, const unsigned char *buf, size_t size,
                                const struct sockaddr *peer_addr, socklen_t peer_addrlen,
-                               void *user_data) {
-    quic_ctx_t *ctx = (quic_ctx_t *)user_data;  
-    struct sockaddr_in *srv_addr;
-    // ignore QUIC provided addr, forward to correct path
-    switch (path_id) {
-        case 0:
-            srv_addr = &ctx->server_addrs[0];
-            break;
-        case 1:
-            srv_addr = &ctx->server_addrs[1];
-            break;
-        default:
-            fprintf(stderr, "invalid path_id: %lu\n", path_id);
-            return -1;
-    }           
-    return write_socket(buf, size, (const struct sockaddr *)srv_addr, sizeof(*srv_addr), user_data);
+                               void *user_data) { 
+    printf("[client] write_socket_ex called for path_id %lu to %s:%d\n", path_id, 
+           inet_ntoa(((struct sockaddr_in*)peer_addr)->sin_addr), ntohs(((struct sockaddr_in*)peer_addr)->sin_port));
+    return write_socket(buf, size, peer_addr, peer_addrlen, user_data);
 }
 
 /* Certificate verification (accept self-signed) */
@@ -144,8 +131,6 @@ int path_created_notify(xqc_connection_t *conn, const xqc_cid_t *cid, uint64_t p
 
 // QUIC datagram callbacks
 static void datagram_read_notify(xqc_connection_t *conn, void *user_data, const void *data, size_t data_len, uint64_t flags) {
-    printf("[client] Received echo back from server: %.*s\n", (int)data_len, (char*)data);
-    
     quic_ctx_t *ctx = g_proxy_ctx;
     if (ctx == NULL) {
         fprintf(stderr, "[proxy] Error: Global proxy context memory block is uninitialized!\n");
@@ -264,12 +249,6 @@ int main(void) {
     ctx.quic_fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (ctx.quic_fd < 0) return -1;
     fcntl(ctx.quic_fd, F_SETFL, O_NONBLOCK);
-    ctx.server_addrs[0].sin_family = AF_INET;
-    ctx.server_addrs[0].sin_port = htons(PATH_PORT); 
-    inet_pton(AF_INET, PATH1_IP, &ctx.server_addrs[0].sin_addr);
-    ctx.server_addrs[1].sin_family = AF_INET;
-    ctx.server_addrs[1].sin_port = htons(PATH_PORT); 
-    inet_pton(AF_INET, PATH2_IP, &ctx.server_addrs[1].sin_addr);
 
     // add QUIC socket to libevent loop
     struct event *sock_ev = event_new(eb, ctx.quic_fd, EV_READ | EV_PERSIST, packet_read_cb, &ctx);

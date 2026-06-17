@@ -152,8 +152,6 @@ static void conn_handshake_finished(xqc_connection_t *conn, void *user_data, voi
 
 // QUIC datagram callbacks
 static void datagram_read_notify(xqc_connection_t *conn, void *user_data, const void *data, size_t data_len, uint64_t flags) {
-    printf("[server] Received %zd bytes over MPQUIC tunnel: %.*s\n", data_len, (int)data_len, (char*)data);
-    
     quic_ctx_t *ctx = g_proxy_ctx;
     if (ctx == NULL) {
         fprintf(stderr, "[server-proxy] Error: Global target proxy context is uninitialized!\n");
