@@ -503,6 +503,7 @@ xqc_send_queue_maybe_remove_unacked(xqc_packet_out_t *packet_out, xqc_send_queue
         return;
     }
 
+    /* Remove the packet from its appropriate queue list */
     if (path && (packet_out->po_flag & XQC_POF_IN_PATH_BUF_LIST)) {
         xqc_path_send_buffer_remove(path, packet_out);
 

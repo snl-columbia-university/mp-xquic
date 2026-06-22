@@ -256,6 +256,7 @@ xqc_server_set_conn_settings(xqc_engine_t *engine, const xqc_conn_settings_t *se
 
     engine->default_conn_settings.enable_multipath = settings->enable_multipath;
     engine->default_conn_settings.is_interop_mode = settings->is_interop_mode;
+    engine->default_conn_settings.enable_experimental_redundancy = settings->enable_experimental_redundancy;
 
     if (xqc_conn_is_current_mp_version_supported(settings->multipath_version) == XQC_OK) {
         engine->default_conn_settings.multipath_version = settings->multipath_version;
@@ -2080,6 +2081,76 @@ xqc_conn_schedule_packets(xqc_connection_t *conn,  xqc_list_head_t *head,
 #endif
 
         xqc_path_send_buffer_append(path, packet_out, &path->path_schedule_buf[send_type]);
+
+        xqc_log(conn->log, XQC_LOG_INFO, 
+                                    "|[REDUNDANCY]| original packet queued | base_packet_pns:%d | send_type:%d | enable_experimental_redundancy:%d | redundancy_mask:%ui| frame_type:%s| normal send_type:%d|", 
+                                    packet_out->po_pkt.pkt_pns, send_type, conn->conn_settings.enable_experimental_redundancy, packet_out->po_experimental_redundancy_mask, xqc_frame_type_2_str(conn->engine, packet_out->po_frame_types), XQC_SEND_TYPE_NORMAL);
+
+
+        xqc_log(conn->log, XQC_LOG_INFO, "DEBUG CHECK: normal=%d, settings=%d, mask=%d, frame=%d",
+            (send_type == XQC_SEND_TYPE_NORMAL),
+            conn->conn_settings.enable_experimental_redundancy,
+            (packet_out->po_experimental_redundancy_mask != 0),
+            (packet_out->po_frame_types & XQC_FRAME_DATAGRAM));
+
+        /* === experimental redundancy === */
+        if (send_type == XQC_SEND_TYPE_NORMAL 
+            && conn->conn_settings.enable_experimental_redundancy /* 1. Validate Feature Toggle */
+            && packet_out->po_experimental_redundancy_mask != 0  /* 2. Validate Packet Execution Plan */
+            && packet_out->po_frame_types & XQC_FRAME_BIT_DATAGRAM)
+        {
+            xqc_list_head_t *pos;
+            
+            xqc_log(conn->log, XQC_LOG_INFO, 
+                                    "|[REDUNDANCY]| cloned packet queuing | base_packet_pns:%d | redundancy_mask:%ui | frame_type:%s|", 
+                                    packet_out->po_pkt.pkt_pns, packet_out->po_experimental_redundancy_mask, xqc_frame_type_2_str(conn->engine, packet_out->po_frame_types));
+
+            xqc_list_for_each(pos, &conn->conn_paths_list) {
+                xqc_path_ctx_t *target_path = xqc_list_entry(pos, xqc_path_ctx_t, path_list);
+                
+                // Check if this path's bit index matches the instruction mask
+                if (packet_out->po_experimental_redundancy_mask & ((uint32_t)1 << target_path->path_id)) {
+                    
+                    if (target_path->path_state >= XQC_PATH_STATE_VALIDATING) {
+
+                        for (int i = 0; i < packet_out->po_experimental_redundancy_factor; i++) {
+                            xqc_packet_out_t *po_copy = xqc_packet_out_get(conn->conn_send_queue);
+                            if (po_copy) {
+                                xqc_packet_out_replicate(po_copy, packet_out);
+                                xqc_packet_out_remove_ack_frame(po_copy);
+
+                                    /* update path_flag */
+                                if (po_copy->po_path_flag & XQC_PATH_SPECIFIED_BY_PTO) {
+                                    po_copy->po_path_flag &= ~XQC_PATH_SPECIFIED_BY_PTO;
+                                }
+
+                                po_copy->po_flag &= ~XQC_POF_RETRANSED;
+                                po_copy->po_flag &= ~XQC_POF_SPURIOUS_LOSS;
+                                po_copy->po_origin = NULL;
+                                po_copy->po_origin_ref_cnt = 0;
+                                po_copy->po_flag &= ~(XQC_POF_REINJECTED_REPLICA | XQC_POF_REINJECTED_ORIGIN);
+                                po_copy->po_experimental_redundancy_mask = 0; 
+                                
+                                xqc_log(conn->log, XQC_LOG_INFO, 
+                                        "|[REDUNDANCY]| cloned packet queued | base_packet_pns:%d | target_path_id:%ui | redundancy_mask:%ui | frame_type:%s|", 
+                                        packet_out->po_pkt.pkt_pns, target_path->path_id, packet_out->po_experimental_redundancy_mask, xqc_frame_type_2_str(conn->engine, packet_out->po_frame_types));
+
+                                xqc_send_queue_insert_send(po_copy, &conn->conn_send_queue->sndq_send_packets, conn->conn_send_queue);
+                                xqc_path_send_buffer_append(target_path, po_copy, &target_path->path_schedule_buf[send_type]);
+
+                                xqc_log(conn->log, XQC_LOG_INFO,
+                                    "|CLONING_DONE|original_pkt:%ui|mask_after:%ui|clone_pkt:%ui|target_path:%ui|",
+                                    packet_out->po_pkt.pkt_num,
+                                    packet_out->po_experimental_redundancy_mask,
+                                    po_copy->po_pkt.pkt_num,
+                                    target_path->path_id);
+                            }
+                        }
+                    }
+                }
+            }
+            packet_out->po_experimental_redundancy_mask = 0;
+        }
     }
     if (conn->conn_settings.fec_params.fec_encoder_scheme == XQC_PACKET_MASK_CODE
         && send_type == XQC_SEND_TYPE_NORMAL

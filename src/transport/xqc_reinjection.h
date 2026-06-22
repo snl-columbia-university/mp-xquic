@@ -21,6 +21,11 @@
 void xqc_associate_packet_with_reinjection(xqc_packet_out_t *reinj_origin,
     xqc_packet_out_t *reinj_replica);
 
+void xqc_packet_out_replicate(xqc_packet_out_t *dst, xqc_packet_out_t *src);
+
+void xqc_associate_packet_with_reinjection(xqc_packet_out_t *reinj_origin,
+    xqc_packet_out_t *reinj_replica);
+
 void xqc_conn_reinject_unack_packets(xqc_connection_t *conn, 
     xqc_reinjection_mode_t mode);
 

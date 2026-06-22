@@ -47,6 +47,7 @@ typedef enum {
     XQC_POF_SPURIOUS_LOSS       = 1 << 20,
     XQC_POF_USE_FEC             = 1 << 21,
     XQC_POF_STREAM_NO_LEN       = 1 << 22,  /* for stream without LEN bit, shouldn't attach different frame to it */
+    XQC_POF_REDUNDANT_REMOVED   = 1 << 23 
 } xqc_packet_out_flag_t;
 
 typedef struct xqc_po_stream_frame_s {
@@ -109,6 +110,9 @@ typedef struct xqc_packet_out_s {
     uint64_t                po_path_id;
     unsigned int            po_cc_size; /* TODO: check cc size != send size */
 
+    uint32_t                po_experimental_redundancy_mask;
+    uint32_t                po_experimental_redundancy_factor;
+    
     /* Reinjection */
     uint64_t                po_stream_offset;
     uint64_t                po_stream_id;

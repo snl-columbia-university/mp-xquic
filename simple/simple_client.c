@@ -9,14 +9,15 @@
 #include <event2/event.h>
 #include <xquic/xquic.h>
 
+#define USE_STREAMS 0
 
 #define MAX_MSG 1024
 #define MAX_PATHS 2
 
 // config
 #define UDP_PORT 7778
-#define PATH1_IP "45.63.15.235"
-#define PATH2_IP "184.164.242.64"
+#define PATH1_IP "127.0.0.1"
+#define PATH2_IP "127.0.0.2"
 #define PATH_PORT 8000
 
 static struct event_base *eb = NULL;
@@ -31,8 +32,10 @@ typedef struct {
     xqc_engine_t *engine;
     int quic_fd;
     xqc_connection_t *conn;
+    struct sockaddr_in server_addrs[MAX_PATHS];
     int udp_fd;
     struct sockaddr_in udp_client;
+    xqc_stream_t *stream;   // reusable stream for all UDP packets
 } quic_ctx_t;
 static quic_ctx_t *g_proxy_ctx = NULL;
 
@@ -58,15 +61,21 @@ static void proxy_udp_read_cb(int fd, short what, void *arg) {
         ctx->udp_client = src_addr;
         // send to QUIC datagram API
         if (ctx->conn) {
-            xqc_datagram_send(ctx->conn, buf, n, NULL, 1);
+            if (USE_STREAMS && ctx->stream) {
+                ssize_t sent = xqc_stream_send(ctx->stream, buf, n, 0);
+                if (sent < 0) {
+                    fprintf(stderr, "[client] xqc_stream_send failed: %zd\n", sent);
+                }
+            } else {
+                // Datagram mode: send as datagram
+                xqc_datagram_send(ctx->conn, buf, n, NULL, 1);
+            }
         }
     }
 }
 
 // QUIC logging callback
-static void log_write(xqc_log_level_t lvl, const void *buf, size_t size, void *arg) {
-    printf("%.*s", (int)size, (char*)buf);
-}
+static void log_write(xqc_log_level_t lvl, const void *buf, size_t size, void *arg) { printf("%.*s", (int)size, (char*)buf); }
 
 // QUIC socket callbacks
 static ssize_t write_socket(const unsigned char *buf, size_t size,
@@ -80,20 +89,54 @@ static ssize_t write_socket_ex(uint64_t path_id, const unsigned char *buf, size_
                                void *user_data) { 
     printf("[client] write_socket_ex called for path_id %lu to %s:%d\n", path_id, 
            inet_ntoa(((struct sockaddr_in*)peer_addr)->sin_addr), ntohs(((struct sockaddr_in*)peer_addr)->sin_port));
-    return write_socket(buf, size, peer_addr, peer_addrlen, user_data);
+    quic_ctx_t *ctx = (quic_ctx_t *)user_data;  
+    struct sockaddr_in *srv_addr;
+    // ignore QUIC provided addr, forward to correct path
+    switch (path_id) {
+        case 0:
+            srv_addr = &ctx->server_addrs[0];
+            break;
+        case 1:
+            srv_addr = &ctx->server_addrs[1];
+            break;
+        default:
+            fprintf(stderr, "invalid path_id: %lu\n", path_id);
+            return -1;
+    }           
+    return write_socket(buf, size, (const struct sockaddr *)srv_addr, sizeof(*srv_addr), user_data);
 }
 
 /* Certificate verification (accept self-signed) */
-static int cert_verify_cb(const unsigned char *certs[], const size_t cert_len[],
-                          size_t certs_len, void *conn_user_data) {
-    printf("[client] Accepting certificate\n");
-    return 1;
-}
+static int cert_verify_cb(const unsigned char *certs[], const size_t cert_len[], size_t certs_len, void *conn_user_data) { return 1; }
 
 // QUIC stream callbacks
 static int stream_create_notify(xqc_stream_t *strm, void *user_data) { return 0; }
 static int stream_close_notify(xqc_stream_t *strm, void *user_data) { return 0; }
-static int stream_read_notify(xqc_stream_t *strm, void *user_data) { return 0; }
+static int stream_read_notify(xqc_stream_t *strm, void *user_data) {
+    quic_ctx_t *ctx = (quic_ctx_t *)user_data;
+    if (!ctx) return 0;
+
+    unsigned char buf[1500];
+    uint8_t fin = 0;
+    while (1) {
+        ssize_t n = xqc_stream_recv(strm, buf, sizeof(buf), &fin);
+        if (n > 0) {
+            if (ctx->udp_client.sin_port != 0) {
+                sendto(ctx->udp_fd, buf, n, 0,
+                       (struct sockaddr*)&ctx->udp_client, sizeof(ctx->udp_client));
+            }
+        } else if (fin) {          // FIN received
+            printf("[client] stream %lu closed by peer\n", (unsigned long)xqc_stream_id(strm));
+            break;
+        } else if (n == -XQC_EAGAIN) {
+            break;                    // no more data for now
+        } else {
+            fprintf(stderr, "[client] xqc_stream_read error: %zd\n", n);
+            break;
+        }
+    }
+    return 0;
+}
 static int stream_write_notify(xqc_stream_t *strm, void *user_data) { return 0; }
 
 // QUIC connection callbacks
@@ -109,6 +152,15 @@ static void conn_handshake_finished(xqc_connection_t *conn, void *user_data, voi
     printf("[client] handshake finished, proxy routing is now active.\n");
     quic_ctx_t *ctx = (quic_ctx_t *)user_data;
     ctx->conn = conn;
+    if (USE_STREAMS) {
+        // Create a bidirectional stream (or unidirectional if you prefer)
+        ctx->stream = xqc_stream_create(ctx->engine, &cid, NULL, user_data);
+        if (ctx->stream) {
+            printf("[client] stream %lu created \n", (unsigned long)xqc_stream_id(ctx->stream));
+        } else {
+            printf("[client] stream creation failed\n");
+        }
+    }
 }
 
 static void save_token_cb(const unsigned char *token, unsigned int token_len, void *user_data) { return; }
@@ -250,6 +302,14 @@ int main(void) {
     if (ctx.quic_fd < 0) return -1;
     fcntl(ctx.quic_fd, F_SETFL, O_NONBLOCK);
 
+    // add the path addresses to ctx
+    ctx.server_addrs[0].sin_family = AF_INET;
+    ctx.server_addrs[0].sin_port = htons(PATH_PORT); 
+    inet_pton(AF_INET, PATH1_IP, &ctx.server_addrs[0].sin_addr);
+    ctx.server_addrs[1].sin_family = AF_INET;
+    ctx.server_addrs[1].sin_port = htons(PATH_PORT); 
+    inet_pton(AF_INET, PATH2_IP, &ctx.server_addrs[1].sin_addr);
+
     // add QUIC socket to libevent loop
     struct event *sock_ev = event_new(eb, ctx.quic_fd, EV_READ | EV_PERSIST, packet_read_cb, &ctx);
     event_add(sock_ev, NULL);
@@ -284,11 +344,15 @@ int main(void) {
     // define QUIC connection settings
     conn_settings.proto_version = XQC_VERSION_V1;
     conn_settings.enable_multipath = 1;
-    conn_settings.max_datagram_frame_size = 65535;
-    conn_settings.scheduler_callback = xqc_minrtt_scheduler_cb;
-    conn_settings.mp_enable_reinjection = 7;
-    conn_settings.reinj_ctl_callback = xqc_dgram_reinj_ctl_cb;
+    conn_settings.scheduler_callback = xqc_proactive_singlepath_scheduler_cb;
+    conn_settings.enable_experimental_redundancy = 1;
+    conn_settings.mp_enable_reinjection = 0;
     conn_settings.mp_ping_on = 1;
+
+    if (!USE_STREAMS) {
+        conn_settings.max_datagram_frame_size = 65535;
+        conn_settings.datagram_force_retrans_on = 0;
+    }
 
     // connect to QUIC server
     const xqc_cid_t *cidp = xqc_connect(ctx.engine, &conn_settings, NULL, 0, "localhost", 0,

@@ -9,12 +9,13 @@
 #include <event2/event.h>
 #include <xquic/xquic.h>
 
+#define USE_STREAMS 0
 
 #define MAX_MSG 1024
 
 // config
 #define BACKEND_IP "127.0.0.1"
-#define BACKEND_PORT 7778
+#define BACKEND_PORT 7779
 #define QUIC_PORT 8000
 
 static struct event_base *eb = NULL;
@@ -28,6 +29,7 @@ typedef struct {
     xqc_connection_t *conn;
     int udp_fd;
     struct sockaddr_in udp_client;
+    xqc_stream_t *stream;
 } quic_ctx_t;
 static quic_ctx_t *g_proxy_ctx = NULL;
 
@@ -42,18 +44,21 @@ static void proxy_udp_read_cb(int fd, short what, void *arg) {
     quic_ctx_t *ctx = (quic_ctx_t *)arg;
     unsigned char buf[1500];
     struct sockaddr_in src_addr;
+    socklen_t src_len = sizeof(src_addr);
 
-    // Drain the local UDP socket
     while (1) {
-        socklen_t src_len = sizeof(src_addr);
         ssize_t n = recvfrom(fd, buf, sizeof(buf), 0, (struct sockaddr*)&src_addr, &src_len);
-        if (n <= 0) {
-            break; 
-        }
+        if (n <= 0) break;
 
-        // If the MPQUIC path tunnel is established, pipe it straight out
         if (ctx->conn) {
-            xqc_datagram_send(ctx->conn, buf, n, NULL, 1);
+            if (USE_STREAMS && ctx->stream) {
+                ssize_t sent = xqc_stream_send(ctx->stream, buf, n, 0);
+                if (sent < 0) {
+                    fprintf(stderr, "[server-proxy] xqc_stream_send failed: %zd\n", sent);
+                }
+            } else {
+                xqc_datagram_send(ctx->conn, buf, n, NULL, 1);
+            }
         }
     }
 }
@@ -73,6 +78,8 @@ static ssize_t write_socket(const unsigned char *buf, size_t size,
 static ssize_t write_socket_ex(uint64_t path_id, const unsigned char *buf, size_t size,
                                const struct sockaddr *peer_addr, socklen_t peer_addrlen,
                                void *user_data) {
+    printf("[server] write_socket_ex called for path_id %lu to %s:%d\n", path_id, 
+           inet_ntoa(((struct sockaddr_in*)peer_addr)->sin_addr), ntohs(((struct sockaddr_in*)peer_addr)->sin_port));
     return write_socket(buf, size, peer_addr, peer_addrlen, user_data);
 }
 
@@ -127,9 +134,41 @@ static int cert_verify_cb(const unsigned char *certs[], const size_t cert_len[],
 }
 
 // QUIC stream callbacks
-static int stream_create_notify(xqc_stream_t *strm, void *user_data) { return 0; }
+static int stream_create_notify(xqc_stream_t *strm, void *user_data) {
+    quic_ctx_t *ctx = (quic_ctx_t *)g_proxy_ctx;
+    if (ctx) {
+        xqc_stream_set_user_data(strm, ctx);
+        ctx->stream = strm;           // remember this stream for sending replies
+        printf("[client] stream %lu closed by peer\n", (unsigned long)xqc_stream_id(strm));
+    }
+    return 0;
+}
 static int stream_close_notify(xqc_stream_t *strm, void *user_data) { return 0; }
-static int stream_read_notify(xqc_stream_t *strm, void *user_data) { return 0; }
+static int stream_read_notify(xqc_stream_t *strm, void *user_data) {
+    quic_ctx_t *ctx = (quic_ctx_t *)user_data;
+    if (!ctx) return 0;
+
+    unsigned char buf[1500];
+    uint8_t fin = 0;
+    while (1) {
+        ssize_t n = xqc_stream_recv(strm, buf, sizeof(buf), &fin);
+        if (n > 0) {
+            if (ctx->udp_client.sin_port != 0) {
+                sendto(ctx->udp_fd, buf, n, 0,
+                       (struct sockaddr*)&ctx->udp_client, sizeof(ctx->udp_client));
+            }
+        } else if (fin) {          // FIN received
+            printf("[client] stream %lu closed by peer\n", (unsigned long)xqc_stream_id(strm));
+            break;
+        } else if (n == -XQC_EAGAIN) {
+            break;                    // no more data for now
+        } else {
+            fprintf(stderr, "[client] xqc_stream_read error: %zd\n", n);
+            break;
+        }
+    }
+    return 0;
+}
 static int stream_write_notify(xqc_stream_t *strm, void *user_data) { return 0; }
 
 // QUIC connection callbacks
@@ -297,11 +336,16 @@ int main(void) {
     // define QUIC connection settings
     conn_settings.proto_version = XQC_VERSION_V1;
     conn_settings.enable_multipath = 1;
-    conn_settings.max_datagram_frame_size = 65535;
-    conn_settings.scheduler_callback = xqc_minrtt_scheduler_cb;
-    conn_settings.mp_enable_reinjection = 7;
-    conn_settings.reinj_ctl_callback = xqc_dgram_reinj_ctl_cb;
+    conn_settings.scheduler_callback = xqc_proactive_singlepath_scheduler_cb;
+    conn_settings.enable_experimental_redundancy = 1;
+    conn_settings.mp_enable_reinjection = 0;
+    //conn_settings.reinj_ctl_callback = xqc_dgram_reinj_ctl_cb;
     conn_settings.mp_ping_on = 1;
+
+    if (!USE_STREAMS) {
+        conn_settings.max_datagram_frame_size = 65535;
+        conn_settings.datagram_force_retrans_on = 0;
+    }
 
     // create QUIC engine
     engine = xqc_engine_create(XQC_ENGINE_SERVER, &cfg, &ssl_cfg, &eng_cb, &trans_cb, NULL);

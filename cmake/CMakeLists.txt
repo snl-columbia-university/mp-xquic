@@ -208,6 +208,8 @@ set(
     "src/transport/scheduler/xqc_scheduler_backup.c"
     "src/transport/scheduler/xqc_scheduler_backup_fec.c"
     "src/transport/scheduler/xqc_scheduler_rap.c"
+    "src/transport/scheduler/xqc_scheduler_proactive_multipath.c"
+    "src/transport/scheduler/xqc_scheduler_proactive_singlepath.c"
 )
 
 if(XQC_ENABLE_MP_INTEROP)
