@@ -280,11 +280,6 @@ int main(int argc, char *argv[]) {
     ctx.next_path_idx = 1;
     ctx.udp_port = 7778;
 
-    if (argc == 1) {
-        usage(argv[0]);
-        return 1;
-    }
-
     int opt;
     while ((opt = getopt(argc, argv, "u:drs:p:h")) != -1) {
         switch (opt) {

@@ -335,12 +335,6 @@ int main(int argc, char *argv[]) {
     conn_settings.enable_experimental_redundancy = 0;
     conn_settings.scheduler_callback = xqc_minrtt_scheduler_cb;
 
-
-    if (argc == 1) {
-        usage(argv[0]);
-        return 1;
-    }
-
     int opt;
     while ((opt = getopt(argc, argv, "drs:h:")) != -1) {
         switch (opt) {
