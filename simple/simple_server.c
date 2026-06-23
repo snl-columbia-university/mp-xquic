@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <getopt.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <arpa/inet.h>
@@ -29,6 +30,7 @@ typedef struct {
     xqc_connection_t *conn;
     int udp_fd;
     struct sockaddr_in udp_client;
+    int datagram;
     xqc_stream_t *stream;
 } quic_ctx_t;
 static quic_ctx_t *g_proxy_ctx = NULL;
@@ -51,7 +53,7 @@ static void proxy_udp_read_cb(int fd, short what, void *arg) {
         if (n <= 0) break;
 
         if (ctx->conn) {
-            if (USE_STREAMS && ctx->stream) {
+            if (ctx->stream) {
                 ssize_t sent = xqc_stream_send(ctx->stream, buf, n, 0);
                 if (sent < 0) {
                     fprintf(stderr, "[server-proxy] xqc_stream_send failed: %zd\n", sent);
@@ -299,13 +301,44 @@ static void packet_read_cb(int fd, short what, void *arg) {
     }
 }
 
-int main(void) {
+int main(int argc, char *argv[]) {
     xqc_config_t cfg;
     xqc_conn_settings_t conn_settings = {0};
     xqc_engine_ssl_config_t ssl_cfg = {0};
     xqc_engine_callback_t eng_cb = {0};
     xqc_transport_callbacks_t trans_cb = {0};
     struct sockaddr_in addr;
+
+    // initialize global QUIC context
+    quic_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    g_proxy_ctx = &ctx;
+
+    // default configs
+    conn_settings.max_datagram_frame_size = 0;
+    conn_settings.datagram_force_retrans_on = 0;
+    conn_settings.enable_experimental_redundancy = 0;
+    conn_settings.scheduler_callback = xqc_minrtt_scheduler_cb;
+
+    int opt;
+    while ((opt = getopt(argc, argv, "d:r:s:")) != -1) {
+        switch (opt) {
+            case 'd': 
+                conn_settings.max_datagram_frame_size = 65535; 
+                conn_settings.datagram_force_retrans_on = 0; 
+                break;
+            case 'r': conn_settings.enable_experimental_redundancy = 1; break;
+            case 's': 
+                if (strcmp(optarg, "pmp") == 0) {
+                    conn_settings.scheduler_callback = xqc_proactive_multipath_scheduler_cb;
+                } else if (strcmp(optarg, "psp") == 0) {
+                    conn_settings.scheduler_callback = xqc_proactive_singlepath_scheduler_cb;
+                } else {
+                    conn_settings.scheduler_callback = xqc_minrtt_scheduler_cb;
+                }
+                break;
+        }
+    }
 
     printf("[server] starting\n");
     eb = event_base_new();
@@ -336,16 +369,8 @@ int main(void) {
     // define QUIC connection settings
     conn_settings.proto_version = XQC_VERSION_V1;
     conn_settings.enable_multipath = 1;
-    conn_settings.scheduler_callback = xqc_proactive_singlepath_scheduler_cb;
-    conn_settings.enable_experimental_redundancy = 1;
     conn_settings.mp_enable_reinjection = 0;
-    //conn_settings.reinj_ctl_callback = xqc_dgram_reinj_ctl_cb;
     conn_settings.mp_ping_on = 1;
-
-    if (!USE_STREAMS) {
-        conn_settings.max_datagram_frame_size = 65535;
-        conn_settings.datagram_force_retrans_on = 0;
-    }
 
     // create QUIC engine
     engine = xqc_engine_create(XQC_ENGINE_SERVER, &cfg, &ssl_cfg, &eng_cb, &trans_cb, NULL);
@@ -365,9 +390,9 @@ int main(void) {
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port = htons(QUIC_PORT);
+    addr.sin_port = htons(8000);
     if (bind(quic_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) { perror("bind"); return -1; }
-    printf("listening on port %d\n", QUIC_PORT);
+    printf("listening on port %d\n", 8000);
 
     // add QUIC socket to libevent loop
     struct event *sock_ev = event_new(eb, quic_fd, EV_READ | EV_PERSIST, packet_read_cb, NULL);
