@@ -286,7 +286,7 @@ int main(int argc, char *argv[]) {
     }
 
     int opt;
-    while ((opt = getopt(argc, argv, "u:d:r:s:p:h")) != -1) {
+    while ((opt = getopt(argc, argv, "u:drs:p:h")) != -1) {
         switch (opt) {
             case 'h':
                 usage(argv[0]);
@@ -329,7 +329,6 @@ int main(int argc, char *argv[]) {
                 return 0;
         }
     }
-
     printf("[client] starting\n");
     eb = event_base_new();
     if (!eb) return -1;
