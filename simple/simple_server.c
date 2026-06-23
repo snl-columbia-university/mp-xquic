@@ -300,6 +300,22 @@ static void packet_read_cb(int fd, short what, void *arg) {
     }
 }
 
+static void usage(const char *progname) {
+    fprintf(stderr,
+        "Usage: %s [options]\n"
+        "Options:\n"
+        "  -d            Enable datagram mode (sets max_datagram_frame_size)\n"
+        "  -r            Enable experimental redundancy\n"
+        "  -s <sched>    Select scheduler: pmp (proactive multipath),\n"
+        "                psp (proactive singlepath), minrtt (default)\n"
+        "  -h            Show this help\n"
+        "\n"
+        "Example:\n"
+        "  %s -d -r -s pmp\n",
+        progname, progname
+    );
+}
+
 int main(int argc, char *argv[]) {
     xqc_config_t cfg;
     xqc_conn_settings_t conn_settings = {0};
@@ -319,9 +335,18 @@ int main(int argc, char *argv[]) {
     conn_settings.enable_experimental_redundancy = 0;
     conn_settings.scheduler_callback = xqc_minrtt_scheduler_cb;
 
+
+    if (argc == 1) {
+        usage(argv[0]);
+        return 1;
+    }
+
     int opt;
     while ((opt = getopt(argc, argv, "d:r:s:")) != -1) {
         switch (opt) {
+            case 'h':
+                usage(argv[0]);
+                return 0; 
             case 'd': 
                 conn_settings.max_datagram_frame_size = 65535; 
                 conn_settings.datagram_force_retrans_on = 0; 
@@ -336,6 +361,9 @@ int main(int argc, char *argv[]) {
                     conn_settings.scheduler_callback = xqc_minrtt_scheduler_cb;
                 }
                 break;
+            default:
+                usage(argv[0]);
+                return 0;
         }
     }
 

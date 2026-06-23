@@ -240,6 +240,24 @@ static void packet_read_cb(int fd, short what, void *arg) {
     }
 }
 
+static void usage(const char *progname) {
+    fprintf(stderr,
+        "Usage: %s [options]\n"
+        "Options:\n"
+        "  -u <port>     Set local UDP port (client only, default 7778)\n"
+        "  -d            Enable datagram mode (sets max_datagram_frame_size)\n"
+        "  -r            Enable experimental redundancy\n"
+        "  -s <sched>    Select scheduler: pmp (proactive multipath),\n"
+        "                psp (proactive singlepath), minrtt (default)\n"
+        "  -p <ip>       Add peer address (can be repeated, client only)\n"
+        "  -h            Show this help\n"
+        "\n"
+        "Example:\n"
+        "  %s -d -r -s pmp -p 127.0.0.1 -p 127.0.0.2\n",
+        progname, progname
+    );
+}
+
 int main(int argc, char *argv[]) {
     xqc_config_t cfg;
     xqc_engine_ssl_config_t ssl_cfg = {0};
@@ -262,9 +280,17 @@ int main(int argc, char *argv[]) {
     ctx.next_path_idx = 1;
     ctx.udp_port = 7778;
 
+    if (argc == 1) {
+        usage(argv[0]);
+        return 1;
+    }
+
     int opt;
-    while ((opt = getopt(argc, argv, "u:d:r:s:p:")) != -1) {
+    while ((opt = getopt(argc, argv, "u:d:r:s:p:h")) != -1) {
         switch (opt) {
+            case 'h':
+                usage(argv[0]);
+            return 0;
             case 'u':
                 ctx.udp_port = atoi(optarg);
                 break;
@@ -298,6 +324,9 @@ int main(int argc, char *argv[]) {
                     return 1;
                 }
                 break;
+            default:
+                usage(argv[0]);
+                return 0;
         }
     }
 
