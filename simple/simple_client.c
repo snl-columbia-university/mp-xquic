@@ -10,7 +10,6 @@
 #include <event2/event.h>
 #include <xquic/xquic.h>
 
-#define MAX_MSG 1024
 #define MAX_PATHS 2
 
 static struct event_base *eb = NULL;
@@ -44,7 +43,7 @@ static xqc_usec_t get_timestamp(void) {
 
 // UDP socket callback
 static void proxy_udp_read_cb(int fd, short what, void *arg) {
-    quic_ctx_t *ctx = (quic_ctx_t *)arg;
+    quic_ctx_t *ctx = (quic_ctx_t *)g_proxy_ctx;
     unsigned char buf[1500];
     struct sockaddr_in src_addr;
     socklen_t src_len = sizeof(src_addr);
@@ -268,6 +267,7 @@ int main(int argc, char *argv[]) {
         switch (opt) {
             case 'u':
                 ctx.udp_port = atoi(optarg);
+                break;
             case 'd': 
                 conn_settings.max_datagram_frame_size = 65535; 
                 conn_settings.datagram_force_retrans_on = 0; 
