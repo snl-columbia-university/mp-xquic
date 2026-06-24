@@ -44,7 +44,7 @@ xqc_associate_packet_with_reinjection(xqc_packet_out_t *reinj_origin,
 }
 
 
-static void
+void
 xqc_packet_out_replicate(xqc_packet_out_t *dst, xqc_packet_out_t *src)
 {
     unsigned char *po_buf = dst->po_buf;

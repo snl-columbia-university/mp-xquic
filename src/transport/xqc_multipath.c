@@ -1021,7 +1021,7 @@ xqc_conn_server_init_path_addr(xqc_connection_t *conn, uint64_t path_id,
             }
 
             /* check if ip address is same with sub-connections created */
-            if (xqc_is_same_addr(peer_addr, (struct sockaddr *)active_path->peer_addr)) {
+            if (xqc_is_same_addr(peer_addr, (struct sockaddr *)active_path->peer_addr) && xqc_is_same_addr(local_addr, (struct sockaddr *)active_path->local_addr)) {
                 xqc_path_immediate_close(path);
                 xqc_log(conn->engine->log, XQC_LOG_STATS, "|MP|path:%ui|conn:%s|"
                         "cannot activate this path, due to the same IP|curIP:%s|conflictIP:%s|",

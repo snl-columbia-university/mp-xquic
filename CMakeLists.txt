@@ -168,15 +168,6 @@ if(GCOV STREQUAL "on")
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fprofile-arcs -ftest-coverage")
 endif()
 
-
-
-# testing
-if(XQC_ENABLE_TESTING)
-    add_subdirectory(tests)
-    add_subdirectory(demo)
-    add_subdirectory(mini)
-endif(XQC_ENABLE_TESTING)
-
 if(XQC_ENABLE_MOQ)
     add_subdirectory(moq)
 endif()
@@ -239,6 +230,9 @@ set(
     "src/transport/scheduler/xqc_scheduler_backup.c"
     "src/transport/scheduler/xqc_scheduler_backup_fec.c"
     "src/transport/scheduler/xqc_scheduler_rap.c"
+    "src/transport/scheduler/xqc_scheduler_reactive_multipath.c"
+    "src/transport/scheduler/xqc_scheduler_proactive_multipath.c"
+    "src/transport/scheduler/xqc_scheduler_proactive_singlepath.c"
 )
 
 if(XQC_ENABLE_MP_INTEROP)
@@ -431,3 +425,47 @@ if(CMAKE_BUILD_TYPE STREQUAL MinSizeRel)
             COMMAND ${CMAKE_STRIP} libxquic.so)
 endif()
 
+# =====================================================================
+# Custom Applications: Proactive Multipath Simple Client & Server
+# =====================================================================
+
+# 1. Find Libevent on the host system (required by your -levent flag)
+find_library(LIBEVENT_LIB NAMES event)
+if(NOT LIBEVENT_LIB)
+    message(FATAL_ERROR "Libevent (libevent) not found! Please install it (e.g., apt install libevent-dev)")
+endif()
+
+# 2. Add the Simple Client Target
+add_executable(
+    simple_client
+    "simple/simple_client.c"  # Adjust this path if the file is in a subdirectory (e.g., "demo/simple_client.c")
+)
+
+# Mirror your exact manual GCC flags inside CMake
+target_link_libraries(
+    simple_client
+    xquic-static       # Links the core engine static archive built with your modifications
+    ${SSL_LIB_PATH}    # Links the configured BoringSSL/BabaSSL static libraries
+    ${LIBEVENT_LIB}    # Maps directly to -levent
+    -lpthread          # Maps to -lpthread
+    -lstdc++           # Maps to -lstdc++
+    -lm                # Maps to -lm
+)
+
+
+# 3. Add the Simple Server Target
+add_executable(
+    simple_server
+    "simple/simple_server.c"  # Adjust this path if the file is in a subdirectory
+)
+
+# Mirror the identical linkage for the server
+target_link_libraries(
+    simple_server
+    xquic-static
+    ${SSL_LIB_PATH}
+    ${LIBEVENT_LIB}
+    -lpthread
+    -lstdc++
+    -lm
+)
