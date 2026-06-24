@@ -208,6 +208,7 @@ set(
     "src/transport/scheduler/xqc_scheduler_backup.c"
     "src/transport/scheduler/xqc_scheduler_backup_fec.c"
     "src/transport/scheduler/xqc_scheduler_rap.c"
+    "src/transport/scheduler/xqc_scheduler_reactive_multipath.c"
     "src/transport/scheduler/xqc_scheduler_proactive_multipath.c"
     "src/transport/scheduler/xqc_scheduler_proactive_singlepath.c"
 )
@@ -373,23 +374,5 @@ if (NOT XQC_NO_SHARED)
         ${DYMAMIC_LINK_OPTION}
         -pthread
     )
-endif()
-
-if (XQC_ENABLE_TESTING)
-    set(CMAKE_MODULE_PATH       "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
-    find_package(CUnit REQUIRED)
-    include_directories(${CUNIT_INCLUDE_DIR})
-    enable_testing()
-    add_subdirectory(tests)
-    add_subdirectory(tests/unittest)
-endif()
-
-if (XQC_BUILD_SAMPLE)
-    add_subdirectory(third_party/libevent)
-    include_directories(third_party/libevent/include  ${CMAKE_CURRENT_BINARY_DIR}/third_party/libevent/include )
-    add_executable(test_client tests/test_client.c)
-    add_executable(test_server tests/test_server.c)
-    target_link_libraries(test_client xquic event)
-    target_link_libraries(test_server xquic event)
 endif()
 

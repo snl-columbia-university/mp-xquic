@@ -168,13 +168,6 @@ if(GCOV STREQUAL "on")
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fprofile-arcs -ftest-coverage")
 endif()
 
-
-
-# testing
-if(XQC_ENABLE_TESTING)
-    add_subdirectory(tests)
-endif(XQC_ENABLE_TESTING)
-
 if(XQC_ENABLE_MOQ)
     add_subdirectory(moq)
 endif()
@@ -237,6 +230,7 @@ set(
     "src/transport/scheduler/xqc_scheduler_backup.c"
     "src/transport/scheduler/xqc_scheduler_backup_fec.c"
     "src/transport/scheduler/xqc_scheduler_rap.c"
+    "src/transport/scheduler/xqc_scheduler_reactive_multipath.c"
     "src/transport/scheduler/xqc_scheduler_proactive_multipath.c"
     "src/transport/scheduler/xqc_scheduler_proactive_singlepath.c"
 )

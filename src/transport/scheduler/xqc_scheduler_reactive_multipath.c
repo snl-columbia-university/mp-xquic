@@ -3,25 +3,25 @@
  */
 
 
-#include "src/transport/scheduler/xqc_scheduler_proactive_multipath.h"
+#include "src/transport/scheduler/xqc_scheduler_reactive_multipath.h"
 #include "src/transport/scheduler/xqc_scheduler_common.h"
 #include "src/transport/xqc_send_ctl.h"
 
 
 static size_t
-xqc_proactive_multipath_scheduler_size()
+xqc_reactive_multipath_scheduler_size()
 {
     return 0;
 }
 
 static void
-xqc_proactive_multipath_scheduler_init(void *scheduler, xqc_log_t *log, xqc_scheduler_params_t *param)
+xqc_reactive_multipath_scheduler_init(void *scheduler, xqc_log_t *log, xqc_scheduler_params_t *param)
 {
     return;
 }
 
 xqc_path_ctx_t *
-xqc_proactive_multipath_scheduler_get_path(void *scheduler,
+xqc_reactive_multipath_scheduler_get_path(void *scheduler,
     xqc_connection_t *conn, xqc_packet_out_t *packet_out, int check_cwnd, int reinject,
     xqc_bool_t *cc_blocked)
 {
@@ -76,20 +76,11 @@ xqc_proactive_multipath_scheduler_get_path(void *scheduler,
         uint64_t path_srtt = xqc_send_ctl_get_srtt(path->path_send_ctl);
         float path_loss = xqc_send_ctl_get_spurious_loss_rate(path->path_send_ctl);
         float path_retrans = xqc_send_ctl_get_retrans_rate(path->path_send_ctl);
-
-        xqc_log(conn->log, XQC_LOG_INFO, "DEBUG: %s, %i", xqc_frame_type_2_str(conn->engine, packet_out->po_frame_types), packet_out->po_frame_types & XQC_FRAME_BIT_DATAGRAM);
         
-        // select 'best' path based on some combo of stats, else if enabled, schedule as redundant
+        // select path based on some combo of stats
         if (best_path == NULL || path_srtt < min_srtt) {
             best_path = path;
             min_srtt = path_srtt;
-        }
-        
-        if (conn->conn_settings.enable_experimental_redundancy && packet_out->po_frame_types & XQC_FRAME_BIT_DATAGRAM) {
-            packet_out->po_experimental_redundancy_mask |= ((uint32_t)1 << path->path_id);
-            xqc_log(conn->log, XQC_LOG_INFO,
-                "|proactive_redundancy_masked|conn:%p|pkt_num:%ui|replicated_to_path:%ui|current_mask:%ui|",
-                conn, packet_out->po_pkt.pkt_num, path->path_id, packet_out->po_experimental_redundancy_mask);
         }
 
 skip_path:
@@ -101,18 +92,6 @@ skip_path:
                 path_can_send, path->app_path_status, path->path_state, reinject, 
                 packet_out->po_path_id,
                 best_path ? (int)best_path->path_id : -1);
-    };
-
-    // remove best path from mask, to avoid single path duplication
-    if (best_path
-        && conn->conn_settings.enable_experimental_redundancy
-        && packet_out->po_frame_types & XQC_FRAME_BIT_DATAGRAM) 
-    {
-        packet_out->po_experimental_redundancy_mask &= ~((uint32_t)1 << best_path->path_id);
-        xqc_log(conn->log, XQC_LOG_INFO,
-                "|proactive_redundancy_masked|conn:%p|pkt_num:%ui|replicated_to_path:%ui|current_mask:%ui|",
-                conn, packet_out->po_pkt.pkt_num, best_path->path_id, packet_out->po_experimental_redundancy_mask);
-            
     }
 
     // log scheduling outcome
@@ -127,8 +106,8 @@ skip_path:
     return best_path;
 }
 
-const xqc_scheduler_callback_t xqc_proactive_multipath_scheduler_cb = {
-    .xqc_scheduler_size             = xqc_proactive_multipath_scheduler_size,
-    .xqc_scheduler_init             = xqc_proactive_multipath_scheduler_init,
-    .xqc_scheduler_get_path         = xqc_proactive_multipath_scheduler_get_path,
+const xqc_scheduler_callback_t xqc_reactive_multipath_scheduler_cb = {
+    .xqc_scheduler_size             = xqc_reactive_multipath_scheduler_size,
+    .xqc_scheduler_init             = xqc_reactive_multipath_scheduler_init,
+    .xqc_scheduler_get_path         = xqc_reactive_multipath_scheduler_get_path,
 };

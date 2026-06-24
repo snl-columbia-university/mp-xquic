@@ -27,7 +27,7 @@ typedef struct {
     int udp_fd;
     int udp_port;
     struct sockaddr_in udp_client;
-    int datagram;
+    uint64_t dgram_id;
     xqc_stream_t *stream;
 } quic_ctx_t;
 static quic_ctx_t *g_proxy_ctx = NULL;
@@ -61,8 +61,8 @@ static void proxy_udp_read_cb(int fd, short what, void *arg) {
                 }
             } else {
                 printf("[client-proxy] datagram recieved over udp\n");
-                xqc_datagram_send(ctx->conn, buf, n, NULL, 1);
-                printf("[client-quic] datagram sent over quic\n");
+                xqc_datagram_send(ctx->conn, buf, n, &ctx->dgram_id, 1);
+                printf("[client-quic] datagram %ld forwarded over quic\n", ctx->dgram_id);
             }
         }
     }
@@ -135,7 +135,7 @@ static void conn_handshake_finished(xqc_connection_t *conn, void *user_data, voi
     printf("[client-quic] handshake finished, proxy routing is now active.\n");
     quic_ctx_t *ctx = (quic_ctx_t *)g_proxy_ctx;
     ctx->conn = conn;
-    if (!ctx->datagram) {
+    if (!ctx->dgram_id) {
         // Create a bidirectional stream (or unidirectional if you prefer)
         ctx->stream = xqc_stream_create(ctx->engine, &cid, NULL, user_data);
         if (ctx->stream) {
@@ -178,10 +178,12 @@ static void datagram_read_notify(xqc_connection_t *conn, void *user_data, const 
         // Push the payload back out to your local UDP client
         if (sendto(ctx->udp_fd, data, data_len, 0, (struct sockaddr*)&ctx->udp_client, sizeof(ctx->udp_client)) < 0) {
             printf("[client-proxy] sendto failed with error: %s\n", strerror(errno));   
-        }
+        } else { printf("[client-proxy] datagram forwarded to udp\n"); }
     }
 }
-static void datagram_write_notify(xqc_connection_t *conn, void *user_data) {}
+static void datagram_write_notify(xqc_connection_t *conn, void *user_data) {printf("[client-quic] datagram sent to server\n");}
+static void datagram_acked_notify(xqc_connection_t *conn, uint64_t dgram_id, void *user_data) { printf("[client-quic] datagram %ld acked\n", dgram_id);}
+static xqc_int_t datagram_lost_notify(xqc_connection_t *conn, uint64_t dgram_id, void *user_data) { printf("[client-quic] datagram %ld lost\n", dgram_id); return XQC_DGRAM_RETX_ASKED_BY_APP;}
 
 static int register_alpn(xqc_engine_t *eng, quic_ctx_t *ctx) {
     xqc_conn_callbacks_t conn_cbs = {
@@ -199,6 +201,8 @@ static int register_alpn(xqc_engine_t *eng, quic_ctx_t *ctx) {
     xqc_datagram_callbacks_t dgram_cbs = {
         .datagram_read_notify = datagram_read_notify,
         .datagram_write_notify = datagram_write_notify,
+        .datagram_lost_notify = datagram_lost_notify,
+        .datagram_acked_notify = datagram_acked_notify,
     };
     xqc_app_proto_callbacks_t ap_cbs = {
         .conn_cbs = conn_cbs,
@@ -290,7 +294,7 @@ int main(int argc, char *argv[]) {
             case 'd': 
                 conn_settings.max_datagram_frame_size = 65535; 
                 conn_settings.datagram_force_retrans_on = 0; 
-                ctx.datagram = 1;
+                ctx.dgram_id = 1;
                 break;
             case 'r': conn_settings.enable_experimental_redundancy = 1; break;
             case 's': 
@@ -298,6 +302,8 @@ int main(int argc, char *argv[]) {
                     conn_settings.scheduler_callback = xqc_proactive_multipath_scheduler_cb;
                 } else if (strcmp(optarg, "psp") == 0) {
                     conn_settings.scheduler_callback = xqc_proactive_singlepath_scheduler_cb;
+                } else if (stcmp(optarg, "rmp") == 0) {
+                    conn_settings.scheduler_callback = xqc_reactive_multipath_scheduler_cb;
                 } else {
                     conn_settings.scheduler_callback = xqc_minrtt_scheduler_cb;
                 }
@@ -327,7 +333,7 @@ int main(int argc, char *argv[]) {
     if (!eb) return -1;
 
     xqc_engine_get_default_config(&cfg, XQC_ENGINE_CLIENT);
-    //cfg.cfg_log_level = XQC_LOG_INFO;
+    cfg.cfg_log_level = XQC_LOG_INFO;
 
     // define QUIC engine callbacks
     eng_cb.set_event_timer = set_event_timer;
