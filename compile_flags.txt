@@ -1,0 +1,8 @@
+-std=gnu11
+-Iinclude
+-I.
+-Isrc
+-I/opt/homebrew/opt/openssl@3/include
+-I/opt/homebrew/opt/libevent/include
+-DNDEBUG_PRINT
+-DNPRINT_MALLOC
