@@ -5,6 +5,7 @@
 #include <getopt.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <endian.h>
 #include <arpa/inet.h>
 #include <sys/time.h>
 #include <event2/event.h>
@@ -27,7 +28,10 @@ typedef struct {
     int udp_fd;
     int udp_port;
     struct sockaddr_in udp_client;
-    uint64_t dgram_id;
+    uint64_t quic_dgram_id;
+    uint64_t client_dgram_id;
+    uint64_t max_server_dgram_id;
+    int first_dgram;
     xqc_stream_t *stream;
 } quic_ctx_t;
 static quic_ctx_t *g_proxy_ctx = NULL;
@@ -61,8 +65,12 @@ static void proxy_udp_read_cb(int fd, short what, void *arg) {
                 }
             } else {
                 printf("[client-proxy] datagram recieved over udp\n");
-                xqc_datagram_send(ctx->conn, buf, n, &ctx->dgram_id, 1);
-                printf("[client-quic] datagram %ld forwarded over quic\n", ctx->dgram_id);
+                memmove(buf + 8, buf, n);
+                uint64_t net_val = htobe64(ctx->client_dgram_id);
+                memcpy(buf, &net_val, sizeof(uint64_t));
+                xqc_datagram_send(ctx->conn, buf, n + sizeof(uint64_t), &ctx->quic_dgram_id, 1);
+                printf("[client-quic] datagram quic=%ld, server=%ld forwarded over quic\n", ctx->quic_dgram_id, ctx->client_dgram_id);
+                ctx->client_dgram_id++;
             }
         }
     }
@@ -135,7 +143,7 @@ static void conn_handshake_finished(xqc_connection_t *conn, void *user_data, voi
     printf("[client-quic] handshake finished, proxy routing is now active.\n");
     quic_ctx_t *ctx = (quic_ctx_t *)g_proxy_ctx;
     ctx->conn = conn;
-    if (!ctx->dgram_id) {
+    if (!ctx->quic_dgram_id) {
         // Create a bidirectional stream (or unidirectional if you prefer)
         ctx->stream = xqc_stream_create(ctx->engine, &cid, NULL, user_data);
         if (ctx->stream) {
@@ -176,9 +184,20 @@ static void datagram_read_notify(xqc_connection_t *conn, void *user_data, const 
     printf("[client-quic] datagram recv from server\n");
     if (ctx->udp_fd && ctx->udp_client.sin_port != 0) {
         // Push the payload back out to your local UDP client
-        if (sendto(ctx->udp_fd, data, data_len, 0, (struct sockaddr*)&ctx->udp_client, sizeof(ctx->udp_client)) < 0) {
+        uint64_t net_val;
+        memcpy(&net_val, data, sizeof(uint64_t));
+        uint64_t server_datagram_id = be64toh(net_val);
+
+        // this assumes in order arrival, not a great assumption
+        // TODO: use a better tracker of see packets
+        if (!ctx->first_dgram && server_datagram_id <= ctx->max_server_dgram_id) {printf("[client-quic] duplicate datagram %ld (<=%ld) recv from server\n", server_datagram_id, ctx->max_server_dgram_id); return;}
+        ctx->first_dgram = 0;
+        ctx->max_server_dgram_id = server_datagram_id;
+        if (sendto(ctx->udp_fd, (const unsigned char *)data + 8, data_len - 8, 0, (struct sockaddr*)&ctx->udp_client, sizeof(ctx->udp_client)) < 0) {
             printf("[client-proxy] sendto failed with error: %s\n", strerror(errno));   
-        } else { printf("[client-proxy] datagram forwarded to udp\n"); }
+        } else { 
+            printf("[client-proxy] datagram %ld forwarded to udp\n", server_datagram_id); 
+        }
     }
 }
 static void datagram_write_notify(xqc_connection_t *conn, void *user_data) {printf("[client-quic] datagram sent to server\n");}
@@ -294,7 +313,10 @@ int main(int argc, char *argv[]) {
             case 'd': 
                 conn_settings.max_datagram_frame_size = 65535; 
                 conn_settings.datagram_force_retrans_on = 0; 
-                ctx.dgram_id = 1;
+                ctx.quic_dgram_id = 1;
+                ctx.client_dgram_id = 0;
+                ctx.max_server_dgram_id = 0;
+                ctx.first_dgram = 1;
                 break;
             case 'r': conn_settings.enable_experimental_redundancy = 1; break;
             case 's': 
