@@ -27,8 +27,8 @@ typedef struct {
     struct sockaddr_in udp_client;
     uint64_t quic_dgram_id;
     uint64_t server_dgram_id;
-    uint64_t max_client_dgram_id;
-    int first_dgram;
+    uint64_t max_dgram_id;
+    uint64_t dgram_id_mask;
     xqc_stream_t *stream;
 } quic_ctx_t;
 static quic_ctx_t *g_proxy_ctx = NULL;
@@ -42,7 +42,7 @@ static xqc_usec_t get_timestamp(void) {
 // UDP socket callback
 static void proxy_udp_read_cb(int fd, short what, void *arg) {
     quic_ctx_t *ctx = (quic_ctx_t *)g_proxy_ctx;
-    unsigned char buf[1500];
+    unsigned char buf[2000];
     struct sockaddr_in src_addr;
     socklen_t src_len = sizeof(src_addr);
 
@@ -162,7 +162,7 @@ static int stream_read_notify(xqc_stream_t *strm, void *user_data) {
     quic_ctx_t *ctx = (quic_ctx_t *)g_proxy_ctx;
     if (!ctx) return 0;
 
-    unsigned char buf[1500];
+    unsigned char buf[2000];
     uint8_t fin = 0;
     while (1) {
         ssize_t n = xqc_stream_recv(strm, buf, sizeof(buf), &fin);
@@ -207,31 +207,50 @@ static void conn_handshake_finished(xqc_connection_t *conn, void *user_data, voi
     printf("[server-quic] handshake finished\n");
 }
 
+static int is_new_datagram(uint64_t id) {
+    quic_ctx_t *ctx = g_proxy_ctx;
+    if (id > ctx->max_dgram_id) {
+        uint64_t diff = id - ctx->max_dgram_id;
+        if (diff >= 64) {
+            ctx->dgram_id_mask = 1;
+        } else {
+            ctx->dgram_id_mask = (ctx->dgram_id_mask << diff) | 1;
+        }
+        ctx->max_dgram_id = id;
+        return 1;
+    } else {
+        uint64_t diff = ctx->max_dgram_id - id;
+        if (diff >= 64) {
+            return 0;
+        }
+        if (ctx->dgram_id_mask & (1ULL << diff)) {
+            return 0;
+        } else {
+            ctx->dgram_id_mask |= (1ULL << diff);
+            return 1;
+        }
+    }
+}
+
 // QUIC datagram callbacks
 static void datagram_read_notify(xqc_connection_t *conn, void *user_data, const void *data, size_t data_len, uint64_t flags) {
     quic_ctx_t *ctx = g_proxy_ctx;
     if (ctx == NULL) { return; }
 
-    // if udp client, forward datagramSS
+    // if udp client, forward datagram
     printf("[server-quic] datagram recv from server\n");
-    printf("[server-proxy] payload_len = %zu, max UDP payload = 65507\n", data_len);
-
     if (ctx->udp_fd && ctx->udp_client.sin_port != 0) {
         // Push the payload back out to your local UDP client
         uint64_t net_val;
         memcpy(&net_val, data, sizeof(uint64_t));
         uint64_t client_datagram_id = be64toh(net_val);
 
-        // this assumes in order arrival, not a great assumption
-        // TODO: use a better tracker of see packets
-        if (!ctx->first_dgram && client_datagram_id <= ctx->max_client_dgram_id) {printf("[server-quic] duplicate datagram %ld (<=%ld) recv from server\n", client_datagram_id, ctx->max_client_dgram_id); return;}
-        ctx->first_dgram = 0;
-        ctx->max_client_dgram_id = client_datagram_id;
+        if (!is_new_datagram(client_datagram_id)) {printf("[server-quic] duplicate datagram %ld (<=%ld) recv from server\n", client_datagram_id, ctx->max_dgram_id); return;}
+
         if (sendto(ctx->udp_fd, (const unsigned char *)data + 8, data_len - 8, 0, (struct sockaddr*)&ctx->udp_client, sizeof(ctx->udp_client)) < 0) {
-            printf("[server-proxy] payload_len = %zu, max UDP payload = 65507\n", data_len - 8);
             printf("[server-proxy] sendto failed with error: %s\n", strerror(errno));   
         } else { 
-            printf("[server-quic] datagram %ld (<=%ld) forwarded from server\n", client_datagram_id, ctx->max_client_dgram_id); 
+            printf("[server-quic] datagram %ld (<=%ld) forwarded from server\n", client_datagram_id, ctx->max_dgram_id); 
         }
     }
 }
@@ -289,7 +308,7 @@ static void engine_timer_cb(int fd, short what, void *arg) {
 
 // QUIC packet read callback
 static void packet_read_cb(int fd, short what, void *arg) {
-    unsigned char buf[1500];
+    unsigned char buf[2000];
     struct sockaddr_in peer_addr, local_addr;
     socklen_t local_len = sizeof(local_addr);
     quic_ctx_t *ctx = (quic_ctx_t *)g_proxy_ctx;
@@ -375,11 +394,13 @@ int main(int argc, char *argv[]) {
                 return 0; 
             case 'd': 
                 conn_settings.max_datagram_frame_size = 65535; 
+                conn_settings.max_udp_payload_size = 65527;
+                conn_settings.max_pkt_out_size = 2000;
                 conn_settings.datagram_force_retrans_on = 0;
                 ctx.quic_dgram_id = 1; 
                 ctx.server_dgram_id = 0;
-                ctx.max_client_dgram_id = 0;
-                ctx.first_dgram = 1;
+                ctx.max_dgram_id = 0;
+                ctx.dgram_id_mask = 0;
                 break;
             case 'r': conn_settings.enable_experimental_redundancy = 1; break;
             case 's':
