@@ -59,7 +59,7 @@ static void proxy_udp_read_cb(int fd, short what, void *arg) {
         // send to QUIC datagram API
         if (ctx->conn) {
             if (ctx->stream) {
-                ssize_t sent = xqc_stream_send(ctx->stream, buf, n, 0);
+                ssize_t sent = xqc_stream_send(ctx->stream, buf, n, 1);
                 if (sent < 0) {
                     fprintf(stderr, "[client-quic] xqc_stream_send failed: %zd\n", sent);
                 }
@@ -350,6 +350,8 @@ int main(int argc, char *argv[]) {
                     conn_settings.scheduler_callback = xqc_proactive_singlepath_scheduler_cb;
                 } else if (strcmp(optarg, "rmp") == 0) {
                     conn_settings.scheduler_callback = xqc_reactive_multipath_scheduler_cb;
+                } else if (strcmp(optarg, "spmp") == 0) {
+                    conn_settings.scheduler_callback = xqc_smart_proactive_multipath_scheduler_cb;
                 } else {
                     conn_settings.scheduler_callback = xqc_minrtt_scheduler_cb;
                 }
@@ -379,7 +381,7 @@ int main(int argc, char *argv[]) {
     if (!eb) return -1;
 
     xqc_engine_get_default_config(&cfg, XQC_ENGINE_CLIENT);
-    //cfg.cfg_log_level = XQC_LOG_INFO;
+    cfg.cfg_log_level = XQC_LOG_INFO;
 
     // define QUIC engine callbacks
     eng_cb.set_event_timer = set_event_timer;

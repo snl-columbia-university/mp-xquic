@@ -1329,6 +1329,8 @@ xqc_write_datagram_frame_to_packet(xqc_connection_t *conn, xqc_pkt_type_t pkt_ty
         packet_out->po_flag |= XQC_POF_QOS_HIGH;
     }
 
+    packet_out->po_qos_level = qos_level;
+
     return XQC_OK;
 }
 
