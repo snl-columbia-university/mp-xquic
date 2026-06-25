@@ -104,6 +104,7 @@ typedef struct xqc_packet_out_s {
 
     /* only meaningful if it contains a DATAGRAM frame */
     uint64_t                po_dgram_id;
+    xqc_data_qos_level_t    po_qos_level;
 
     /* Multipath */
     uint8_t                 po_path_flag;

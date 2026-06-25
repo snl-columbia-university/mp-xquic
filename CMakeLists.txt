@@ -233,6 +233,7 @@ set(
     "src/transport/scheduler/xqc_scheduler_reactive_multipath.c"
     "src/transport/scheduler/xqc_scheduler_proactive_multipath.c"
     "src/transport/scheduler/xqc_scheduler_proactive_singlepath.c"
+    "src/transport/scheduler/xqc_scheduler_smart_proactive_multipath.c"
 )
 
 if(XQC_ENABLE_MP_INTEROP)
