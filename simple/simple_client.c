@@ -5,6 +5,7 @@
 #include <getopt.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <endian.h>
 #include <arpa/inet.h>
 #include <sys/time.h>
 #include <event2/event.h>
@@ -27,7 +28,10 @@ typedef struct {
     int udp_fd;
     int udp_port;
     struct sockaddr_in udp_client;
-    uint64_t dgram_id;
+    uint64_t quic_dgram_id;
+    uint64_t client_dgram_id;
+    uint64_t max_dgram_id;
+    uint64_t dgram_id_mask;
     xqc_stream_t *stream;
 } quic_ctx_t;
 static quic_ctx_t *g_proxy_ctx = NULL;
@@ -41,7 +45,7 @@ static xqc_usec_t get_timestamp(void) {
 // UDP socket callback
 static void proxy_udp_read_cb(int fd, short what, void *arg) {
     quic_ctx_t *ctx = (quic_ctx_t *)g_proxy_ctx;
-    unsigned char buf[1500];
+    unsigned char buf[2000];
     struct sockaddr_in src_addr;
     socklen_t src_len = sizeof(src_addr);
 
@@ -55,14 +59,19 @@ static void proxy_udp_read_cb(int fd, short what, void *arg) {
         // send to QUIC datagram API
         if (ctx->conn) {
             if (ctx->stream) {
-                ssize_t sent = xqc_stream_send(ctx->stream, buf, n, 0);
+                ssize_t sent = xqc_stream_send(ctx->stream, buf, n, 1);
                 if (sent < 0) {
                     fprintf(stderr, "[client-quic] xqc_stream_send failed: %zd\n", sent);
                 }
             } else {
                 printf("[client-proxy] datagram recieved over udp\n");
-                xqc_datagram_send(ctx->conn, buf, n, &ctx->dgram_id, 1);
-                printf("[client-quic] datagram %ld forwarded over quic\n", ctx->dgram_id);
+                memmove(buf + 8, buf, n);
+                uint64_t net_val = htobe64(ctx->client_dgram_id);
+                memcpy(buf, &net_val, sizeof(uint64_t));
+                int err = xqc_datagram_send(ctx->conn, buf, n + sizeof(uint64_t), &ctx->quic_dgram_id, 1);
+                if (err < 0){ printf("[client-quic] datagram send error %i, %ld\n", err, xqc_datagram_get_mss(ctx->conn)); return;};
+                printf("[client-quic] datagram quic=%ld, server=%ld forwarded over quic\n", ctx->quic_dgram_id, ctx->client_dgram_id);
+                ctx->client_dgram_id++;
             }
         }
     }
@@ -99,7 +108,7 @@ static int stream_read_notify(xqc_stream_t *strm, void *user_data) {
     quic_ctx_t *ctx = (quic_ctx_t *)g_proxy_ctx;
     if (!ctx) return 0;
 
-    unsigned char buf[1500];
+    unsigned char buf[2000];
     uint8_t fin = 0;
     while (1) {
         ssize_t n = xqc_stream_recv(strm, buf, sizeof(buf), &fin);
@@ -135,7 +144,7 @@ static void conn_handshake_finished(xqc_connection_t *conn, void *user_data, voi
     printf("[client-quic] handshake finished, proxy routing is now active.\n");
     quic_ctx_t *ctx = (quic_ctx_t *)g_proxy_ctx;
     ctx->conn = conn;
-    if (!ctx->dgram_id) {
+    if (!ctx->quic_dgram_id) {
         // Create a bidirectional stream (or unidirectional if you prefer)
         ctx->stream = xqc_stream_create(ctx->engine, &cid, NULL, user_data);
         if (ctx->stream) {
@@ -167,6 +176,31 @@ void ready_to_create_path_notify(const xqc_cid_t *cid, void *user_data) {
 }
 int path_created_notify(xqc_connection_t *conn, const xqc_cid_t *cid, uint64_t path_id, void *user_data) { return 0; }
 
+static int is_new_datagram(uint64_t id) {
+    quic_ctx_t *ctx = g_proxy_ctx;
+    if (id > ctx->max_dgram_id) {
+        uint64_t diff = id - ctx->max_dgram_id;
+        if (diff >= 64) {
+            ctx->dgram_id_mask = 1;
+        } else {
+            ctx->dgram_id_mask = (ctx->dgram_id_mask << diff) | 1;
+        }
+        ctx->max_dgram_id = id;
+        return 1;
+    } else {
+        uint64_t diff = ctx->max_dgram_id - id;
+        if (diff >= 64) {
+            return 0;
+        }
+        if (ctx->dgram_id_mask & (1ULL << diff)) {
+            return 0;
+        } else {
+            ctx->dgram_id_mask |= (1ULL << diff);
+            return 1;
+        }
+    }
+}
+
 // QUIC datagram callbacks
 static void datagram_read_notify(xqc_connection_t *conn, void *user_data, const void *data, size_t data_len, uint64_t flags) {
     quic_ctx_t *ctx = g_proxy_ctx;
@@ -176,9 +210,17 @@ static void datagram_read_notify(xqc_connection_t *conn, void *user_data, const 
     printf("[client-quic] datagram recv from server\n");
     if (ctx->udp_fd && ctx->udp_client.sin_port != 0) {
         // Push the payload back out to your local UDP client
-        if (sendto(ctx->udp_fd, data, data_len, 0, (struct sockaddr*)&ctx->udp_client, sizeof(ctx->udp_client)) < 0) {
+        uint64_t net_val;
+        memcpy(&net_val, data, sizeof(uint64_t));
+        uint64_t server_datagram_id = be64toh(net_val);
+
+        if (is_new_datagram(server_datagram_id)) {printf("[client-quic] duplicate datagram %ld (<=%ld) recv from server\n", server_datagram_id, ctx->max_dgram_id); return;}
+
+        if (sendto(ctx->udp_fd, (const unsigned char *)data + 8, data_len - 8, 0, (struct sockaddr*)&ctx->udp_client, sizeof(ctx->udp_client)) < 0) {
             printf("[client-proxy] sendto failed with error: %s\n", strerror(errno));   
-        } else { printf("[client-proxy] datagram forwarded to udp\n"); }
+        } else { 
+            printf("[client-proxy] datagram %ld forwarded to udp\n", server_datagram_id); 
+        }
     }
 }
 static void datagram_write_notify(xqc_connection_t *conn, void *user_data) {printf("[client-quic] datagram sent to server\n");}
@@ -227,7 +269,7 @@ static void engine_timer_cb(int fd, short what, void *arg) {
 
 // QUIC packet read callback
 static void packet_read_cb(int fd, short what, void *arg) {
-    unsigned char buf[1500];
+    unsigned char buf[2000];
     struct sockaddr_in peer_addr, local_addr;
     quic_ctx_t *ctx = (quic_ctx_t *)arg;
     socklen_t peer_len = sizeof(peer_addr), local_len = sizeof(local_addr);
@@ -293,8 +335,12 @@ int main(int argc, char *argv[]) {
                 break;
             case 'd': 
                 conn_settings.max_datagram_frame_size = 65535; 
+                conn_settings.max_udp_payload_size = 65527;
+                conn_settings.max_pkt_out_size = 2000;
                 conn_settings.datagram_force_retrans_on = 0; 
-                ctx.dgram_id = 1;
+                ctx.quic_dgram_id = 1;
+                ctx.client_dgram_id = 0;
+                ctx.max_dgram_id = 0;
                 break;
             case 'r': conn_settings.enable_experimental_redundancy = 1; break;
             case 's': 
@@ -304,6 +350,8 @@ int main(int argc, char *argv[]) {
                     conn_settings.scheduler_callback = xqc_proactive_singlepath_scheduler_cb;
                 } else if (strcmp(optarg, "rmp") == 0) {
                     conn_settings.scheduler_callback = xqc_reactive_multipath_scheduler_cb;
+                } else if (strcmp(optarg, "spmp") == 0) {
+                    conn_settings.scheduler_callback = xqc_smart_proactive_multipath_scheduler_cb;
                 } else {
                     conn_settings.scheduler_callback = xqc_minrtt_scheduler_cb;
                 }
@@ -333,7 +381,7 @@ int main(int argc, char *argv[]) {
     if (!eb) return -1;
 
     xqc_engine_get_default_config(&cfg, XQC_ENGINE_CLIENT);
-    //cfg.cfg_log_level = XQC_LOG_INFO;
+    cfg.cfg_log_level = XQC_LOG_INFO;
 
     // define QUIC engine callbacks
     eng_cb.set_event_timer = set_event_timer;

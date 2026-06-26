@@ -14,7 +14,7 @@
 #define XQC_HEADER_SPACE                    28
 #define XQC_QUIC_MIN_MSS                    1200
 /* 1500 - 40 (IPv6) - 8 (UDP) - 16 (ACK) - 16 (AEAD) */
-#define XQC_QUIC_MAX_MSS                    1420
+#define XQC_QUIC_MAX_MSS                    1500
 #define XQC_MSS                             (XQC_QUIC_MAX_MSS + XQC_ACK_SPACE)
 
 /* max 0rtt packet count sent by client */

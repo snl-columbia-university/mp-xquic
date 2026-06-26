@@ -2087,12 +2087,6 @@ xqc_conn_schedule_packets(xqc_connection_t *conn,  xqc_list_head_t *head,
                                     packet_out->po_pkt.pkt_pns, send_type, conn->conn_settings.enable_experimental_redundancy, packet_out->po_experimental_redundancy_mask, xqc_frame_type_2_str(conn->engine, packet_out->po_frame_types), XQC_SEND_TYPE_NORMAL);
 
 
-        xqc_log(conn->log, XQC_LOG_INFO, "DEBUG CHECK: normal=%d, settings=%d, mask=%d, frame=%d",
-            (send_type == XQC_SEND_TYPE_NORMAL),
-            conn->conn_settings.enable_experimental_redundancy,
-            (packet_out->po_experimental_redundancy_mask != 0),
-            (packet_out->po_frame_types & XQC_FRAME_DATAGRAM));
-
         /* === experimental redundancy === */
         if (send_type == XQC_SEND_TYPE_NORMAL 
             && conn->conn_settings.enable_experimental_redundancy /* 1. Validate Feature Toggle */
