@@ -381,7 +381,7 @@ int main(int argc, char *argv[]) {
     if (!eb) return -1;
 
     xqc_engine_get_default_config(&cfg, XQC_ENGINE_CLIENT);
-    cfg.cfg_log_level = XQC_LOG_INFO;
+    //cfg.cfg_log_level = XQC_LOG_INFO;
 
     // define QUIC engine callbacks
     eng_cb.set_event_timer = set_event_timer;
