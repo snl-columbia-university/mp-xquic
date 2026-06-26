@@ -285,7 +285,6 @@ static void citm_stm_read_cb(int fd, short what, void *arg) {
 
 // CITM ctl set stm and game addrs 
 static void citm_ctl_set_target(const char *payload) {
-    quic_ctx_t *ctx = (quic_ctx_t *)g_proxy_ctx;
     citm_state *state = (citm_state *)g_citm_state;
     char stm_ip[64], game_ip[64];
     int app_port, game_port;
@@ -304,6 +303,23 @@ static void citm_ctl_set_target(const char *payload) {
     strncpy(state->game_ip, game_ip, sizeof(state->game_ip) - 1);
     state->game_ip[sizeof(state->game_ip) - 1] = '\0';
     state->game_port = game_port;
+    state->app_port = app_port;
+
+    if (state->app_fd < 0)
+    {
+        state->app_fd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (state->app_fd < 0) { return; }
+        fcntl(state->app_fd, F_SETFL, O_NONBLOCK);
+        struct sockaddr_in proxy_local_addr;
+        memset(&proxy_local_addr, 0, sizeof(proxy_local_addr));
+        proxy_local_addr.sin_family = AF_INET;
+        proxy_local_addr.sin_port = htons(state->app_port);
+        proxy_local_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+        bind(state->app_fd, (struct sockaddr *)&proxy_local_addr, sizeof(proxy_local_addr));
+        struct event *proxy_ev = event_new(eb, state->app_fd, EV_READ | EV_PERSIST, citm_stm_read_cb, NULL);
+        event_add(proxy_ev, NULL);
+        printf("[client-stm] listening for external UDP traffic on port %d...\n", state->app_port);
+    }
 
     state->ready = 1;
 
@@ -326,7 +342,7 @@ static void citm_ctl_read_cb(int fd, short what) {
         // send to QUIC datagram API
         const char *payload = (const char *)(buf + 1);  // NUL-terminated by caller
         switch (buf[0]) {
-            case CMD_SET_TARGET: apply_set_target(payload); break;
+            case CMD_SET_TARGET: citm_ctl_set_target(payload); break;
             default:             LOG("unknown command 0x%02X", buf[0]); break;
     }
     }
@@ -510,6 +526,7 @@ int main(int argc, char *argv[]) {
     // default citm configs
     state.id = "";
     state.ready = 0;
+    state.app_fd = -1;  // set up lazily in citm_ctl_set_target() once app_port is known
     state.multipath = 1;
     state.ctl_port = 5051;
 
@@ -615,21 +632,10 @@ int main(int argc, char *argv[]) {
         return -1;
     }
     printf("[client-citm] pinger thread started\n");
-    
-    // create, set-up, and add CITM stm socket to libevent loop
-    state.app_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (state.app_fd < 0) return -1;
-    fcntl(state.app_fd, F_SETFL, O_NONBLOCK);
-    memset(&state.stm_addr, 0, sizeof(state.stm_addr));
-    struct sockaddr_in proxy_local_addr;
-    memset(&proxy_local_addr, 0, sizeof(proxy_local_addr));
-    proxy_local_addr.sin_family = AF_INET;
-    proxy_local_addr.sin_port = htons(state.app_port);
-    proxy_local_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    bind(state.app_fd, (struct sockaddr *)&proxy_local_addr, sizeof(proxy_local_addr));
-    struct event *proxy_ev = event_new(eb, state.app_fd, EV_READ | EV_PERSIST, citm_stm_read_cb, &ctx);
-    event_add(proxy_ev, NULL);
-    printf("[client-stm] listening for external UDP traffic on port %d...\n", state.app_port);
+
+    // NOTE: the CITM stm/app socket (state.app_fd) is created, bound, and
+    // registered with libevent lazily in citm_ctl_set_target(), once the
+    // app_port is learned from the CMD_SET_TARGET control message.
 
     // add QUIC engine timer to libevent loop
     timer_ev = event_new(eb, -1, 0, engine_timer_cb, &ctx);
@@ -656,7 +662,7 @@ int main(int argc, char *argv[]) {
 
     xqc_engine_destroy(ctx.engine);
     close(ctx.quic_fd);
-    close(state.app_fd);
+    if (state.app_fd >= 0) close(state.app_fd);
     event_base_free(eb);
     return 0;
 }
