@@ -56,6 +56,17 @@ static void stm_game_read_cb(int fd, short what, void *arg) {
                 }
             } else {
                 printf("[server-stm] datagram recieved from game\n");
+                /*
+                * Datagram header (14 bytes total):
+                *
+                *   0                   1                   2                   3
+                *   0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+                *  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+                *  |                         Datagram ID (8)                       |
+                *  |                                                               |
+                *  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+                *
+                */
                 memmove(buf + sizeof(uint64_t), buf, n);
                 uint64_t net_val = htobe64(ctx->server_dgram_id);
                 memcpy(buf, &net_val, sizeof(uint64_t));
@@ -224,10 +235,23 @@ static void datagram_read_notify(xqc_connection_t *conn, void *user_data, const 
     quic_ctx_t *ctx = g_stm_ctx;
     if (ctx == NULL) { return; }
 
-    // if game client, forward datagram
     printf("[server-quic] datagram recv from server\n");
     if (ctx->game_fd) {
-        // Push the payload back out to your local GAME client
+        /*
+        * Datagram header (14 bytes total):
+        *
+        *   0                   1                   2                   3
+        *   0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+        *  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+        *  |                         Datagram ID (8)                       |
+        *  |                                                               |
+        *  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+        *  |                         Game IP (4)                           |
+        *  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+        *  |         Game Port (2)        |
+        *  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+        *
+        */
         int header_len = sizeof(uint64_t) + sizeof(u_int32_t) + sizeof(u_int16_t);
         uint64_t net_val;
         memcpy(&net_val, data, sizeof(uint64_t));

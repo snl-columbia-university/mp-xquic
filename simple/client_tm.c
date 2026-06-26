@@ -39,7 +39,7 @@ typedef struct {
     uint64_t dgram_id_mask;
     xqc_stream_t *stream;
 } quic_ctx_t;
-static quic_ctx_t *g_proxy_ctx = NULL;
+static quic_ctx_t *g_citm_ctx = NULL;
 
 // citm config
 #define CMD_SET_TARGET 0x01  // cloud->citm: "stm_ip:stm_port,game_ip:game_port"
@@ -77,17 +77,19 @@ static void log_write(xqc_log_level_t lvl, const void *buf, size_t size, void *a
 static ssize_t write_socket(const unsigned char *buf, size_t size,
                             const struct sockaddr *peer_addr, socklen_t peer_addrlen,
                             void *user_data) {
-    quic_ctx_t *ctx = (quic_ctx_t *)g_proxy_ctx;
+    quic_ctx_t *ctx = (quic_ctx_t *)g_citm_ctx;
     return sendto(ctx->quic_fd, buf, size, 0, peer_addr, peer_addrlen);
 }
 static ssize_t write_socket_ex(uint64_t path_id, const unsigned char *buf, size_t size,
                                const struct sockaddr *peer_addr, socklen_t peer_addrlen,
                                void *user_data) { 
     /*
-    quic_ctx_t *ctx = (quic_ctx_t *)g_proxy_ctx;  
+    quic_ctx_t *ctx = (quic_ctx_t *)g_citm_ctx;  
     struct sockaddr_in *path_addr;
     path_addr = &ctx->path_addrs[path_id];
     */
+
+    // TODO: incorportate quic into the path decisions, rn we just ignore
     citm_state *state = (citm_state *)g_citm_state;
     struct sockaddr_in *path_addr;
     path_addr = &state->stm_addr;
@@ -103,7 +105,7 @@ static int cert_verify_cb(const unsigned char *certs[], const size_t cert_len[],
 static int stream_create_notify(xqc_stream_t *strm, void *user_data) { return 0; }
 static int stream_close_notify(xqc_stream_t *strm, void *user_data) { return 0; }
 static int stream_read_notify(xqc_stream_t *strm, void *user_data) {
-    quic_ctx_t *ctx = (quic_ctx_t *)g_proxy_ctx;
+    quic_ctx_t *ctx = (quic_ctx_t *)g_citm_ctx;
     citm_state *state = (citm_state *)g_citm_state;
     if (!ctx) return 0;
 
@@ -112,10 +114,7 @@ static int stream_read_notify(xqc_stream_t *strm, void *user_data) {
     while (1) {
         ssize_t n = xqc_stream_recv(strm, buf, sizeof(buf), &fin);
         if (n > 0) {
-            if (state->app_fd && state->app_addr.sin_port != 0) {
-                sendto(state->app_fd, buf, n, 0,
-                       (struct sockaddr*)&state->app_addr, sizeof(state->app_addr));
-            }
+            continue;
         } else if (fin) {          // FIN received
             printf("[client-quic] stream %lu closed by peer\n", (unsigned long)xqc_stream_id(strm));
             break;
@@ -140,11 +139,10 @@ static int conn_close_notify(xqc_connection_t *conn, const xqc_cid_t *cid, void 
     return 0; 
 }
 static void conn_handshake_finished(xqc_connection_t *conn, void *user_data, void *proto_data) {
-    printf("[client-quic] handshake finished, proxy routing is now active.\n");
-    quic_ctx_t *ctx = (quic_ctx_t *)g_proxy_ctx;
+    printf("[client-quic] handshake finished, app routing is now active.\n");
+    quic_ctx_t *ctx = (quic_ctx_t *)g_citm_ctx;
     ctx->conn = conn;
     if (!ctx->quic_dgram_id) {
-        // Create a bidirectional stream (or unidirectional if you prefer)
         ctx->stream = xqc_stream_create(ctx->engine, &cid, NULL, user_data);
         if (ctx->stream) {
             printf("[client-quic] stream %lu created\n", (unsigned long)xqc_stream_id(ctx->stream));
@@ -159,8 +157,9 @@ static void save_session_cb(const  char *data, size_t data_len, void *user_data)
 
 // QUIC multipath callbacks
 void ready_to_create_path_notify(const xqc_cid_t *cid, void *user_data) {
+    // TODO: support multiple quic paths
     /*
-    quic_ctx_t *ctx = (quic_ctx_t *)g_proxy_ctx;
+    quic_ctx_t *ctx = (quic_ctx_t *)g_citm_ctx;
     // Create all remaining paths in one go
     while (ctx->next_path_idx < ctx->num_paths) {
         uint64_t new_path_id = 0;
@@ -178,7 +177,7 @@ void ready_to_create_path_notify(const xqc_cid_t *cid, void *user_data) {
 int path_created_notify(xqc_connection_t *conn, const xqc_cid_t *cid, uint64_t path_id, void *user_data) { return 0; }
 
 static int is_new_datagram(uint64_t id) {
-    quic_ctx_t *ctx = g_proxy_ctx;
+    quic_ctx_t *ctx = g_citm_ctx;
     if (id > ctx->max_dgram_id) {
         uint64_t diff = id - ctx->max_dgram_id;
         if (diff >= 64) {
@@ -204,25 +203,36 @@ static int is_new_datagram(uint64_t id) {
 
 // QUIC datagram callbacks
 static void datagram_read_notify(xqc_connection_t *conn, void *user_data, const void *data, size_t data_len, uint64_t flags) {
-    quic_ctx_t *ctx = g_proxy_ctx;
+    quic_ctx_t *ctx = g_citm_ctx;
     citm_state *state = (citm_state *)g_citm_state;
     if (ctx == NULL) { return; }
 
-    // if app socket and app client, forward datagram
     printf("[client-quic] datagram recv from server\n");
-
-    if (state->app_fd && state->app_addr.sin_port != 0) {
+    if (state->app_fd) {
+        /*
+        * Datagram header (14 bytes total):
+        *
+        *   0                   1                   2                   3
+        *   0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+        *  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+        *  |                         Datagram ID (8)                       |
+        *  |                                                               |
+        *  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+        *
+        */
         uint64_t net_val;
         memcpy(&net_val, data, sizeof(uint64_t));
         uint64_t server_datagram_id = be64toh(net_val);
-
-        if (is_new_datagram(server_datagram_id)) {printf("[client-quic] duplicate datagram %ld (<=%ld) recv from server\n", server_datagram_id, ctx->max_dgram_id); return;}
+        if (is_new_datagram(server_datagram_id)) {
+            printf("[client-quic] duplicate datagram %ld (<=%ld) recv from server\n", server_datagram_id, ctx->max_dgram_id);
+            return;
+        }
 
         int sent = sendto(state->app_fd, (const unsigned char *)data + sizeof(uint64_t), data_len - sizeof(uint64_t), 0, (struct sockaddr*)&state->app_addr, sizeof(state->app_addr));
         if (sent < 0) {
-            printf("[client-proxy] sendto failed with error: %s\n", strerror(errno));   
+            printf("[client-citm] sendto failed with error: %s\n", strerror(errno));   
         } else { 
-            printf("[client-proxy] datagram %ld forwarded to udp\n", server_datagram_id); 
+            printf("[client-citm] datagram %ld forwarded to udp\n", server_datagram_id); 
         }
     }
 }
@@ -264,7 +274,7 @@ static void set_event_timer(xqc_usec_t wake_after, void *user_data) {
     event_add(timer_ev, &tv);
 }
 static void engine_timer_cb(int fd, short what, void *arg) {
-    quic_ctx_t *ctx = (quic_ctx_t *)g_proxy_ctx;
+    quic_ctx_t *ctx = (quic_ctx_t *)g_citm_ctx;
     xqc_engine_main_logic(ctx->engine);
     struct timeval tv = {0, 10000};
     event_add(timer_ev, &tv);
@@ -274,7 +284,7 @@ static void engine_timer_cb(int fd, short what, void *arg) {
 static void packet_read_cb(int fd, short what, void *arg) {
     unsigned char buf[1500];
     struct sockaddr_in peer_addr, local_addr;
-    quic_ctx_t *ctx = (quic_ctx_t *)g_proxy_ctx;
+    quic_ctx_t *ctx = (quic_ctx_t *)g_citm_ctx;
     socklen_t peer_len = sizeof(peer_addr), local_len = sizeof(local_addr);
     ssize_t n = recvfrom(fd, buf, sizeof(buf), 0, (struct sockaddr*)&peer_addr, &peer_len);
     if (n > 0) {
@@ -289,7 +299,7 @@ static void packet_read_cb(int fd, short what, void *arg) {
 
 // CITM app socket callback
 static void citm_app_read_cb(int fd, short what, void *arg) {
-    quic_ctx_t *ctx = (quic_ctx_t *)g_proxy_ctx;
+    quic_ctx_t *ctx = (quic_ctx_t *)g_citm_ctx;
     citm_state *state = (citm_state *)g_citm_state;
 
     unsigned char buf[1500];
@@ -311,7 +321,22 @@ static void citm_app_read_cb(int fd, short what, void *arg) {
                     fprintf(stderr, "[client-quic] xqc_stream_send failed: %zd\n", sent);
                 }
             } else {
-                printf("[client-proxy] datagram recieved over udp\n");
+                printf("[client-citm] datagram recieved from app\n");
+                /*
+                * Datagram header (14 bytes total):
+                *
+                *   0                   1                   2                   3
+                *   0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+                *  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+                *  |                         Datagram ID (8)                       |
+                *  |                                                               |
+                *  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+                *  |                         Game IP (4)                           |
+                *  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+                *  |         Game Port (2)        |
+                *  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+                *
+                */
                 int header_len = sizeof(uint64_t) + sizeof(uint32_t) + sizeof(u_int16_t);
                 memmove(buf + header_len, buf, n);
                 uint64_t net_val = htobe64(ctx->client_dgram_id);
@@ -328,7 +353,7 @@ static void citm_app_read_cb(int fd, short what, void *arg) {
 
 // CITM ctl set stm and game addrs
 static void citm_ctl_set_target(const char *payload) {
-    quic_ctx_t *ctx = (quic_ctx_t *)g_proxy_ctx;
+    quic_ctx_t *ctx = (quic_ctx_t *)g_citm_ctx;
     citm_state *state = (citm_state *)g_citm_state;
     char stm_ip[64], game_ip[64];
     int stm_port, game_port;
@@ -551,7 +576,7 @@ int main(int argc, char *argv[]) {
     // initialize global quic context
     quic_ctx_t ctx;
     memset(&ctx, 0, sizeof(ctx));
-    g_proxy_ctx = &ctx;
+    g_citm_ctx = &ctx;
 
     // default quic configs
     conn_settings.max_datagram_frame_size = 0;
