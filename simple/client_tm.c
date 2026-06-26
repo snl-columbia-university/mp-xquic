@@ -56,6 +56,7 @@ typedef struct {
     char game_ip[64];
     int game_port;
     int game_fd;
+    struct event *game_ev;
     int ctl_fd;
     int ctl_port;
     struct sockaddr_in ctl_addr;
@@ -284,7 +285,19 @@ static void citm_stm_read_cb(int fd, short what, void *arg) {
     }
 }
 
-// CITM ctl set stm and game addrs 
+static void game_read_cb(int fd, short what, void *arg) {
+    citm_state *state = (citm_state *)g_citm_state;
+    unsigned char buf[1500];
+    ssize_t n;
+    while ((n = recv(fd, buf, sizeof(buf), 0)) > 0) {       
+        if (state->app_fd && state->app_addr.sin_port != 0) {
+            sendto(state->app_fd, buf, n, 0,
+                   (struct sockaddr *)&state->app_addr, sizeof(state->app_addr));
+        }
+    }
+}
+
+// CITM ctl set stm and game addrs
 static void citm_ctl_set_target(const char *payload) {
     quic_ctx_t *ctx = (quic_ctx_t *)g_proxy_ctx;
     citm_state *state = (citm_state *)g_citm_state;
@@ -307,6 +320,7 @@ static void citm_ctl_set_target(const char *payload) {
     state->game_port = game_port;
 
     if (state->game_fd > 0) {
+        if (state->game_ev) { event_free(state->game_ev); state->game_ev = NULL; }
         close(state->game_fd);
         state->game_fd = 0;
     }
@@ -338,6 +352,9 @@ static void citm_ctl_set_target(const char *payload) {
         return;
     }
     state->game_fd = gfd;
+
+    state->game_ev = event_new(eb, gfd, EV_READ | EV_PERSIST, game_read_cb, NULL);
+    event_add(state->game_ev, NULL);
 
     state->ready = 1;
 
