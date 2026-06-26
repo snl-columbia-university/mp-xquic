@@ -28,6 +28,8 @@ typedef struct {
     xqc_engine_t *engine;
     int quic_fd;
     xqc_connection_t *conn;
+    xqc_conn_settings_t *conn_settings;
+    xqc_conn_ssl_config_t *conn_ssl_config;
     struct sockaddr_in path_addrs[MAX_PATHS];
     int num_paths;
     int next_path_idx;
@@ -55,8 +57,6 @@ typedef struct {
     struct sockaddr_in stm_addr;
     char game_ip[64];
     int game_port;
-    int game_fd;
-    struct event *game_ev;
     int ctl_fd;
     int ctl_port;
     struct sockaddr_in ctl_addr;
@@ -147,7 +147,7 @@ static void conn_handshake_finished(xqc_connection_t *conn, void *user_data, voi
         // Create a bidirectional stream (or unidirectional if you prefer)
         ctx->stream = xqc_stream_create(ctx->engine, &cid, NULL, user_data);
         if (ctx->stream) {
-            printf("[client-quic] stream %lu created \n", (unsigned long)xqc_stream_id(ctx->stream));
+            printf("[client-quic] stream %lu created\n", (unsigned long)xqc_stream_id(ctx->stream));
         } else {
             printf("[client-quic] stream creation failed\n");
         }
@@ -253,8 +253,8 @@ static void packet_read_cb(int fd, short what, void *arg) {
     }
 }
 
-// CITM stm socket callback
-static void citm_stm_read_cb(int fd, short what, void *arg) {
+// CITM app socket callback
+static void citm_app_read_cb(int fd, short what, void *arg) {
     quic_ctx_t *ctx = (quic_ctx_t *)g_proxy_ctx;
     citm_state *state = (citm_state *)g_citm_state;
 
@@ -277,22 +277,11 @@ static void citm_stm_read_cb(int fd, short what, void *arg) {
                     fprintf(stderr, "[client-quic] xqc_stream_send failed: %zd\n", sent);
                 }
             } else {
+                // TODO: add game-ip + game-port to datagram
                 printf("[client-proxy] datagram recieved over udp\n");
                 xqc_datagram_send(ctx->conn, buf, n, &ctx->dgram_id, 1);
                 printf("[client-quic] datagram %ld forwarded over quic\n", ctx->dgram_id);
             }
-        }
-    }
-}
-
-static void game_read_cb(int fd, short what, void *arg) {
-    citm_state *state = (citm_state *)g_citm_state;
-    unsigned char buf[1500];
-    ssize_t n;
-    while ((n = recv(fd, buf, sizeof(buf), 0)) > 0) {       
-        if (state->app_fd && state->app_addr.sin_port != 0) {
-            sendto(state->app_fd, buf, n, 0,
-                   (struct sockaddr *)&state->app_addr, sizeof(state->app_addr));
         }
     }
 }
@@ -302,67 +291,48 @@ static void citm_ctl_set_target(const char *payload) {
     quic_ctx_t *ctx = (quic_ctx_t *)g_proxy_ctx;
     citm_state *state = (citm_state *)g_citm_state;
     char stm_ip[64], game_ip[64];
-    int app_port, game_port;
-    if (sscanf(payload, "%63[^:]:%d,%63[^:]:%d", stm_ip, &app_port, game_ip, &game_port) != 4) {printf("[client-citm] ctl set target error\n"); return;}
+    int stm_port, game_port;
+    if (sscanf(payload, "%63[^:]:%d,%63[^:]:%d", stm_ip, &stm_port, game_ip, &game_port) != 4) {printf("[client-citm] ctl set target error\n"); return;}
 
     if(!state->multipath && state->ready) { return; }
 
     memset(&state->stm_addr, 0, sizeof(state->stm_addr));
     state->stm_addr.sin_family = AF_INET;
     state->stm_addr.sin_port = htons(8000);
-    if (inet_pton(AF_INET, stm_ip, &state->stm_addr.sin_addr) <= 0) {
-        printf("[client-citm] invalid stm ip: %s\n", stm_ip);
-        return;
-    }
+    if (inet_pton(AF_INET, stm_ip, &state->stm_addr.sin_addr) <= 0) { printf("[client-citm] invalid stm ip: %s\n", stm_ip); return; }
 
     strncpy(state->game_ip, game_ip, sizeof(state->game_ip) - 1);
     state->game_ip[sizeof(state->game_ip) - 1] = '\0';
     state->game_port = game_port;
 
-    if (state->game_fd > 0) {
-        if (state->game_ev) { event_free(state->game_ev); state->game_ev = NULL; }
-        close(state->game_fd);
-        state->game_fd = 0;
-    }
+    // connect to QUIC server
+    const xqc_cid_t *cidp = xqc_connect(ctx->engine, ctx->conn_settings, NULL, 0, "localhost", 0,
+                                        ctx->conn_ssl_config, 
+                                        (struct sockaddr*)&state->stm_addr, sizeof(state->stm_addr),
+                                        "raw", NULL);
+    if (!cidp) { fprintf(stderr, "[client-quic] quic connection failed\n"); return; }
+    memcpy(&cid, cidp, sizeof(cid));
+    printf("[client-quic] quic connection initiated\n");
 
-    struct sockaddr_in game_addr;
-
-    memset(&game_addr, 0, sizeof(game_addr));
-
-    game_addr.sin_family = AF_INET;
-    game_addr.sin_port = htons(game_port);
-
-    if (inet_pton(AF_INET, game_ip, &game_addr.sin_addr) <= 0) {
-        printf("[client-citm] invalid game ip: %s\n", game_ip);
-        return;
-    }
-
-    int gfd = socket(AF_INET, SOCK_DGRAM, 0);
-
-    if (gfd < 0) {
-        printf("[client-citm] game socket() failed: %s\n", strerror(errno));
-        return;
-    }
-
-    fcntl(gfd, F_SETFL, O_NONBLOCK);
-
-    if (connect(gfd, (struct sockaddr *)&game_addr, sizeof(game_addr)) < 0) {
-        printf("[client-citm] game connect to %s:%d failed: %s\n", game_ip, game_port, strerror(errno));
-        close(gfd);
-        return;
-    }
-    state->game_fd = gfd;
-
-    state->game_ev = event_new(eb, gfd, EV_READ | EV_PERSIST, game_read_cb, NULL);
-    event_add(state->game_ev, NULL);
+    // create, set-up, and add CITM app socket to libevent loop
+    state->app_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (state->app_fd < 0) return;
+    fcntl(state->app_fd, F_SETFL, O_NONBLOCK);
+    struct sockaddr_in app_local_addr;
+    memset(&app_local_addr, 0, sizeof(app_local_addr));
+    app_local_addr.sin_family = AF_INET;
+    app_local_addr.sin_port = htons(state->game_port);
+    app_local_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    bind(state->app_fd, (struct sockaddr *)&app_local_addr, sizeof(app_local_addr));
+    struct event *app_ev = event_new(eb, state->app_fd, EV_READ | EV_PERSIST, citm_app_read_cb, NULL);
+    event_add(app_ev, NULL);
+    printf("[client-stm] listening for external UDP traffic on port %d...\n", state->game_port);
 
     state->ready = 1;
-
-    printf("[client-citm] ctl set target stm=%s:%d, game=%s:%d\n", stm_ip, app_port, game_ip, game_port);
 }
 
 // CITM ctl socket callback
-static void citm_ctl_read_cb(int fd, short what) {
+static void citm_ctl_read_cb(int fd, short what, void *arg) {
     citm_state *state = (citm_state *)g_citm_state;
     unsigned char buf[1500];
     struct sockaddr_in src_addr;
@@ -377,7 +347,7 @@ static void citm_ctl_read_cb(int fd, short what) {
         // send to QUIC datagram API
         const char *payload = (const char *)(buf + 1);  // NUL-terminated by caller
         switch (buf[0]) {
-            case CMD_SET_TARGET: apply_set_target(payload); break;
+            case CMD_SET_TARGET: citm_ctl_set_target(payload); break;
             default:             LOG("unknown command 0x%02X", buf[0]); break;
     }
     }
@@ -386,7 +356,7 @@ static void citm_ctl_read_cb(int fd, short what) {
 // CITM ctl socket set-up
 static int citm_ctl_setup() {
     citm_state *state = (citm_state *)g_citm_state;
-    struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM }, *res;
+    struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_DGRAM }, *res;
     char port_str[8];
     snprintf(port_str, sizeof(port_str), "%d", state->ctl_port);
     if (getaddrinfo("cloud-traffic-manager.xrnet-columbia.com", port_str, &hints, &res) != 0){ return 0; }
@@ -399,8 +369,8 @@ static int citm_ctl_setup() {
 
     char buf[256];
     int size = snprintf(buf, sizeof(buf), "%c%s\n", CMD_REGISTER, state->id);
-    if (sendto(state->ctl_fd, buf, size, 0, (struct sockaddr_in *)&state->ctl_addr, sizeof(state->ctl_addr) < 0)) {printf("[client-citm] ctl registration error"); return 0;}
-    else {printf("[client-citm] ctl registration");}
+    if (sendto(state->ctl_fd, buf, size, 0, (struct sockaddr *)&state->ctl_addr, sizeof(state->ctl_addr)) < 0) {printf("[client-citm] ctl registration error\n"); return 0;}
+    else {printf("[client-citm] ctl registration\n");}
 
     return 1;
 
@@ -408,7 +378,7 @@ static int citm_ctl_setup() {
 
 // Run one `ping` and parse the RTT in ms. Returns -1.0 on no reply or -2.0 
 // if the ping command could not be spawned.
-static double ping_host(const char *ip) {
+static double citm_ping_host(const char *ip) {
     char cmd[128], line[256];
     double rtt = -1.0;
 
@@ -430,7 +400,7 @@ static double ping_host(const char *ip) {
 }
 
 // dns resolver
-static int resolve_servers(char paths[64][64]) {
+static int citm_resolve_servers(char paths[64][64]) {
     struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_DGRAM }, *res, *p;
 
     int rc = getaddrinfo(servers_domain, NULL, &hints, &res);
@@ -451,13 +421,13 @@ static int resolve_servers(char paths[64][64]) {
 }
 
 // pinger thread loop
-static void *publish_measurements_thread(void *arg) {
+static void *citm_measurement_thread(void *arg) {
     citm_state *state = (citm_state *)g_citm_state;
     bool reachable[64];
     char paths[64][64];
 
     int count;
-    while ((count = resolve_servers(paths)) == 0) {
+    while ((count = citm_resolve_servers(paths)) == 0) {
         sleep(5);  // retry until the first lookup succeeds
     }
     for (int i = 0; i < count; i++) {
@@ -472,10 +442,10 @@ static void *publish_measurements_thread(void *arg) {
         bool first = true;
         int ok = 0;
         for (int i = 0; i < count; i++) {
-            double rtt = ping_host(paths[i]);
+            double rtt = citm_ping_host(paths[i]);
             if (rtt < 0) {
                 if (reachable[i]) {
-                    LOG("telemetry: server %s unreachable (%s)", paths[i],
+                    LOG("[client-citm] telemetry server %s unreachable (%s)", paths[i],
                         rtt <= -2.0 ? "ping could not run" : "no reply");
                     reachable[i] = false;
                 }
@@ -483,7 +453,7 @@ static void *publish_measurements_thread(void *arg) {
             }
             if (verbose) LOG("telemetry: server %s rtt=%.2f ms", paths[i], rtt);
             if (!reachable[i]) {
-                LOG("telemetry: server %s reachable again (%.2f ms)", paths[i], rtt);
+                LOG("[client-citm] telemetry server %s reachable again (%.2f ms)", paths[i], rtt);
                 reachable[i] = true;
             }
             ok++;
@@ -497,16 +467,13 @@ static void *publish_measurements_thread(void *arg) {
         if (len >= (int)sizeof(json)) len = sizeof(json) - 1;  // guard against truncation
 
         if (ok > 0) {  // nothing measured -> skip the empty report
-            // One datagram to the CTM control port: [CMD_TELEMETRY][json][\n].
-            // ctl_fd is read by the libevent loop and only written here, so a
-            // concurrent send + recv on the same UDP socket needs no lock.
             unsigned char msg[2 + sizeof(json)];
             msg[0] = CMD_TELEMETRY;
             memcpy(msg + 1, json, len);
             msg[1 + len] = '\n';
             if (sendto(state->ctl_fd, msg, len + 2, 0,
                        (struct sockaddr *)&state->ctl_addr, sizeof(state->ctl_addr)) < 0) {
-                LOG("telemetry: send failed: %s", strerror(errno));
+                LOG("[client-citm] telemetry send failed: %s", strerror(errno));
             }
         }
         sleep(1);
@@ -559,7 +526,7 @@ int main(int argc, char *argv[]) {
     g_citm_state = &state;
 
     // default citm configs
-    state.id = "";
+    state.id = "83760a4a23a04f4b8409d679fd6094bc";
     state.ready = 0;
     state.multipath = 1;
     state.ctl_port = 5051;
@@ -651,36 +618,21 @@ int main(int argc, char *argv[]) {
     fcntl(ctx.quic_fd, F_SETFL, O_NONBLOCK);
 
     // add QUIC socket to libevent loop
-    struct event *sock_ev = event_new(eb, ctx.quic_fd, EV_READ | EV_PERSIST, packet_read_cb, &ctx);
+    struct event *sock_ev = event_new(eb, ctx.quic_fd, EV_READ | EV_PERSIST, packet_read_cb, NULL);
     event_add(sock_ev, NULL);
 
     // create, set-up, and add CITM ctl socket to libevent loop
     if (!citm_ctl_setup()) { printf("[client-citm] ctl set up error"); return -1; }
-    struct event *citm_ctl_ev = event_new(eb, state.ctl_fd, EV_READ | EV_PERSIST, citm_ctl_read_cb);
+    struct event *citm_ctl_ev = event_new(eb, state.ctl_fd, EV_READ | EV_PERSIST, citm_ctl_read_cb, NULL);
     event_add(citm_ctl_ev, NULL);
-    printf("[client-citm] ctl set up");
+    printf("[client-citm] ctl set up\n");
 
     pthread_t pinger_tid;
-    if (pthread_create(&pinger_tid, NULL, publish_measurements_thread, NULL) != 0) {
+    if (pthread_create(&pinger_tid, NULL, citm_measurement_thread, NULL) != 0) {
         fprintf(stderr, "[client-citm] failed to start pinger thread: %s\n", strerror(errno));
         return -1;
     }
     printf("[client-citm] pinger thread started\n");
-    
-    // create, set-up, and add CITM stm socket to libevent loop
-    state.app_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (state.app_fd < 0) return -1;
-    fcntl(state.app_fd, F_SETFL, O_NONBLOCK);
-    memset(&state.stm_addr, 0, sizeof(state.stm_addr));
-    struct sockaddr_in proxy_local_addr;
-    memset(&proxy_local_addr, 0, sizeof(proxy_local_addr));
-    proxy_local_addr.sin_family = AF_INET;
-    proxy_local_addr.sin_port = htons(state.app_port);
-    proxy_local_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    bind(state.app_fd, (struct sockaddr *)&proxy_local_addr, sizeof(proxy_local_addr));
-    struct event *proxy_ev = event_new(eb, state.app_fd, EV_READ | EV_PERSIST, citm_stm_read_cb, &ctx);
-    event_add(proxy_ev, NULL);
-    printf("[client-stm] listening for external UDP traffic on port %d...\n", state.app_port);
 
     // add QUIC engine timer to libevent loop
     timer_ev = event_new(eb, -1, 0, engine_timer_cb, &ctx);
@@ -694,20 +646,15 @@ int main(int argc, char *argv[]) {
     conn_settings.mp_ping_on = 1;
     conn_settings.init_max_path_id = MAX_PATHS;
 
-    // connect to QUIC server
-    const xqc_cid_t *cidp = xqc_connect(ctx.engine, &conn_settings, NULL, 0, "localhost", 0,
-                                        &conn_ssl_config, 
-                                        (struct sockaddr*)&ctx.path_addrs[0], sizeof(ctx.path_addrs[0]),
-                                        "raw", &ctx);
-    if (!cidp) { fprintf(stderr, "[client-quic] quic connection failed\n"); return -1; }
-    memcpy(&cid, cidp, sizeof(cid));
-    printf("[client-quic] quic connection initiated\n");
+    ctx.conn_settings = &conn_settings;
+    ctx.conn_ssl_config = &conn_ssl_config;
 
     event_base_dispatch(eb);
 
     xqc_engine_destroy(ctx.engine);
     close(ctx.quic_fd);
     close(state.app_fd);
+    close(state.ctl_fd);
     event_base_free(eb);
     return 0;
 }
