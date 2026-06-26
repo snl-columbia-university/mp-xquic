@@ -487,3 +487,21 @@ target_link_libraries(
     -lstdc++           # Maps to -lstdc++
     -lm                # Maps to -lm
 )
+
+
+# 2. Add the Simple Client Target
+add_executable(
+    server_tm
+    "simple/server_tm.c"  # Adjust this path if the file is in a subdirectory (e.g., "demo/simple_client.c")
+)
+
+# Mirror your exact manual GCC flags inside CMake
+target_link_libraries(
+    server_tm
+    xquic-static       # Links the core engine static archive built with your modifications
+    ${SSL_LIB_PATH}    # Links the configured BoringSSL/BabaSSL static libraries
+    ${LIBEVENT_LIB}    # Maps directly to -levent
+    -lpthread          # Maps to -lpthread
+    -lstdc++           # Maps to -lstdc++
+    -lm                # Maps to -lm
+)

@@ -33,7 +33,10 @@ typedef struct {
     struct sockaddr_in path_addrs[MAX_PATHS];
     int num_paths;
     int next_path_idx;
-    uint64_t dgram_id;
+    uint64_t quic_dgram_id;
+    uint64_t client_dgram_id;
+    uint64_t max_dgram_id;
+    uint64_t dgram_id_mask;
     xqc_stream_t *stream;
 } quic_ctx_t;
 static quic_ctx_t *g_proxy_ctx = NULL;
@@ -140,7 +143,7 @@ static void conn_handshake_finished(xqc_connection_t *conn, void *user_data, voi
     printf("[client-quic] handshake finished, proxy routing is now active.\n");
     quic_ctx_t *ctx = (quic_ctx_t *)g_proxy_ctx;
     ctx->conn = conn;
-    if (!ctx->dgram_id) {
+    if (!ctx->quic_dgram_id) {
         // Create a bidirectional stream (or unidirectional if you prefer)
         ctx->stream = xqc_stream_create(ctx->engine, &cid, NULL, user_data);
         if (ctx->stream) {
@@ -174,19 +177,53 @@ void ready_to_create_path_notify(const xqc_cid_t *cid, void *user_data) {
 }
 int path_created_notify(xqc_connection_t *conn, const xqc_cid_t *cid, uint64_t path_id, void *user_data) { return 0; }
 
+static int is_new_datagram(uint64_t id) {
+    quic_ctx_t *ctx = g_proxy_ctx;
+    if (id > ctx->max_dgram_id) {
+        uint64_t diff = id - ctx->max_dgram_id;
+        if (diff >= 64) {
+            ctx->dgram_id_mask = 1;
+        } else {
+            ctx->dgram_id_mask = (ctx->dgram_id_mask << diff) | 1;
+        }
+        ctx->max_dgram_id = id;
+        return 1;
+    } else {
+        uint64_t diff = ctx->max_dgram_id - id;
+        if (diff >= 64) {
+            return 0;
+        }
+        if (ctx->dgram_id_mask & (1ULL << diff)) {
+            return 0;
+        } else {
+            ctx->dgram_id_mask |= (1ULL << diff);
+            return 1;
+        }
+    }
+}
+
 // QUIC datagram callbacks
 static void datagram_read_notify(xqc_connection_t *conn, void *user_data, const void *data, size_t data_len, uint64_t flags) {
     quic_ctx_t *ctx = g_proxy_ctx;
     citm_state *state = (citm_state *)g_citm_state;
     if (ctx == NULL) { return; }
 
-    // if STM socket and app client, forward datagram
+    // if app socket and app client, forward datagram
     printf("[client-quic] datagram recv from server\n");
+
     if (state->app_fd && state->app_addr.sin_port != 0) {
-        // Push the payload back out to your local CITM client
-        if (sendto(state->app_fd, data, data_len, 0, (struct sockaddr*)&state->app_addr, sizeof(state->app_addr)) < 0) {
+        uint64_t net_val;
+        memcpy(&net_val, data, sizeof(uint64_t));
+        uint64_t server_datagram_id = be64toh(net_val);
+
+        if (is_new_datagram(server_datagram_id)) {printf("[client-quic] duplicate datagram %ld (<=%ld) recv from server\n", server_datagram_id, ctx->max_dgram_id); return;}
+
+        int sent = sendto(state->app_fd, (const unsigned char *)data + sizeof(uint64_t), data_len - sizeof(uint64_t), 0, (struct sockaddr*)&state->app_addr, sizeof(state->app_addr));
+        if (sent < 0) {
             printf("[client-proxy] sendto failed with error: %s\n", strerror(errno));   
-        } else { printf("[client-proxy] datagram forwarded to udp\n"); }
+        } else { 
+            printf("[client-proxy] datagram %ld forwarded to udp\n", server_datagram_id); 
+        }
     }
 }
 static void datagram_write_notify(xqc_connection_t *conn, void *user_data) {printf("[client-quic] datagram sent to server\n");}
@@ -275,12 +312,15 @@ static void citm_app_read_cb(int fd, short what, void *arg) {
                 }
             } else {
                 printf("[client-proxy] datagram recieved over udp\n");
-                memmove(buf + 6, buf, n);
-                memcpy(buf, &state->game_addr.sin_addr.s_addr, 4);
-                memcpy(buf, &state->game_addr.sin_port, 2);
-                int err = xqc_datagram_send(ctx->conn, buf, n + 6, &ctx->dgram_id, 1);
+                int header_len = sizeof(uint64_t) + sizeof(uint32_t) + sizeof(u_int16_t);
+                memmove(buf + header_len, buf, n);
+                uint64_t net_val = htobe64(ctx->client_dgram_id);
+                memcpy(buf, &net_val, sizeof(uint64_t));
+                memcpy(buf + sizeof(uint64_t), &state->game_addr.sin_addr.s_addr, sizeof(u_int32_t));
+                memcpy(buf + sizeof(uint64_t) + sizeof(uint32_t), &state->game_addr.sin_port, sizeof(u_int16_t));
+                int err = xqc_datagram_send(ctx->conn, buf, n + header_len, &ctx->quic_dgram_id, 1);
                 if (err < 0){ printf("[client-quic] datagram send error %i\n", err); return;};
-                printf("[client-quic] datagram %ld forwarded over quic\n", ctx->dgram_id);
+                printf("[client-quic] datagram %ld forwarded over quic\n", ctx->quic_dgram_id);
             }
         }
     }
@@ -359,7 +399,7 @@ static int citm_ctl_setup() {
     citm_state *state = (citm_state *)g_citm_state;
     struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_DGRAM }, *res;
     char port_str[8];
-    snprintf(port_str, sizeof(port_str), "%d", state->ctl_port);
+    snprintf(port_str, sizeof(port_str), "%d", 5051);
     if (getaddrinfo("cloud-traffic-manager.xrnet-columbia.com", port_str, &hints, &res) != 0){ return 0; }
     else { state->ctl_addr = *(struct sockaddr_in *)res->ai_addr; }
     freeaddrinfo(res);
@@ -530,7 +570,6 @@ int main(int argc, char *argv[]) {
     state.id = "83760a4a23a04f4b8409d679fd6094bc";
     state.ready = 0;
     state.multipath = 1;
-    state.ctl_port = 5051;
 
     int opt;
     while ((opt = getopt(argc, argv, "drs:p:i:hv")) != -1) {
@@ -540,8 +579,12 @@ int main(int argc, char *argv[]) {
             return 0;
             case 'd': 
                 conn_settings.max_datagram_frame_size = 65535; 
+                conn_settings.max_udp_payload_size = 65527;
+                conn_settings.max_pkt_out_size = 2000;
                 conn_settings.datagram_force_retrans_on = 0; 
-                ctx.dgram_id = 1;
+                ctx.quic_dgram_id = 1;
+                ctx.client_dgram_id = 0;
+                ctx.max_dgram_id = 0;
                 break;
             case 'r': conn_settings.enable_experimental_redundancy = 1; break;
             case 's': 
@@ -551,6 +594,8 @@ int main(int argc, char *argv[]) {
                     conn_settings.scheduler_callback = xqc_proactive_singlepath_scheduler_cb;
                 } else if (strcmp(optarg, "rmp") == 0) {
                     conn_settings.scheduler_callback = xqc_reactive_multipath_scheduler_cb;
+                } else if (strcmp(optarg, "spmp") == 0) {
+                    conn_settings.scheduler_callback = xqc_smart_proactive_multipath_scheduler_cb;
                 } else {
                     conn_settings.scheduler_callback = xqc_minrtt_scheduler_cb;
                 }
