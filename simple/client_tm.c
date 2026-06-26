@@ -39,7 +39,7 @@ typedef struct {
 static quic_ctx_t *g_proxy_ctx = NULL;
 
 // citm config
-#define CMD_SET_TARGET 0x01  // cloud->citm: "stm_ip:app_port,game_ip:game_port"
+#define CMD_SET_TARGET 0x01  // cloud->citm: "stm_ip:stm_port,game_ip:game_port"
 #define CMD_TELEMETRY  0x04  // citm->cloud: {"client_id":..,"measurements":[..]}
 #define CMD_REGISTER   0x06  // citm->cloud: client_id
 
@@ -52,13 +52,10 @@ typedef struct {
     char *id;
     int ready;
     int app_fd;
-    int app_port;
     struct sockaddr_in app_addr;
     struct sockaddr_in stm_addr;
-    char game_ip[64];
-    int game_port;
+    struct sockaddr_in game_addr;
     int ctl_fd;
-    int ctl_port;
     struct sockaddr_in ctl_addr;
     int multipath;
 } citm_state;
@@ -277,9 +274,12 @@ static void citm_app_read_cb(int fd, short what, void *arg) {
                     fprintf(stderr, "[client-quic] xqc_stream_send failed: %zd\n", sent);
                 }
             } else {
-                // TODO: add game-ip + game-port to datagram
                 printf("[client-proxy] datagram recieved over udp\n");
-                xqc_datagram_send(ctx->conn, buf, n, &ctx->dgram_id, 1);
+                memmove(buf + 6, buf, n);
+                memcpy(buf, &state->game_addr.sin_addr.s_addr, 4);
+                memcpy(buf, &state->game_addr.sin_port, 2);
+                int err = xqc_datagram_send(ctx->conn, buf, n + 6, &ctx->dgram_id, 1);
+                if (err < 0){ printf("[client-quic] datagram send error %i\n", err); return;};
                 printf("[client-quic] datagram %ld forwarded over quic\n", ctx->dgram_id);
             }
         }
@@ -301,9 +301,10 @@ static void citm_ctl_set_target(const char *payload) {
     state->stm_addr.sin_port = htons(8000);
     if (inet_pton(AF_INET, stm_ip, &state->stm_addr.sin_addr) <= 0) { printf("[client-citm] invalid stm ip: %s\n", stm_ip); return; }
 
-    strncpy(state->game_ip, game_ip, sizeof(state->game_ip) - 1);
-    state->game_ip[sizeof(state->game_ip) - 1] = '\0';
-    state->game_port = game_port;
+    memset(&state->game_addr, 0, sizeof(state->game_addr));
+    state->game_addr.sin_family = AF_INET;
+    state->game_addr.sin_port = htons(game_port);
+    if (inet_pton(AF_INET, game_ip, &state->game_addr.sin_addr) <= 0) { printf("[client-citm] invalid game ip: %s\n", game_ip); return; }
 
     // connect to QUIC server
     const xqc_cid_t *cidp = xqc_connect(ctx->engine, ctx->conn_settings, NULL, 0, "localhost", 0,
@@ -321,12 +322,12 @@ static void citm_ctl_set_target(const char *payload) {
     struct sockaddr_in app_local_addr;
     memset(&app_local_addr, 0, sizeof(app_local_addr));
     app_local_addr.sin_family = AF_INET;
-    app_local_addr.sin_port = htons(state->game_port);
+    app_local_addr.sin_port = state->game_addr.sin_port;
     app_local_addr.sin_addr.s_addr = htonl(INADDR_ANY);
     bind(state->app_fd, (struct sockaddr *)&app_local_addr, sizeof(app_local_addr));
     struct event *app_ev = event_new(eb, state->app_fd, EV_READ | EV_PERSIST, citm_app_read_cb, NULL);
     event_add(app_ev, NULL);
-    printf("[client-stm] listening for external UDP traffic on port %d...\n", state->game_port);
+    printf("[client-stm] listening for external UDP traffic on port %d...\n", state->game_addr.sin_port);
 
     state->ready = 1;
 }
@@ -485,12 +486,12 @@ static void usage(const char *progname) {
     fprintf(stderr,
         "Usage: %s [options]\n"
         "Options:\n"
-        "  -u <port>     Set local UDP port (client only, default 7778)\n"
         "  -d            Enable datagram mode (sets max_datagram_frame_size)\n"
         "  -r            Enable experimental redundancy\n"
         "  -s <sched>    Select scheduler: pmp (proactive multipath),\n"
         "                psp (proactive singlepath), minrtt (default)\n"
         "  -p <ip>       Add peer address (can be repeated, client only)\n"
+        "  -i <id>       Sets client-id used for ctm registration"
         "  -h            Show this help\n"
         "\n"
         "Example:\n"
