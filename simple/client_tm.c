@@ -55,6 +55,7 @@ typedef struct {
     struct sockaddr_in stm_addr;
     char game_ip[64];
     int game_port;
+    int game_fd;
     int ctl_fd;
     int ctl_port;
     struct sockaddr_in ctl_addr;
@@ -304,6 +305,39 @@ static void citm_ctl_set_target(const char *payload) {
     strncpy(state->game_ip, game_ip, sizeof(state->game_ip) - 1);
     state->game_ip[sizeof(state->game_ip) - 1] = '\0';
     state->game_port = game_port;
+
+    if (state->game_fd > 0) {
+        close(state->game_fd);
+        state->game_fd = 0;
+    }
+
+    struct sockaddr_in game_addr;
+
+    memset(&game_addr, 0, sizeof(game_addr));
+
+    game_addr.sin_family = AF_INET;
+    game_addr.sin_port = htons(game_port);
+
+    if (inet_pton(AF_INET, game_ip, &game_addr.sin_addr) <= 0) {
+        printf("[client-citm] invalid game ip: %s\n", game_ip);
+        return;
+    }
+
+    int gfd = socket(AF_INET, SOCK_DGRAM, 0);
+
+    if (gfd < 0) {
+        printf("[client-citm] game socket() failed: %s\n", strerror(errno));
+        return;
+    }
+
+    fcntl(gfd, F_SETFL, O_NONBLOCK);
+
+    if (connect(gfd, (struct sockaddr *)&game_addr, sizeof(game_addr)) < 0) {
+        printf("[client-citm] game connect to %s:%d failed: %s\n", game_ip, game_port, strerror(errno));
+        close(gfd);
+        return;
+    }
+    state->game_fd = gfd;
 
     state->ready = 1;
 
