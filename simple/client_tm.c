@@ -6,9 +6,15 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <sys/time.h>
+#include <time.h>
+#include <pthread.h>
+#include <stdbool.h>
 #include <event2/event.h>
 #include <xquic/xquic.h>
+
+#define LOG(fmt, ...) printf("[%ld] " fmt "\n", (long)time(NULL), ##__VA_ARGS__)
 
 // quic config
 #define MAX_PATHS 4
@@ -34,6 +40,10 @@ static quic_ctx_t *g_proxy_ctx = NULL;
 #define CMD_SET_TARGET 0x01  // cloud->citm: "stm_ip:app_port,game_ip:game_port"
 #define CMD_TELEMETRY  0x04  // citm->cloud: {"client_id":..,"measurements":[..]}
 #define CMD_REGISTER   0x06  // citm->cloud: client_id
+
+// telemetry: DNS name of the game-server pool to ping and report RTTs for
+static const char *servers_domain = "gameservers.xrnet-columbia.com";
+static bool verbose = false;  // -v: log every per-server RTT sample
 
 // citm state
 typedef struct {
@@ -328,7 +338,7 @@ static int citm_ctl_setup() {
     struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM }, *res;
     char port_str[8];
     snprintf(port_str, sizeof(port_str), "%d", state->ctl_port);
-    if (getaddrinfo("cloud-traffic-manager.xrnet-columbia.com", state->ctl_port, &hints, &res) != 0){ return 0; }
+    if (getaddrinfo("cloud-traffic-manager.xrnet-columbia.com", port_str, &hints, &res) != 0){ return 0; }
     else { state->ctl_addr = *(struct sockaddr_in *)res->ai_addr; }
     freeaddrinfo(res);
 
@@ -343,6 +353,114 @@ static int citm_ctl_setup() {
 
     return 1;
 
+}
+
+// Run one `ping` and parse the RTT in ms. Returns -1.0 on no reply or -2.0 
+// if the ping command could not be spawned.
+static double ping_host(const char *ip) {
+    char cmd[128], line[256];
+    double rtt = -1.0;
+
+    snprintf(cmd, sizeof(cmd), "ping -c 1 -W 1 %s 2>/dev/null", ip);
+    errno = 0;
+
+    FILE *fp = popen(cmd, "r");
+    if (!fp) {
+        LOG("ping: could not run ping for %s: %s", ip, strerror(errno));
+        return -2.0;
+    }
+    while (fgets(line, sizeof(line), fp)) {
+        char *t = strstr(line, "time=");
+        if (t) { sscanf(t, "time=%lf", &rtt); break; }
+    }
+    pclose(fp);
+
+    return rtt;
+}
+
+// dns resolver
+static int resolve_servers(char paths[64][64]) {
+    struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_DGRAM }, *res, *p;
+
+    int rc = getaddrinfo(servers_domain, NULL, &hints, &res);
+    if (rc != 0) {
+        LOG("telemetry: DNS resolution of '%s' failed: %s", servers_domain, gai_strerror(rc));
+        return 0;
+    }
+
+    int count = 0;
+    for (p = res; p && count < 64; p = p->ai_next) {
+        inet_ntop(AF_INET, &((struct sockaddr_in *)p->ai_addr)->sin_addr, paths[count++], 64);
+    }
+    freeaddrinfo(res);
+
+    if (count == 0) LOG("telemetry: '%s' resolved to no IPv4 addresses", servers_domain);
+    else            LOG("telemetry: resolved %d server(s) from '%s'", count, servers_domain);
+    return count;
+}
+
+// pinger thread loop
+static void *publish_measurements_thread(void *arg) {
+    citm_state *state = (citm_state *)g_citm_state;
+    bool reachable[64];
+    char paths[64][64];
+
+    int count;
+    while ((count = resolve_servers(paths)) == 0) {
+        sleep(5);  // retry until the first lookup succeeds
+    }
+    for (int i = 0; i < count; i++) {
+        reachable[i] = true;
+    }
+
+    while (1) {
+        // Flat schema: {"client_id":..,"measurements":[{"server_ip":..,"rtt":..}, ..]}
+        char json[4096];
+        int len = snprintf(json, sizeof(json),
+                           "{\"client_id\":\"%s\",\"measurements\":[", state->id);
+        bool first = true;
+        int ok = 0;
+        for (int i = 0; i < count; i++) {
+            double rtt = ping_host(paths[i]);
+            if (rtt < 0) {
+                if (reachable[i]) {
+                    LOG("telemetry: server %s unreachable (%s)", paths[i],
+                        rtt <= -2.0 ? "ping could not run" : "no reply");
+                    reachable[i] = false;
+                }
+                continue;
+            }
+            if (verbose) LOG("telemetry: server %s rtt=%.2f ms", paths[i], rtt);
+            if (!reachable[i]) {
+                LOG("telemetry: server %s reachable again (%.2f ms)", paths[i], rtt);
+                reachable[i] = true;
+            }
+            ok++;
+            len += snprintf(json + len, sizeof(json) - len,
+                            "%s{\"server_ip\":\"%s\",\"rtt\":%.2f}",
+                            first ? "" : ",", paths[i], rtt);
+            first = false;
+        }
+        len += snprintf(json + len, sizeof(json) - len, "]}");
+        if (len < 0) len = 0;
+        if (len >= (int)sizeof(json)) len = sizeof(json) - 1;  // guard against truncation
+
+        if (ok > 0) {  // nothing measured -> skip the empty report
+            // One datagram to the CTM control port: [CMD_TELEMETRY][json][\n].
+            // ctl_fd is read by the libevent loop and only written here, so a
+            // concurrent send + recv on the same UDP socket needs no lock.
+            unsigned char msg[2 + sizeof(json)];
+            msg[0] = CMD_TELEMETRY;
+            memcpy(msg + 1, json, len);
+            msg[1 + len] = '\n';
+            if (sendto(state->ctl_fd, msg, len + 2, 0,
+                       (struct sockaddr *)&state->ctl_addr, sizeof(state->ctl_addr)) < 0) {
+                LOG("telemetry: send failed: %s", strerror(errno));
+            }
+        }
+        sleep(1);
+    }
+    return NULL;
 }
 
 static void usage(const char *progname) {
@@ -396,7 +514,7 @@ int main(int argc, char *argv[]) {
     state.ctl_port = 5051;
 
     int opt;
-    while ((opt = getopt(argc, argv, "drs:p:i:h")) != -1) {
+    while ((opt = getopt(argc, argv, "drs:p:i:hv")) != -1) {
         switch (opt) {
             case 'h':
                 usage(argv[0]);
@@ -435,6 +553,10 @@ int main(int argc, char *argv[]) {
                 break;
             case 'i':
                 state.id = optarg;
+                break;
+            case 'v':
+                verbose = true;
+                break;
             default:
                 usage(argv[0]);
                 return 0;
@@ -482,10 +604,17 @@ int main(int argc, char *argv[]) {
     event_add(sock_ev, NULL);
 
     // create, set-up, and add CITM ctl socket to libevent loop
-    if (!citm_ctl_setup()) { printf("[client-citm] ctl set up error"); return;};
+    if (!citm_ctl_setup()) { printf("[client-citm] ctl set up error"); return -1; }
     struct event *citm_ctl_ev = event_new(eb, state.ctl_fd, EV_READ | EV_PERSIST, citm_ctl_read_cb);
     event_add(citm_ctl_ev, NULL);
     printf("[client-citm] ctl set up");
+
+    pthread_t pinger_tid;
+    if (pthread_create(&pinger_tid, NULL, publish_measurements_thread, NULL) != 0) {
+        fprintf(stderr, "[client-citm] failed to start pinger thread: %s\n", strerror(errno));
+        return -1;
+    }
+    printf("[client-citm] pinger thread started\n");
     
     // create, set-up, and add CITM stm socket to libevent loop
     state.app_fd = socket(AF_INET, SOCK_DGRAM, 0);
