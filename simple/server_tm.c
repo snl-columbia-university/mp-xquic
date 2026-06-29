@@ -263,19 +263,24 @@ static void datagram_read_notify(xqc_connection_t *conn, void *user_data, const 
 
         uint32_t game_ip;
         uint16_t game_port;
-        memcpy(&game_ip, data, 4);
-        memcpy(&game_port, (const uint8_t *)data + 4, 2);
+        memcpy(&game_ip, data + sizeof(uint64_t), sizeof(uint32_t));
+        memcpy(&game_port, data + sizeof(uint64_t) + sizeof(uint32_t), sizeof(uint16_t));
         struct sockaddr_in game_addr;
         memset(&game_addr, 0, sizeof(game_addr));
         game_addr.sin_family = AF_INET;
         game_addr.sin_port = game_port;
         game_addr.sin_addr.s_addr = game_ip;
 
+        char ip_str[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &game_ip, ip_str, sizeof(ip_str));
+        printf("[server-stm] forwarding to game %s:%u (dgram_id=%lu, payload_len=%zu)\n",
+            ip_str, ntohs(game_port), client_datagram_id, data_len - header_len);
+
         ssize_t sent = sendto(ctx->game_fd, (const unsigned char *)data + header_len, data_len - header_len, 0, (struct sockaddr*)&game_addr, sizeof(game_addr));
         if (sent < 0) {
             printf("[server-stm] sendto failed with error: %s\n", strerror(errno));   
         } else { 
-            printf("[server-quic] datagram %ld (<=%ld) forwarded from server\n", client_datagram_id, ctx->max_dgram_id); 
+            printf("[server-stm] datagram %ld (<=%ld) forwarded to game\n", client_datagram_id, ctx->max_dgram_id); 
         }
     }
 }
