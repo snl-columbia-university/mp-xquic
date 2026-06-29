@@ -68,11 +68,10 @@ static void stm_game_read_cb(int fd, short what, void *arg) {
                 *
                 */
                 memmove(buf + sizeof(uint64_t), buf, n);
-                uint64_t net_val = htobe64(ctx->server_dgram_id);
+                uint64_t net_val = htobe64(ctx->server_dgram_id++);
                 memcpy(buf, &net_val, sizeof(uint64_t));
                 xqc_datagram_send(ctx->conn, buf, n + sizeof(uint64_t), &ctx->quic_dgram_id, 1);
                 printf("[server-quic] datagram quic=%ld, server=%ld forwarded over quic\n", ctx->quic_dgram_id, ctx->server_dgram_id);
-                ctx->server_dgram_id++;
                 printf("[server-quic] datagram %ld forwarded over quic\n", ctx->quic_dgram_id);
             }
         }
