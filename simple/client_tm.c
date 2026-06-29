@@ -223,7 +223,7 @@ static void datagram_read_notify(xqc_connection_t *conn, void *user_data, const 
         uint64_t net_val;
         memcpy(&net_val, data, sizeof(uint64_t));
         uint64_t server_datagram_id = be64toh(net_val);
-        if (is_new_datagram(server_datagram_id)) {
+        if (!is_new_datagram(server_datagram_id)) {
             printf("[client-quic] duplicate datagram %ld (<=%ld) recv from server\n", server_datagram_id, ctx->max_dgram_id);
             return;
         }
@@ -339,7 +339,7 @@ static void citm_app_read_cb(int fd, short what, void *arg) {
                 */
                 int header_len = sizeof(uint64_t) + sizeof(uint32_t) + sizeof(u_int16_t);
                 memmove(buf + header_len, buf, n);
-                uint64_t net_val = htobe64(ctx->client_dgram_id);
+                uint64_t net_val = htobe64(ctx->client_dgram_id++);
                 memcpy(buf, &net_val, sizeof(uint64_t));
                 memcpy(buf + sizeof(uint64_t), &state->game_addr.sin_addr.s_addr, sizeof(u_int32_t));
                 memcpy(buf + sizeof(uint64_t) + sizeof(uint32_t), &state->game_addr.sin_port, sizeof(u_int16_t));
@@ -347,7 +347,8 @@ static void citm_app_read_cb(int fd, short what, void *arg) {
                 if (err < 0){ printf("[client-quic] datagram send error %i\n", err); return;};
                 char game_ip_str[INET_ADDRSTRLEN];
                 inet_ntop(AF_INET, &state->game_addr.sin_addr, game_ip_str, sizeof(game_ip_str));
-                printf("[client-quic] datagram %ld forwarded over quic, game-ip:%s, game-port:%d\n", ctx->quic_dgram_id, game_ip_str, state->game_addr.sin_port);
+                printf("[client-quic] datagram q:%ld, c:%ld forwarded over quic, game-ip:%s, game-port:%d\n",
+                    ctx->quic_dgram_id, ctx->client_dgram_id - 1, game_ip_str, (state->game_addr.sin_port));
             }
         }
     }
