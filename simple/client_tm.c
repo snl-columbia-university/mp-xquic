@@ -345,7 +345,9 @@ static void citm_app_read_cb(int fd, short what, void *arg) {
                 memcpy(buf + sizeof(uint64_t) + sizeof(uint32_t), &state->game_addr.sin_port, sizeof(u_int16_t));
                 int err = xqc_datagram_send(ctx->conn, buf, n + header_len, &ctx->quic_dgram_id, 1);
                 if (err < 0){ printf("[client-quic] datagram send error %i\n", err); return;};
-                printf("[client-quic] datagram %ld forwarded over quic\n", ctx->quic_dgram_id);
+                char game_ip_str[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &state->game_addr.sin_addr, game_ip_str, sizeof(game_ip_str));
+                printf("[client-quic] datagram %ld forwarded over quic, game-ip:%s, game-port:%d\n", ctx->quic_dgram_id, game_ip_str, state->game_addr.sin_port);
             }
         }
     }
@@ -370,6 +372,10 @@ static void citm_ctl_set_target(const char *payload) {
     state->game_addr.sin_family = AF_INET;
     state->game_addr.sin_port = htons(game_port);
     if (inet_pton(AF_INET, game_ip, &state->game_addr.sin_addr) <= 0) { printf("[client-citm] invalid game ip: %s\n", game_ip); return; }
+
+    char game_ip_str[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &state->game_addr.sin_addr, game_ip_str, sizeof(game_ip_str));
+    printf("[client-citm] game target set to %s:%d\n", game_ip_str, game_port);
 
     // connect to QUIC server
     const xqc_cid_t *cidp = xqc_connect(ctx->engine, ctx->conn_settings, NULL, 0, "localhost", 0,
