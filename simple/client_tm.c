@@ -549,6 +549,7 @@ static void *citm_measurement_thread(void *arg) {
                 LOG("[client-citm] telemetry send failed: %s", strerror(errno));
             }
         }
+        fflush(stdout);  
         sleep(1);
     }
     return NULL;
