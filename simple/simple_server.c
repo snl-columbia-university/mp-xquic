@@ -180,7 +180,10 @@ static int stream_read_notify(xqc_stream_t *strm, void *user_data) {
     }
     return 0;
 }
-static int stream_write_notify(xqc_stream_t *strm, void *user_data) { printf("[server-quic] stream %lu sent to client\n", (unsigned long)xqc_stream_id(strm)); return 0; }
+static int stream_write_notify(xqc_stream_t *strm, void *user_data) { 
+    printf("[server-quic] stream %lu sent to client\n", (unsigned long)xqc_stream_id(strm)); 
+    return 0; 
+}
 
 // QUIC connection callbacks
 static int conn_create_notify(xqc_connection_t *conn, const xqc_cid_t *cid, void *user_data, void *proto_data) { 
@@ -456,6 +459,7 @@ int main(int argc, char *argv[]) {
     conn_settings.mp_ping_on = 1;
     conn_settings.init_max_path_id = 4;
     conn_settings.least_available_cid_count = 4;
+    conn_settings.max_streams_bidi = 32;
 
     // create QUIC engine
     ctx.engine = xqc_engine_create(XQC_ENGINE_SERVER, &cfg, &ssl_cfg, &eng_cb, &trans_cb, &ctx);
