@@ -62,7 +62,7 @@ static void proxy_udp_read_cb(int fd, short what, void *arg) {
         // send to QUIC datagram API
         if (ctx->conn) {
             if (ctx->stream) {
-                ssize_t sent = xqc_stream_send(ctx->stream, buf, n, 1);
+                ssize_t sent = xqc_stream_send(ctx->stream, buf, n, 0);
                 if (sent < 0) {
                     fprintf(stderr, "[client-quic] xqc_stream_send failed: %zd\n", sent);
                 }
@@ -99,7 +99,7 @@ static ssize_t write_socket_ex(uint64_t path_id, const unsigned char *buf, size_
     struct sockaddr_in *local_addr;
     int *quic_fd;
 
-    peer_addr = &ctx->peer_addrs[path_id / ctx->num_peer_addrs];
+    peer_addr = &ctx->peer_addrs[(path_id / ctx->num_local_addrs) % ctx->num_peer_addrs];
     local_addr = &ctx->local_addrs[path_id % ctx->num_local_addrs];
     quic_fd = &ctx->quic_fds[path_id % ctx->num_local_addrs];
 
