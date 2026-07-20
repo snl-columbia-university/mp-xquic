@@ -5,6 +5,7 @@
 #include <getopt.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <ifaddrs.h>
 #include <endian.h>
 #include <arpa/inet.h>
 #include <sys/time.h>
@@ -20,11 +21,13 @@ static xqc_cid_t cid;
 // ctx structure
 typedef struct {
     xqc_engine_t *engine;
-    int quic_fd;
+    int quic_fds[MAX_PATHS];
     xqc_connection_t *conn;
-    struct sockaddr_in path_addrs[MAX_PATHS];
+    struct sockaddr_in peer_addrs[MAX_PATHS];
+    int num_peer_addrs;
+    struct sockaddr_in local_addrs[MAX_PATHS];
+    int num_local_addrs;
     int num_paths;
-    int next_path_idx;
     int udp_fd;
     int udp_port;
     struct sockaddr_in udp_client;
@@ -84,18 +87,31 @@ static void log_write(xqc_log_level_t lvl, const void *buf, size_t size, void *a
 static ssize_t write_socket(const unsigned char *buf, size_t size,
                             const struct sockaddr *peer_addr, socklen_t peer_addrlen,
                             void *user_data) {
-    quic_ctx_t *ctx = (quic_ctx_t *)g_proxy_ctx;
-    return sendto(ctx->quic_fd, buf, size, 0, peer_addr, peer_addrlen);
+    int quic_fd = *((int *)user_data);
+    return sendto(quic_fd, buf, size, 0, peer_addr, peer_addrlen);
 }
 static ssize_t write_socket_ex(uint64_t path_id, const unsigned char *buf, size_t size,
-                               const struct sockaddr *peer_addr, socklen_t peer_addrlen,
+                               const struct sockaddr *_peer_addr, socklen_t _peer_addrlen,
                                void *user_data) { 
     quic_ctx_t *ctx = (quic_ctx_t *)g_proxy_ctx;  
-    struct sockaddr_in *path_addr;
-    path_addr = &ctx->path_addrs[path_id];
-    printf("[client-quic] write_socket_ex called for path_id %lu to %s:%d\n", path_id, 
-        inet_ntoa(((struct sockaddr_in*)path_addr)->sin_addr), ntohs(((struct sockaddr_in*)path_addr)->sin_port));
-    return write_socket(buf, size, (const struct sockaddr *)path_addr, sizeof(*path_addr), user_data);
+    struct sockaddr_in *peer_addr;
+    struct sockaddr_in *local_addr;
+    int *quic_fd;
+
+    peer_addr = &ctx->peer_addrs[path_id / ctx->num_peer_addrs];
+    local_addr = &ctx->local_addrs[path_id % ctx->num_local_addrs];
+    quic_fd = &ctx->quic_fds[path_id % ctx->num_local_addrs];
+
+    char local_ip[INET_ADDRSTRLEN];
+    char peer_ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &local_addr->sin_addr, local_ip, sizeof(local_ip));
+    inet_ntop(AF_INET, &peer_addr->sin_addr, peer_ip, sizeof(peer_ip));
+
+    printf("[client-quic] write_socket_ex called for path_id %lu from %s:%d to %s:%d\n", 
+           path_id, 
+           local_ip, ntohs(local_addr->sin_port),
+           peer_ip, ntohs(peer_addr->sin_port));
+    return write_socket(buf, size, (const struct sockaddr *)peer_addr, sizeof(*peer_addr), quic_fd);
 }
 
 /* Certificate verification (accept self-signed) */
@@ -160,17 +176,17 @@ static void save_session_cb(const  char *data, size_t data_len, void *user_data)
 
 // QUIC multipath callbacks
 void ready_to_create_path_notify(const xqc_cid_t *cid, void *user_data) {
+    printf("[client-multipath] ready to create new path\n");
     quic_ctx_t *ctx = (quic_ctx_t *)g_proxy_ctx;
-    // Create all remaining paths in one go
-    while (ctx->next_path_idx < ctx->num_paths) {
+    while(ctx->num_paths < ctx->num_local_addrs * ctx->num_peer_addrs && ctx->num_paths < MAX_PATHS) {
         uint64_t new_path_id = 0;
         int ret = xqc_conn_create_path(ctx->engine, cid, &new_path_id, 0);
         if (ret == XQC_OK) {
-            printf("[client-multipath] created path %lu for address %d\n", new_path_id, ctx->next_path_idx);
-            ctx->next_path_idx++;
+            printf("[client-multipath] created path %lu\n", new_path_id);
+            ctx->num_paths++;
         } else {
-            printf("[client-multipath] failed to create path for address %d: %d\n", ctx->next_path_idx, ret);
-            break;  // no more CIDs available (or other error)
+            printf("[client-multipath] failed to create path for address %d: %d\n", ctx->num_paths, ret);
+            break;
         }
     }
 }
@@ -225,7 +241,10 @@ static void datagram_read_notify(xqc_connection_t *conn, void *user_data, const 
 }
 static void datagram_write_notify(xqc_connection_t *conn, void *user_data) {printf("[client-quic] datagram sent to server\n");}
 static void datagram_acked_notify(xqc_connection_t *conn, uint64_t dgram_id, void *user_data) { printf("[client-quic] datagram %ld acked\n", dgram_id);}
-static xqc_int_t datagram_lost_notify(xqc_connection_t *conn, uint64_t dgram_id, void *user_data) { printf("[client-quic] datagram %ld lost\n", dgram_id); return XQC_DGRAM_RETX_ASKED_BY_APP;}
+static xqc_int_t datagram_lost_notify(xqc_connection_t *conn, uint64_t dgram_id, void *user_data) { 
+    printf("[client-quic] datagram %ld lost\n", dgram_id); 
+    return XQC_DGRAM_RETX_ASKED_BY_APP;
+}
 
 static int register_alpn(xqc_engine_t *eng, quic_ctx_t *ctx) {
     xqc_conn_callbacks_t conn_cbs = {
@@ -293,6 +312,7 @@ static void usage(const char *progname) {
         "  -r            Enable experimental redundancy\n"
         "  -s <sched>    Select scheduler: pmp (proactive multipath),\n"
         "                psp (proactive singlepath), minrtt (default)\n"
+        "  -l <ip>       Set local address (can be repeated, client only)\n"
         "  -p <ip>       Add peer address (can be repeated, client only)\n"
         "  -h            Show this help\n"
         "\n"
@@ -320,12 +340,13 @@ int main(int argc, char *argv[]) {
     conn_settings.datagram_force_retrans_on = 0;
     conn_settings.enable_experimental_redundancy = 0;
     conn_settings.scheduler_callback = xqc_minrtt_scheduler_cb;
-    ctx.num_paths = 0;
-    ctx.next_path_idx = 1;
+    ctx.num_local_addrs = 0;
+    ctx.num_peer_addrs = 0;
+    ctx.num_paths = 1;
     ctx.udp_port = 7778;
 
     int opt;
-    while ((opt = getopt(argc, argv, "u:drs:p:h")) != -1) {
+    while ((opt = getopt(argc, argv, "u:drs:l:p:h")) != -1) {
         switch (opt) {
             case 'h':
                 usage(argv[0]);
@@ -356,12 +377,27 @@ int main(int argc, char *argv[]) {
                     conn_settings.scheduler_callback = xqc_minrtt_scheduler_cb;
                 }
                 break;
-            case 'p': 
-                if (ctx.num_paths < MAX_PATHS) {
-                    struct sockaddr_in *addr = &ctx.path_addrs[ctx.num_paths++];
+            case 'l': 
+                if (ctx.num_local_addrs < MAX_PATHS) {
+                    struct sockaddr_in *addr = &ctx.local_addrs[ctx.num_local_addrs++];
                     memset(addr, 0, sizeof(*addr));
                     addr->sin_family = AF_INET;
-                    addr->sin_port = htons(8000);   // port is fixed (8000)
+                    addr->sin_port = htons(0);
+                    if (inet_pton(AF_INET, optarg, &addr->sin_addr) <= 0) {
+                        fprintf(stderr, "[client-quic] invalid address: %s\n", optarg);
+                        return 1;
+                    }
+                } else {
+                    fprintf(stderr, "[client-quic] too many addresses, max %d\n", MAX_PATHS);
+                    return 1;
+                }
+                break;
+            case 'p': 
+                if (ctx.num_peer_addrs < MAX_PATHS) {
+                    struct sockaddr_in *addr = &ctx.peer_addrs[ctx.num_peer_addrs++];
+                    memset(addr, 0, sizeof(*addr));
+                    addr->sin_family = AF_INET;
+                    addr->sin_port = htons(8000);
                     if (inet_pton(AF_INET, optarg, &addr->sin_addr) <= 0) {
                         fprintf(stderr, "[client-quic] invalid address: %s\n", optarg);
                         return 1;
@@ -381,7 +417,7 @@ int main(int argc, char *argv[]) {
     if (!eb) return -1;
 
     xqc_engine_get_default_config(&cfg, XQC_ENGINE_CLIENT);
-    cfg.cfg_log_level = XQC_LOG_INFO;
+    //cfg.cfg_log_level = XQC_LOG_INFO;
 
     // define QUIC engine callbacks
     eng_cb.set_event_timer = set_event_timer;
@@ -408,13 +444,37 @@ int main(int argc, char *argv[]) {
     if (register_alpn(ctx.engine, &ctx) != 0) { fprintf(stderr, "[client-quic] ALPN registration failed\n"); return -1; }
 
     // create QUIC socket
-    ctx.quic_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (ctx.quic_fd < 0) return -1;
-    fcntl(ctx.quic_fd, F_SETFL, O_NONBLOCK);
-
-    // add QUIC socket to libevent loop
-    struct event *sock_ev = event_new(eb, ctx.quic_fd, EV_READ | EV_PERSIST, packet_read_cb, &ctx);
-    event_add(sock_ev, NULL);
+    for (int i = 0; i < ctx.num_local_addrs; i++) {
+        ctx.quic_fds[i] = socket(AF_INET, SOCK_DGRAM, 0);
+        if (ctx.quic_fds[i] < 0) return -1;
+        fcntl(ctx.quic_fds[i], F_SETFL, O_NONBLOCK);
+        struct ifaddrs *ifaddr, *ifa;
+        if (getifaddrs(&ifaddr) == 0) {
+            for (ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
+                // Check if interface has an IPv4 address and matches our current local target IP
+                if (ifa->ifa_addr && ifa->ifa_addr->sa_family == AF_INET &&
+                    ((struct sockaddr_in *)ifa->ifa_addr)->sin_addr.s_addr == ctx.local_addrs[i].sin_addr.s_addr) {
+                    if (setsockopt(ctx.quic_fds[i], SOL_SOCKET, SO_BINDTODEVICE, ifa->ifa_name, strlen(ifa->ifa_name)) < 0) {
+                        perror("[client-quic] SO_BINDTODEVICE failed");
+                    } else {
+                        printf("[client-quic] Bound socket %d to interface device: %s\n", i, ifa->ifa_name);
+                    }
+                    break;
+                }
+            }
+            freeifaddrs(ifaddr);
+        }
+        if (bind(ctx.quic_fds[i], (struct sockaddr*)&ctx.local_addrs[i], sizeof(ctx.local_addrs[i])) < 0) {
+            fprintf(stderr, "[client-quic] bind failed for local address %d\n", i);
+            return -1;
+        } else {
+            char local_ip[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &ctx.local_addrs[i].sin_addr, local_ip, sizeof(local_ip));
+            printf("[client-quic] bound to local address %s:%d\n", local_ip, ntohs(ctx.local_addrs[i].sin_port));
+        }
+        struct event *sock_ev = event_new(eb, ctx.quic_fds[i], EV_READ | EV_PERSIST, packet_read_cb, &ctx);
+        event_add(sock_ev, NULL);
+    }
     
     // create UDP socket
     ctx.udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -445,10 +505,10 @@ int main(int argc, char *argv[]) {
     conn_settings.mp_ping_on = 1;
     conn_settings.init_max_path_id = MAX_PATHS;
 
-    // connect to QUIC server
+    // connect to QUIC server, using the first peer address as the initial path
     const xqc_cid_t *cidp = xqc_connect(ctx.engine, &conn_settings, NULL, 0, "localhost", 0,
                                         &conn_ssl_config, 
-                                        (struct sockaddr*)&ctx.path_addrs[0], sizeof(ctx.path_addrs[0]),
+                                        (struct sockaddr*)&ctx.peer_addrs[0], sizeof(ctx.peer_addrs[0]),
                                         "raw", &ctx);
     if (!cidp) { fprintf(stderr, "[client-quic] quic connection failed\n"); return -1; }
     memcpy(&cid, cidp, sizeof(cid));
@@ -457,7 +517,9 @@ int main(int argc, char *argv[]) {
     event_base_dispatch(eb);
 
     xqc_engine_destroy(ctx.engine);
-    close(ctx.quic_fd);
+    for (int i = 0; i < ctx.num_local_addrs; i++) {
+        close(ctx.quic_fds[i]);
+    }
     close(ctx.udp_fd);
     event_base_free(eb);
     return 0;
