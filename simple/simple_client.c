@@ -47,7 +47,7 @@ static xqc_usec_t get_timestamp(void) {
 // UDP socket callback
 static void proxy_udp_read_cb(int fd, short what, void *arg) {
     quic_ctx_t *ctx = (quic_ctx_t *)arg;
-    if (!ctx) {return -1;}
+    if (!ctx) {return;}
     unsigned char buf[2000];
     struct sockaddr_in src_addr;
     socklen_t src_len = sizeof(src_addr);
@@ -162,7 +162,7 @@ static int conn_close_notify(xqc_connection_t *conn, const xqc_cid_t *cid, void 
 static void conn_handshake_finished(xqc_connection_t *conn, void *user_data, void *proto_data) {
     printf("[client-quic] handshake finished, proxy routing is now active.\n");
     quic_ctx_t *ctx = (quic_ctx_t *)user_data;
-    if (!ctx) {return -1;}
+    if (!ctx) {return;}
     ctx->conn = conn;
     if (!ctx->quic_dgram_id) {
         // Create a bidirectional stream (or unidirectional if you prefer)
@@ -182,7 +182,7 @@ static void save_session_cb(const  char *data, size_t data_len, void *user_data)
 void ready_to_create_path_notify(const xqc_cid_t *cid, void *user_data) {
     printf("[client-multipath] ready to create new path\n");
     quic_ctx_t *ctx = (quic_ctx_t *)user_data;
-    if (!ctx) {return -1;}
+    if (!ctx) {return;}
     while(ctx->num_paths < ctx->num_local_addrs * ctx->num_peer_addrs && ctx->num_paths < MAX_PATHS) {
         uint64_t new_path_id = 0;
         int ret = xqc_conn_create_path(ctx->engine, cid, &new_path_id, 0);
@@ -224,7 +224,7 @@ static int is_new_datagram(uint64_t id, uint64_t *max_dgram_id, uint64_t *dgram_
 // QUIC datagram callbacks
 static void datagram_read_notify(xqc_connection_t *conn, void *user_data, const void *data, size_t data_len, uint64_t flags) {
     quic_ctx_t *ctx = (quic_ctx_t *)user_data;
-    if (!ctx) {return -1;}
+    if (!ctx) {return;}
 
     // if udp client, forward datagram
     printf("[client-quic] datagram recv from server\n");
@@ -299,7 +299,7 @@ static void packet_read_cb(int fd, short what, void *arg) {
     unsigned char buf[2000];
     struct sockaddr_in peer_addr, local_addr;
     quic_ctx_t *ctx = (quic_ctx_t *)arg;
-    if (!ctx) {return -1;}
+    if (!ctx) {return;}
     socklen_t peer_len = sizeof(peer_addr), local_len = sizeof(local_addr);
     ssize_t n = recvfrom(fd, buf, sizeof(buf), 0, (struct sockaddr*)&peer_addr, &peer_len);
     if (n > 0) {

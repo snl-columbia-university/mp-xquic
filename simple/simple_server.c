@@ -41,7 +41,7 @@ static xqc_usec_t get_timestamp(void) {
 // UDP socket callback
 static void proxy_udp_read_cb(int fd, short what, void *arg) {
     quic_ctx_t *ctx = (quic_ctx_t *)arg;
-    if (!ctx) {return -1;}
+    if (!ctx) {return;}
     unsigned char buf[2000];
     struct sockaddr_in src_addr;
     socklen_t src_len = sizeof(src_addr);
@@ -229,7 +229,7 @@ static int is_new_datagram(uint64_t id, uint64_t *max_dgram_id, uint64_t *dgram_
 // QUIC datagram callbacks
 static void datagram_read_notify(xqc_connection_t *conn, void *user_data, const void *data, size_t data_len, uint64_t flags) {
     quic_ctx_t *ctx = (quic_ctx_t *)user_data;
-    if (!ctx) {return -1;}
+    if (!ctx) {return;}
     // if udp client, forward datagram
     printf("[server-quic] datagram recv from client\n");
     if (ctx->udp_fd && ctx->udp_client.sin_port != 0) {
@@ -300,7 +300,7 @@ static void set_event_timer(xqc_usec_t wake_after, void *user_data) {
 
 static void engine_timer_cb(int fd, short what, void *arg) {
     quic_ctx_t *ctx = (quic_ctx_t *)arg;
-    if (!ctx) {return -1;}
+    if (!ctx) {return;}
     xqc_engine_main_logic(ctx->engine);
     struct timeval tv = {0, 10000};
     event_add(timer_ev, &tv);
@@ -312,7 +312,7 @@ static void packet_read_cb(int fd, short what, void *arg) {
     struct sockaddr_in peer_addr, local_addr;
     socklen_t local_len = sizeof(local_addr);
     quic_ctx_t *ctx = (quic_ctx_t *)arg;
-    if (!ctx) {return -1;}
+    if (!ctx) {return;}
 
     // parse dst addr of incoming packet
     struct iovec iov;
