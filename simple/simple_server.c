@@ -41,6 +41,7 @@ static xqc_usec_t get_timestamp(void) {
 // UDP socket callback
 static void proxy_udp_read_cb(int fd, short what, void *arg) {
     quic_ctx_t *ctx = (quic_ctx_t *)arg;
+    if (!ctx) {return -1;}
     unsigned char buf[2000];
     struct sockaddr_in src_addr;
     socklen_t src_len = sizeof(src_addr);
@@ -83,6 +84,7 @@ static ssize_t write_socket(const unsigned char *buf, size_t size,
                             const struct sockaddr *peer_addr, socklen_t peer_addrlen,
                             void *user_data) {
     quic_ctx_t *ctx = (quic_ctx_t *)user_data;
+    if (!ctx) {return -1;}
     return sendto(ctx->quic_fd, buf, size, 0, peer_addr, peer_addrlen);
 }
 
@@ -100,9 +102,7 @@ static int server_accept(xqc_engine_t *eng, xqc_connection_t *conn,
     
     printf("[server-quic] new connection accepted\n");
     quic_ctx_t *ctx = (quic_ctx_t *)user_data;
-    if (!ctx) {
-        return -1;
-    }
+    if (!ctx) {return -1;}
     ctx->conn = conn;
 
     // create UDP socket
@@ -147,6 +147,7 @@ static ssize_t cid_generate_cb(const xqc_cid_t *ori_cid, uint8_t *cid_buf,
 // QUIC stream callbacks
 static int stream_create_notify(xqc_stream_t *strm, void *user_data) {
     quic_ctx_t *ctx = (quic_ctx_t *)user_data;
+    if (!ctx) {return -1;}
     xqc_stream_set_user_data(strm, ctx);
     ctx->stream = strm;
     printf("[server-quic] stream %lu created by client\n", (unsigned long)xqc_stream_id(strm));
@@ -155,6 +156,7 @@ static int stream_create_notify(xqc_stream_t *strm, void *user_data) {
 static int stream_close_notify(xqc_stream_t *strm, void *user_data) { printf("[server-quic] stream %lu closed by client\n", (unsigned long)xqc_stream_id(strm)); return 0; }
 static int stream_read_notify(xqc_stream_t *strm, void *user_data) {
     quic_ctx_t *ctx = (quic_ctx_t *)user_data;
+    if (!ctx) {return -1;}
 
     unsigned char buf[2000];
     uint8_t fin = 0;
@@ -183,6 +185,7 @@ static int stream_write_notify(xqc_stream_t *strm, void *user_data) { printf("[s
 // QUIC connection callbacks
 static int conn_create_notify(xqc_connection_t *conn, const xqc_cid_t *cid, void *user_data, void *proto_data) { 
     quic_ctx_t *ctx = (quic_ctx_t *)user_data;
+    if (!ctx) {return -1;}
     ctx->conn = conn;
     return 0; 
 }
@@ -226,7 +229,7 @@ static int is_new_datagram(uint64_t id, uint64_t *max_dgram_id, uint64_t *dgram_
 // QUIC datagram callbacks
 static void datagram_read_notify(xqc_connection_t *conn, void *user_data, const void *data, size_t data_len, uint64_t flags) {
     quic_ctx_t *ctx = (quic_ctx_t *)user_data;
-
+    if (!ctx) {return -1;}
     // if udp client, forward datagram
     printf("[server-quic] datagram recv from client\n");
     if (ctx->udp_fd && ctx->udp_client.sin_port != 0) {
@@ -261,7 +264,7 @@ int path_created_notify(xqc_connection_t *conn, const xqc_cid_t *cid, uint64_t p
     return 0;
 }
 
-static int register_alpn(xqc_engine_t *eng) {
+static int register_alpn(xqc_engine_t *eng, quic_ctx_t *ctx) {
     xqc_conn_callbacks_t conn_cbs = {
         .conn_create_notify = conn_create_notify,
         .conn_close_notify = conn_close_notify,
@@ -285,7 +288,7 @@ static int register_alpn(xqc_engine_t *eng) {
         .dgram_cbs = dgram_cbs,
     };
     const char *alpn = "raw";
-    return xqc_engine_register_alpn(eng, alpn, strlen(alpn), &ap_cbs, NULL);
+    return xqc_engine_register_alpn(eng, alpn, strlen(alpn), &ap_cbs, ctx);
 }
 
 static void set_event_timer(xqc_usec_t wake_after, void *user_data) {
@@ -297,6 +300,7 @@ static void set_event_timer(xqc_usec_t wake_after, void *user_data) {
 
 static void engine_timer_cb(int fd, short what, void *arg) {
     quic_ctx_t *ctx = (quic_ctx_t *)arg;
+    if (!ctx) {return -1;}
     xqc_engine_main_logic(ctx->engine);
     struct timeval tv = {0, 10000};
     event_add(timer_ev, &tv);
@@ -308,6 +312,7 @@ static void packet_read_cb(int fd, short what, void *arg) {
     struct sockaddr_in peer_addr, local_addr;
     socklen_t local_len = sizeof(local_addr);
     quic_ctx_t *ctx = (quic_ctx_t *)arg;
+    if (!ctx) {return -1;}
 
     // parse dst addr of incoming packet
     struct iovec iov;
@@ -457,7 +462,7 @@ int main(int argc, char *argv[]) {
     if (!ctx.engine) { fprintf(stderr, "[server-quic] engine creation failed\n"); return -1; }
     printf("[server-quic] engine created\n");
     xqc_server_set_conn_settings(ctx.engine, &conn_settings);
-    if (register_alpn(ctx.engine) != 0) { fprintf(stderr, "[server-quic] ALPN registration failed\n"); return -1; }
+    if (register_alpn(ctx.engine, &ctx) != 0) { fprintf(stderr, "[server-quic] ALPN registration failed\n"); return -1; }
 
     // create QUIC socket
     ctx.quic_fd = socket(AF_INET, SOCK_DGRAM, 0);
