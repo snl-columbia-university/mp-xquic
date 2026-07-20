@@ -453,7 +453,7 @@ int main(int argc, char *argv[]) {
     conn_settings.least_available_cid_count = 4;
 
     // create QUIC engine
-    ctx.engine = xqc_engine_create(XQC_ENGINE_SERVER, &cfg, &ssl_cfg, &eng_cb, &trans_cb, NULL);
+    ctx.engine = xqc_engine_create(XQC_ENGINE_SERVER, &cfg, &ssl_cfg, &eng_cb, &trans_cb, &ctx);
     if (!ctx.engine) { fprintf(stderr, "[server-quic] engine creation failed\n"); return -1; }
     printf("[server-quic] engine created\n");
     xqc_server_set_conn_settings(ctx.engine, &conn_settings);
