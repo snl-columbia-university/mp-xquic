@@ -475,11 +475,11 @@ int main(int argc, char *argv[]) {
     printf("[server-quic] listening on port %d\n", 8000);
 
     // add QUIC socket to libevent loop
-    struct event *sock_ev = event_new(eb, ctx.quic_fd, EV_READ | EV_PERSIST, packet_read_cb, NULL);
+    struct event *sock_ev = event_new(eb, ctx.quic_fd, EV_READ | EV_PERSIST, packet_read_cb, &ctx);
     event_add(sock_ev, NULL);
 
     // add engine timer to libevent loop
-    timer_ev = event_new(eb, -1, 0, engine_timer_cb, NULL);
+    timer_ev = event_new(eb, -1, 0, engine_timer_cb, &ctx);
     struct timeval tv = {0, 10000};
     event_add(timer_ev, &tv);
 
