@@ -146,7 +146,7 @@ static ssize_t cid_generate_cb(const xqc_cid_t *ori_cid, uint8_t *cid_buf,
 
 // QUIC stream callbacks
 static int stream_create_notify(xqc_stream_t *strm, void *user_data) {
-    quic_ctx_t *ctx = (quic_ctx_t *)user_data;
+    quic_ctx_t *ctx = (quic_ctx_t *)xqc_get_conn_alp_user_data_by_stream(strm);
     if (!ctx) {return -1;}
     xqc_stream_set_user_data(strm, ctx);
     ctx->stream = strm;
