@@ -31,7 +31,6 @@ typedef struct {
     uint64_t dgram_id_mask;
     xqc_stream_t *stream;
 } quic_ctx_t;
-static quic_ctx_t *g_proxy_ctx = NULL;
 
 static xqc_usec_t get_timestamp(void) {
     struct timeval tv;
@@ -41,7 +40,7 @@ static xqc_usec_t get_timestamp(void) {
 
 // UDP socket callback
 static void proxy_udp_read_cb(int fd, short what, void *arg) {
-    quic_ctx_t *ctx = (quic_ctx_t *)g_proxy_ctx;
+    quic_ctx_t *ctx = (quic_ctx_t *)arg;
     unsigned char buf[2000];
     struct sockaddr_in src_addr;
     socklen_t src_len = sizeof(src_addr);
@@ -83,7 +82,7 @@ static void log_write(xqc_log_level_t lvl, const void *buf, size_t size, void *a
 static ssize_t write_socket(const unsigned char *buf, size_t size,
                             const struct sockaddr *peer_addr, socklen_t peer_addrlen,
                             void *user_data) {
-    quic_ctx_t *ctx = (quic_ctx_t *)g_proxy_ctx;
+    quic_ctx_t *ctx = (quic_ctx_t *)user_data;
     return sendto(ctx->quic_fd, buf, size, 0, peer_addr, peer_addrlen);
 }
 
@@ -100,7 +99,7 @@ static int server_accept(xqc_engine_t *eng, xqc_connection_t *conn,
                          const xqc_cid_t *cid, void *user_data) {
     
     printf("[server-quic] new connection accepted\n");
-    quic_ctx_t *ctx = (quic_ctx_t *)g_proxy_ctx;
+    quic_ctx_t *ctx = (quic_ctx_t *)user_data;
     if (!ctx) {
         return -1;
     }
@@ -130,10 +129,8 @@ static int server_accept(xqc_engine_t *eng, xqc_connection_t *conn,
     ctx->udp_client.sin_port = htons(BACKEND_PORT);
     inet_pton(AF_INET, BACKEND_IP, &ctx->udp_client.sin_addr);
 
-    // save global ctx
-    g_proxy_ctx = ctx;
-
     xqc_conn_set_alp_user_data(conn, ctx);
+    xqc_datagram_set_user_data(conn, ctx);
 
     return 0;
 }
@@ -144,35 +141,33 @@ static ssize_t cid_generate_cb(const xqc_cid_t *ori_cid, uint8_t *cid_buf,
     for (size_t i = 0; i < 8 && i < cid_buflen; i++) {
         cid_buf[i] = (uint8_t)(rand() & 0xFF);
     }
-    return 8;   // 8‑byte CID
+    return 8;
 }
 
 // QUIC stream callbacks
 static int stream_create_notify(xqc_stream_t *strm, void *user_data) {
-    quic_ctx_t *ctx = (quic_ctx_t *)g_proxy_ctx;
-    if (ctx) {
-        xqc_stream_set_user_data(strm, ctx);
-        ctx->stream = strm;
-        printf("[server-quic] stream %lu created by client\n", (unsigned long)xqc_stream_id(strm));
-    }
+    quic_ctx_t *ctx = (quic_ctx_t *)user_data;
+    xqc_stream_set_user_data(strm, ctx);
+    ctx->stream = strm;
+    printf("[server-quic] stream %lu created by client\n", (unsigned long)xqc_stream_id(strm));
     return 0;
 }
-static int stream_close_notify(xqc_stream_t *strm, void *user_data) { return 0; }
+static int stream_close_notify(xqc_stream_t *strm, void *user_data) { printf("[server-quic] stream %lu closed by client\n", (unsigned long)xqc_stream_id(strm)); return 0; }
 static int stream_read_notify(xqc_stream_t *strm, void *user_data) {
-    quic_ctx_t *ctx = (quic_ctx_t *)g_proxy_ctx;
-    if (!ctx) return 0;
+    quic_ctx_t *ctx = (quic_ctx_t *)user_data;
 
     unsigned char buf[2000];
     uint8_t fin = 0;
     while (1) {
         ssize_t n = xqc_stream_recv(strm, buf, sizeof(buf), &fin);
+        printf("[server-quic] stream_read_notify called for stream %lu, received %zd bytes\n", (unsigned long)xqc_stream_id(strm), n);
         if (n > 0) {
             if (ctx->udp_client.sin_port != 0) {
                 sendto(ctx->udp_fd, buf, n, 0,
                        (struct sockaddr*)&ctx->udp_client, sizeof(ctx->udp_client));
             }
         } else if (fin) {
-            printf("[server-quic] stream %lu closed by client\n", (unsigned long)xqc_stream_id(strm));
+            printf("[server-quic] stream %lu finished\n", (unsigned long)xqc_stream_id(strm));
             break;
         } else if (n == -XQC_EAGAIN) {
             break;
@@ -183,23 +178,20 @@ static int stream_read_notify(xqc_stream_t *strm, void *user_data) {
     }
     return 0;
 }
-static int stream_write_notify(xqc_stream_t *strm, void *user_data) { return 0; }
+static int stream_write_notify(xqc_stream_t *strm, void *user_data) { printf("[server-quic] stream %lu sent to client\n", (unsigned long)xqc_stream_id(strm)); return 0; }
 
 // QUIC connection callbacks
 static int conn_create_notify(xqc_connection_t *conn, const xqc_cid_t *cid, void *user_data, void *proto_data) { 
-    quic_ctx_t *ctx = (quic_ctx_t *)g_proxy_ctx;
+    quic_ctx_t *ctx = (quic_ctx_t *)user_data;
     ctx->conn = conn;
     return 0; 
 }
 static int conn_close_notify(xqc_connection_t *conn, const xqc_cid_t *cid, void *user_data, void *proto_data) { 
     printf("[server-quic] connection closed\n");
-    quic_ctx_t *ctx = g_proxy_ctx;
+    quic_ctx_t *ctx = (quic_ctx_t *)user_data;
     if (ctx) {
         if (ctx->udp_fd >= 0) close(ctx->udp_fd);
         free(ctx);
-    }
-    if (g_proxy_ctx == ctx) {
-        g_proxy_ctx = NULL;
     }
     return 0; 
 }
@@ -207,26 +199,25 @@ static void conn_handshake_finished(xqc_connection_t *conn, void *user_data, voi
     printf("[server-quic] handshake finished\n");
 }
 
-static int is_new_datagram(uint64_t id) {
-    quic_ctx_t *ctx = g_proxy_ctx;
-    if (id > ctx->max_dgram_id) {
-        uint64_t diff = id - ctx->max_dgram_id;
+static int is_new_datagram(uint64_t id, uint64_t *max_dgram_id, uint64_t *dgram_id_mask) {
+    if (id > *max_dgram_id) {
+        uint64_t diff = id - *max_dgram_id;
         if (diff >= 64) {
-            ctx->dgram_id_mask = 1;
+            *dgram_id_mask = 1;
         } else {
-            ctx->dgram_id_mask = (ctx->dgram_id_mask << diff) | 1;
+            *dgram_id_mask = (*dgram_id_mask << diff) | 1;
         }
-        ctx->max_dgram_id = id;
+        *max_dgram_id = id;
         return 1;
     } else {
-        uint64_t diff = ctx->max_dgram_id - id;
+        uint64_t diff = *max_dgram_id - id;
         if (diff >= 64) {
             return 0;
         }
-        if (ctx->dgram_id_mask & (1ULL << diff)) {
+        if (*dgram_id_mask & (1ULL << diff)) {
             return 0;
         } else {
-            ctx->dgram_id_mask |= (1ULL << diff);
+            *dgram_id_mask |= (1ULL << diff);
             return 1;
         }
     }
@@ -234,29 +225,34 @@ static int is_new_datagram(uint64_t id) {
 
 // QUIC datagram callbacks
 static void datagram_read_notify(xqc_connection_t *conn, void *user_data, const void *data, size_t data_len, uint64_t flags) {
-    quic_ctx_t *ctx = g_proxy_ctx;
-    if (ctx == NULL) { return; }
+    quic_ctx_t *ctx = (quic_ctx_t *)user_data;
 
     // if udp client, forward datagram
-    printf("[server-quic] datagram recv from server\n");
+    printf("[server-quic] datagram recv from client\n");
     if (ctx->udp_fd && ctx->udp_client.sin_port != 0) {
         // Push the payload back out to your local UDP client
         uint64_t net_val;
         memcpy(&net_val, data, sizeof(uint64_t));
         uint64_t client_datagram_id = be64toh(net_val);
 
-        if (!is_new_datagram(client_datagram_id)) {printf("[server-quic] duplicate datagram %ld (<=%ld) recv from server\n", client_datagram_id, ctx->max_dgram_id); return;}
+        if (!is_new_datagram(client_datagram_id, &ctx->max_dgram_id, &ctx->dgram_id_mask)) {
+            printf("[server-quic] duplicate datagram %ld (<=%ld) recv from client\n", client_datagram_id, ctx->max_dgram_id);
+            return;
+        }
 
         if (sendto(ctx->udp_fd, (const unsigned char *)data + 8, data_len - 8, 0, (struct sockaddr*)&ctx->udp_client, sizeof(ctx->udp_client)) < 0) {
             printf("[server-proxy] sendto failed with error: %s\n", strerror(errno));   
         } else { 
-            printf("[server-quic] datagram %ld (<=%ld) forwarded from server\n", client_datagram_id, ctx->max_dgram_id); 
+            printf("[server-quic] datagram %ld (<=%ld) forwarded from client\n", client_datagram_id, ctx->max_dgram_id); 
         }
     }
 }
-static void datagram_write_notify(xqc_connection_t *conn, void *user_data) {printf("[server-quic] datagram sent to server\n");}
+static void datagram_write_notify(xqc_connection_t *conn, void *user_data) {printf("[server-quic] datagram sent to client\n");}
 static void datagram_acked_notify(xqc_connection_t *conn, uint64_t dgram_id, void *user_data) { printf("[server-quic] datagram %ld acked\n", dgram_id);}
-static xqc_int_t datagram_lost_notify(xqc_connection_t *conn, uint64_t dgram_id, void *user_data) { printf("[server-quic] datagram %ld lost\n", dgram_id); return XQC_DGRAM_RETX_ASKED_BY_APP;}
+static xqc_int_t datagram_lost_notify(xqc_connection_t *conn, uint64_t dgram_id, void *user_data) { 
+    printf("[server-quic] datagram %ld lost\n", dgram_id); 
+    return XQC_DGRAM_RETX_ASKED_BY_APP;
+}
 
 // QUIC multipath callbacks
 void ready_to_create_path_notify(const xqc_cid_t *cid, void *user_data) {}
@@ -300,7 +296,7 @@ static void set_event_timer(xqc_usec_t wake_after, void *user_data) {
 }
 
 static void engine_timer_cb(int fd, short what, void *arg) {
-    quic_ctx_t *ctx = (quic_ctx_t *)g_proxy_ctx;
+    quic_ctx_t *ctx = (quic_ctx_t *)arg;
     xqc_engine_main_logic(ctx->engine);
     struct timeval tv = {0, 10000};
     event_add(timer_ev, &tv);
@@ -311,7 +307,7 @@ static void packet_read_cb(int fd, short what, void *arg) {
     unsigned char buf[2000];
     struct sockaddr_in peer_addr, local_addr;
     socklen_t local_len = sizeof(local_addr);
-    quic_ctx_t *ctx = (quic_ctx_t *)g_proxy_ctx;
+    quic_ctx_t *ctx = (quic_ctx_t *)arg;
 
     // parse dst addr of incoming packet
     struct iovec iov;
@@ -346,7 +342,7 @@ static void packet_read_cb(int fd, short what, void *arg) {
         xqc_engine_packet_process(ctx->engine, buf, n,
                                   (struct sockaddr*)&local_addr, local_len,
                                   (struct sockaddr*)&peer_addr, msg.msg_namelen,
-                                  get_timestamp(), NULL);
+                                  get_timestamp(), ctx);
         xqc_engine_finish_recv(ctx->engine);
     }
 }
@@ -375,10 +371,9 @@ int main(int argc, char *argv[]) {
     xqc_transport_callbacks_t trans_cb = {0};
     struct sockaddr_in addr;
 
-    // initialize global QUIC context
+    // initialize QUIC context
     quic_ctx_t ctx;
     memset(&ctx, 0, sizeof(ctx));
-    g_proxy_ctx = &ctx;
 
     // default configs
     conn_settings.max_datagram_frame_size = 0;
