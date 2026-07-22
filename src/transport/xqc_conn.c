@@ -2082,16 +2082,10 @@ xqc_conn_schedule_packets(xqc_connection_t *conn,  xqc_list_head_t *head,
 
         xqc_path_send_buffer_append(path, packet_out, &path->path_schedule_buf[send_type]);
 
-        xqc_log(conn->log, XQC_LOG_INFO, 
-                                    "|[REDUNDANCY]| original packet queued | base_packet_pns:%d | send_type:%d | enable_experimental_redundancy:%d | redundancy_mask:%ui| frame_type:%s| normal send_type:%d|", 
-                                    packet_out->po_pkt.pkt_pns, send_type, conn->conn_settings.enable_experimental_redundancy, packet_out->po_experimental_redundancy_mask, xqc_frame_type_2_str(conn->engine, packet_out->po_frame_types), XQC_SEND_TYPE_NORMAL);
-
-
-        /* === experimental redundancy === */
         if (send_type == XQC_SEND_TYPE_NORMAL 
-            && conn->conn_settings.enable_experimental_redundancy /* 1. Validate Feature Toggle */
-            && packet_out->po_experimental_redundancy_mask != 0  /* 2. Validate Packet Execution Plan */
-            && packet_out->po_frame_types & (XQC_FRAME_BIT_DATAGRAM | XQC_FRAME_BIT_STREAM) /* 3. Validate Packet Type */
+            && conn->conn_settings.enable_experimental_redundancy
+            && packet_out->po_experimental_redundancy_mask != 0 
+            && packet_out->po_frame_types & (XQC_FRAME_BIT_DATAGRAM | XQC_FRAME_BIT_STREAM)
         )
         {
             xqc_list_head_t *pos;
@@ -2114,7 +2108,6 @@ xqc_conn_schedule_packets(xqc_connection_t *conn,  xqc_list_head_t *head,
                                 xqc_packet_out_replicate(po_copy, packet_out);
                                 xqc_packet_out_remove_ack_frame(po_copy);
 
-                                    /* update path_flag */
                                 if (po_copy->po_path_flag & XQC_PATH_SPECIFIED_BY_PTO) {
                                     po_copy->po_path_flag &= ~XQC_PATH_SPECIFIED_BY_PTO;
                                 }
@@ -2856,31 +2849,33 @@ xqc_conn_schedule_packets_to_paths(xqc_connection_t *conn)
 {
     xqc_conn_schedule_start(conn);
 
-    /* do neither CC nor Pacing */
+    // schedule pto probe packets
     xqc_list_head_t *head = &conn->conn_send_queue->sndq_pto_probe_packets;
-
     xqc_conn_schedule_packets(conn, head, XQC_FALSE, XQC_SEND_TYPE_PTO_PROBE);
 
+    // schedule lost packets
     head = &conn->conn_send_queue->sndq_lost_packets;
-    
     xqc_conn_schedule_packets(conn, head, XQC_TRUE, XQC_SEND_TYPE_RETRANS);
 
+    // schedule high priority packets
     head = &conn->conn_send_queue->sndq_send_packets_high_pri;
     xqc_conn_schedule_packets(conn, head, XQC_FALSE, 
                               XQC_SEND_TYPE_NORMAL_HIGH_PRI);
 
-    /* try to reinject unacked packets if paths still have cwnd */
+    // reinject if enabled
     if (conn->conn_settings.mp_enable_reinjection & XQC_REINJ_UNACK_BEFORE_SCHED) {
         xqc_conn_reinject_unack_packets(conn, XQC_REINJ_UNACK_BEFORE_SCHED);
     }
 
+    // schedule all other packets, redundancy enbabled
     head = &conn->conn_send_queue->sndq_send_packets;
     xqc_conn_schedule_packets(conn, head, XQC_TRUE, XQC_SEND_TYPE_NORMAL);
 
-    /* all packets are scheduled, we need to check if there are paths not fully utilized */
+    // all packets scheduled
     xqc_conn_check_path_utilization(conn);
     xqc_conn_schedule_end(conn);
 
+    // reinject if enabled
     if (conn->conn_settings.mp_enable_reinjection & XQC_REINJ_UNACK_AFTER_SCHED) {
         xqc_conn_reinject_unack_packets(conn, XQC_REINJ_UNACK_AFTER_SCHED);
     }

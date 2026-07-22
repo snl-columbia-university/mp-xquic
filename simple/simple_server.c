@@ -24,6 +24,7 @@ typedef struct {
     int quic_fd;
     xqc_connection_t *conn;
     int udp_fd;
+    struct event *udp_ev;
     struct sockaddr_in udp_client;
     uint64_t quic_dgram_id;
     uint64_t server_dgram_id;
@@ -120,8 +121,8 @@ static int server_accept(xqc_engine_t *eng, xqc_connection_t *conn,
         }
 
         // add UDP socket to libevent loop
-        struct event *proxy_ev = event_new(eb, ctx->udp_fd, EV_READ | EV_PERSIST, proxy_udp_read_cb, ctx);
-        event_add(proxy_ev, NULL);
+        ctx->udp_ev = event_new(eb, ctx->udp_fd, EV_READ | EV_PERSIST, proxy_udp_read_cb, ctx);
+        event_add(ctx->udp_ev, NULL);
         printf("[server-proxy] listening for external backend traffic on port %d...\n", proxy_local_addr.sin_port);
     }
     memset(&ctx->udp_client, 0, sizeof(ctx->udp_client));
@@ -153,7 +154,14 @@ static int stream_create_notify(xqc_stream_t *strm, void *user_data) {
     printf("[server-quic] stream %lu created by client\n", (unsigned long)xqc_stream_id(strm));
     return 0;
 }
-static int stream_close_notify(xqc_stream_t *strm, void *user_data) { printf("[server-quic] stream %lu closed by client\n", (unsigned long)xqc_stream_id(strm)); return 0; }
+static int stream_close_notify(xqc_stream_t *strm, void *user_data) { 
+    printf("[server-quic] stream %lu closed by client\n", (unsigned long)xqc_stream_id(strm));
+    quic_ctx_t *ctx = (quic_ctx_t *)user_data;
+    if (ctx && ctx->stream == strm) {
+        ctx->stream = NULL; // Clear dead stream pointer
+    }
+    return 0; 
+}
 static int stream_read_notify(xqc_stream_t *strm, void *user_data) {
     quic_ctx_t *ctx = (quic_ctx_t *)user_data;
     if (!ctx) {return -1;}
@@ -196,8 +204,18 @@ static int conn_close_notify(xqc_connection_t *conn, const xqc_cid_t *cid, void 
     printf("[server-quic] connection closed\n");
     quic_ctx_t *ctx = (quic_ctx_t *)user_data;
     if (ctx) {
-        if (ctx->udp_fd >= 0) close(ctx->udp_fd);
-        free(ctx);
+        if (ctx->udp_ev) {
+            event_del(ctx->udp_ev);
+            event_free(ctx->udp_ev);
+            ctx->udp_ev = NULL;
+        }
+        if (ctx->udp_fd >= 0) {
+            close(ctx->udp_fd);
+            ctx->udp_fd = -1;
+        }
+        ctx->conn = NULL;
+        ctx->stream = NULL;
+
     }
     return 0; 
 }
