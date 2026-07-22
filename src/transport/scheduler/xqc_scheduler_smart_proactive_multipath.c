@@ -75,9 +75,13 @@ xqc_smart_proactive_multipath_scheduler_get_path(void *scheduler,
         }
 
         // get path stats for this path
-        uint64_t path_srtt = xqc_send_ctl_get_srtt(path->path_send_ctl);
-        float path_loss = xqc_send_ctl_get_spurious_loss_rate(path->path_send_ctl);
+        xqc_usec_t path_minrtt = path->path_send_ctl->ctl_minrtt;
+        xqc_usec_t path_rtt = path->path_send_ctl->ctl_latest_rtt;
+        xqc_usec_t path_srtt = path->path_send_ctl->ctl_srtt;
+        xqc_usec_t path_jitter = path->path_send_ctl->ctl_rttvar;
+        int path_loss = path->path_send_ctl->ctl_spurious_loss_count;
         float path_retrans = xqc_send_ctl_get_retrans_rate(path->path_send_ctl);
+        uint64_t path_bw = xqc_send_ctl_get_est_bw(path->path_send_ctl);
         
         // select 'best' path based on some combo of stats, else if enabled, schedule as redundant
         if (best_path == NULL || path_srtt < min_srtt) {

@@ -79,12 +79,13 @@ xqc_proactive_multipath_scheduler_get_path(void *scheduler,
 
         xqc_log(conn->log, XQC_LOG_INFO, "DEBUG: %s, %i", xqc_frame_type_2_str(conn->engine, packet_out->po_frame_types), packet_out->po_frame_types & (XQC_FRAME_BIT_DATAGRAM | XQC_FRAME_BIT_STREAM));
         
-        // select 'best' path based on some combo of stats, else if enabled, schedule as redundant
+        // select 'best' path based on some combo of stats
         if (best_path == NULL || path_srtt < min_srtt) {
             best_path = path;
             min_srtt = path_srtt;
         }
         
+        // if redundancy is enabled, mark this path in the redundancy mask
         if (conn->conn_settings.enable_experimental_redundancy && packet_out->po_frame_types & (XQC_FRAME_BIT_DATAGRAM | XQC_FRAME_BIT_STREAM)) {
             packet_out->po_experimental_redundancy_mask |= ((uint32_t)1 << path->path_id);
             xqc_log(conn->log, XQC_LOG_INFO,
