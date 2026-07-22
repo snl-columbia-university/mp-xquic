@@ -470,3 +470,57 @@ target_link_libraries(
     -lstdc++
     -lm
 )
+
+# 2. Build quic_api wrapper library
+add_library(
+    quic_api
+    STATIC
+    "api/quic_api.c"  # Adjust path if quic_api.c is in a subfolder (e.g., "simple/quic_api.c")
+)
+
+target_link_libraries(
+    quic_api
+    PUBLIC
+    xquic-static
+    ${SSL_LIB_PATH}
+    ${LIBEVENT_LIB}
+    -lpthread
+    -lstdc++
+    -lm
+)
+
+# 3. Build api_server executable
+add_executable(
+    api_server
+    "api/api_server.c"  # Adjust path if in a subfolder (e.g., "simple/api_server.c")
+)
+
+target_link_libraries(
+    api_server
+    PRIVATE
+    quic_api
+    xquic-static
+    ${SSL_LIB_PATH}
+    ${LIBEVENT_LIB}
+    -lpthread
+    -lstdc++
+    -lm
+)
+
+# 4. Build api_client executable
+add_executable(
+    api_client
+    "api/api_client.c"  # Adjust path if in a subfolder (e.g., "simple/api_client.c")
+)
+
+target_link_libraries(
+    api_client
+    PRIVATE
+    quic_api
+    xquic-static
+    ${SSL_LIB_PATH}
+    ${LIBEVENT_LIB}
+    -lpthread
+    -lstdc++
+    -lm
+)
