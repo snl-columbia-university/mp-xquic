@@ -10,13 +10,15 @@ static void on_client_recv(const uint8_t *data, size_t len, void *user_data) {
 
 int main(void) {
     quic_client_config_t config = {
-        .peer_ips = { "127.0.0.1" },
-        .num_peer_addrs = 1,
-        .local_ips = { "127.0.0.1" },
-        .num_local_addrs = 1,
+        .peer_ips = { "127.0.0.1", "127.0.0.2" },
+        .num_peer_addrs = 2,
+        .local_ips = { "127.0.0.1" , "127.0.0.3"},
+        .num_local_addrs = 2,
         .peer_port = 8000,
         .enable_datagram = 1,
         .recv_cb = on_client_recv,
+        .scheduler = "pmp",
+        .enable_redundancy = 1,
         .user_data = NULL
     };
 
@@ -35,7 +37,7 @@ int main(void) {
     quic_send(client, (const uint8_t *)msg, strlen(msg));
 
     /* Wait to process echo response */
-    sleep(2);
+    sleep(5);
 
     printf("Stopping client...\n");
     quic_endpoint_stop(client);

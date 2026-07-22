@@ -145,7 +145,6 @@ static ssize_t write_socket(const unsigned char *buf, size_t size,
     int quic_fd = ep->quic_fds[0];
     return sendto(quic_fd, buf, size, 0, peer_addr, peer_addrlen);
 }
-
 static ssize_t write_socket_ex(uint64_t path_id, const unsigned char *buf, size_t size,
                                const struct sockaddr *_peer_addr, socklen_t _peer_addrlen,
                                void *user_data) { 
@@ -174,7 +173,7 @@ static ssize_t write_socket_ex(uint64_t path_id, const unsigned char *buf, size_
     }
 }
 
-/* Certificate verification (accept self-signed) */
+// QUIC certificate callback
 static int cert_verify_cb(const unsigned char *certs[], const size_t cert_len[], size_t certs_len, void *conn_user_data) { 
     return 1; 
 }
@@ -182,6 +181,7 @@ static int cert_verify_cb(const unsigned char *certs[], const size_t cert_len[],
 static void save_token_cb(const unsigned char *token, unsigned int token_len, void *user_data) { return; }
 static void save_session_cb(const char *data, size_t data_len, void *user_data) { return; }
 
+// QUIC connection id callback
 static ssize_t cid_generate_cb(const xqc_cid_t *ori_cid, uint8_t *cid_buf,
                                size_t cid_buflen, void *engine_user_data) {
     for (size_t i = 0; i < 8 && i < cid_buflen; i++) {
@@ -200,7 +200,6 @@ static int stream_create_notify(xqc_stream_t *strm, void *user_data) {
     LOG_INFO("[%s-quic] stream %lu created\n", ep && ep->mode == QUIC_MODE_SERVER ? "server" : "client", (unsigned long)xqc_stream_id(strm));
     return 0;
 }
-
 static int stream_close_notify(xqc_stream_t *strm, void *user_data) { 
     LOG_INFO("[quic] stream %lu closed\n", (unsigned long)xqc_stream_id(strm));
     quic_endpoint_t *ep = (quic_endpoint_t *)user_data;
@@ -209,7 +208,6 @@ static int stream_close_notify(xqc_stream_t *strm, void *user_data) {
     }
     return 0; 
 }
-
 static int stream_read_notify(xqc_stream_t *strm, void *user_data) {
     quic_endpoint_t *ep = (quic_endpoint_t *)user_data;
     if (!ep) return -1;
@@ -235,7 +233,6 @@ static int stream_read_notify(xqc_stream_t *strm, void *user_data) {
     }
     return 0;
 }
-
 static int stream_write_notify(xqc_stream_t *strm, void *user_data) { 
     LOG_DEBUG("[quic] stream %lu write notify\n", (unsigned long)xqc_stream_id(strm)); 
     return 0; 
@@ -251,7 +248,6 @@ static int conn_create_notify(xqc_connection_t *conn, const xqc_cid_t *cid, void
     xqc_conn_set_alp_user_data(conn, ep);
     return 0; 
 }
-
 static int conn_close_notify(xqc_connection_t *conn, const xqc_cid_t *cid, void *user_data, void *proto_data) { 
     LOG_INFO("[quic] connection closed\n");
     quic_endpoint_t *ep = (quic_endpoint_t *)user_data;
@@ -261,7 +257,6 @@ static int conn_close_notify(xqc_connection_t *conn, const xqc_cid_t *cid, void 
     }
     return 0; 
 }
-
 static void conn_handshake_finished(xqc_connection_t *conn, void *user_data, void *proto_data) {
     LOG_INFO("[quic] handshake finished\n");
     quic_endpoint_t *ep = (quic_endpoint_t *)user_data;
@@ -305,7 +300,6 @@ void ready_to_create_path_notify(const xqc_cid_t *cid, void *user_data) {
         }
     }
 }
-
 int path_created_notify(xqc_connection_t *conn, const xqc_cid_t *cid, uint64_t path_id, void *user_data) { 
     LOG_INFO("[multipath] sub-path %lu established successfully.\n", path_id);
     return 0; 
@@ -334,15 +328,12 @@ static void datagram_read_notify(xqc_connection_t *conn, void *user_data, const 
         ep->app_recv_cb(payload, payload_len, ep->app_user_data);
     }
 }
-
 static void datagram_write_notify(xqc_connection_t *conn, void *user_data) { 
     LOG_DEBUG("[quic] datagram sent to peer\n"); 
 }
-
 static void datagram_acked_notify(xqc_connection_t *conn, uint64_t dgram_id, void *user_data) { 
     LOG_DEBUG("[quic] datagram %lu acked\n", dgram_id); 
 }
-
 static xqc_int_t datagram_lost_notify(xqc_connection_t *conn, uint64_t dgram_id, void *user_data) { 
     LOG_WARN("[quic] datagram %lu lost\n", dgram_id); 
     return XQC_DGRAM_RETX_ASKED_BY_APP;
@@ -430,6 +421,7 @@ quic_endpoint_t *quic_client_start(const quic_client_config_t *config) {
         .mp_enable_reinjection = 0,
         .mp_ping_on = 1,
         .init_max_path_id = MAX_PATHS,
+        .max_streams_bidi = 32,
         .max_datagram_frame_size = config->enable_datagram ? 65535 : 0,
         .max_udp_payload_size = config->enable_datagram ? 65527 : 0,
         .max_pkt_out_size = config->enable_datagram ? 2000 : 0,
@@ -459,11 +451,13 @@ quic_endpoint_t *quic_client_start(const quic_client_config_t *config) {
         inet_pton(AF_INET, config->local_ips[i], &addr->sin_addr);
     }
     if (ep->num_local_addrs == 0) ep->num_local_addrs = 1;
+    if (ep->num_paths == 0) ep->num_paths = 1;
 
     ep->eb = event_base_new();
     
     xqc_config_t cfg;
     xqc_engine_get_default_config(&cfg, XQC_ENGINE_CLIENT);
+    //cfg.cfg_log_level = XQC_LOG_INFO;
 
     // define QUIC engine callbacks
     xqc_engine_callback_t eng_cb = {
@@ -576,6 +570,7 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
 
     xqc_config_t cfg;
     xqc_engine_get_default_config(&cfg, XQC_ENGINE_SERVER);
+    //cfg.cfg_log_level = XQC_LOG_INFO;
 
     // define QUIC engine callbacks
     xqc_engine_callback_t eng_cb = {
@@ -625,6 +620,7 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
         ep->max_dgram_id = 0;
         ep->dgram_id_mask = 0;
     }
+    if (ep->num_paths == 0) ep->num_paths = 1;
 
     // create QUIC engine
     ep->engine = xqc_engine_create(XQC_ENGINE_SERVER, &cfg, &ssl_cfg, &eng_cb, &trans_cb, ep);
@@ -653,7 +649,7 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
     };
     xqc_engine_register_alpn(ep->engine, "raw", 3, &ap_cbs, ep);
 
-    // create QUIC socket
+    // create QUIC socket listening on 0.0.0.0
     ep->quic_fds[0] = socket(AF_INET, SOCK_DGRAM, 0);
     fcntl(ep->quic_fds[0], F_SETFL, O_NONBLOCK);
     int reuse = 1;
@@ -703,20 +699,23 @@ int quic_send(quic_endpoint_t *ep, const uint8_t *data, size_t len) {
 
 void quic_endpoint_stop(quic_endpoint_t *ep) {
     if (!ep) return;
-
     if (ep->eb) {
         event_base_loopbreak(ep->eb);
-        pthread_join(ep->thread, NULL);
-        event_base_free(ep->eb);
     }
-
+    if (ep->thread) {
+        pthread_join(ep->thread, NULL);
+    }
     if (ep->engine) {
         xqc_engine_destroy(ep->engine);
+        ep->engine = NULL;
     }
-
-    for (int i = 0; i < ep->num_fds; i++) {
-        if (ep->quic_fds[i] > 0) close(ep->quic_fds[i]);
+    if (ep->timer_ev) {
+        event_free(ep->timer_ev);
+        ep->timer_ev = NULL;
     }
-
+    if (ep->eb) {
+        event_base_free(ep->eb);
+        ep->eb = NULL;
+    }
     free(ep);
 }

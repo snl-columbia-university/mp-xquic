@@ -29,6 +29,8 @@ int main(void) {
         .cert_file = "server.crt",
         .key_file = "server.key",
         .enable_datagram = 1,
+        .scheduler = "pmp",
+        .enable_redundancy = 1,
         .recv_cb = on_server_recv,
         .user_data = &app_ctx
     };
