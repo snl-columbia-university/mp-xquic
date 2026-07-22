@@ -2091,7 +2091,8 @@ xqc_conn_schedule_packets(xqc_connection_t *conn,  xqc_list_head_t *head,
         if (send_type == XQC_SEND_TYPE_NORMAL 
             && conn->conn_settings.enable_experimental_redundancy /* 1. Validate Feature Toggle */
             && packet_out->po_experimental_redundancy_mask != 0  /* 2. Validate Packet Execution Plan */
-            && packet_out->po_frame_types & XQC_FRAME_BIT_DATAGRAM)
+            && packet_out->po_frame_types & (XQC_FRAME_BIT_DATAGRAM | XQC_FRAME_BIT_STREAM) /* 3. Validate Packet Type */
+        )
         {
             xqc_list_head_t *pos;
             
