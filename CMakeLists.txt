@@ -524,3 +524,38 @@ target_link_libraries(
     -lstdc++
     -lm
 )
+
+add_executable(
+    xr_server
+    "api/xr_server.c"  # Adjust path if in a subfolder (e.g., "simple/api_server.c")
+)
+
+target_link_libraries(
+    xr_server
+    PRIVATE
+    quic_api
+    xquic-static
+    ${SSL_LIB_PATH}
+    ${LIBEVENT_LIB}
+    -lpthread
+    -lstdc++
+    -lm
+)
+
+# 4. Build api_client executable
+add_executable(
+    xr_client
+    "api/xr_client.c"  # Adjust path if in a subfolder (e.g., "simple/api_client.c")
+)
+
+target_link_libraries(
+    xr_client
+    PRIVATE
+    quic_api
+    xquic-static
+    ${SSL_LIB_PATH}
+    ${LIBEVENT_LIB}
+    -lpthread
+    -lstdc++
+    -lm
+)
