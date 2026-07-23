@@ -57,8 +57,12 @@ static void on_server_recv(const uint8_t *data, size_t len, void *user_data) {
     }
 }
 
-int main(void) {
+int main(int argc, char *argv[]) {
     server_app_ctx_t app_ctx = {0};
+
+    const char *scheduler   = (argc > 1) ? argv[1] : "pmp";
+    const char *congestion  = (argc > 2) ? argv[2] : "cubic";
+    const char *out_log_file = "rtt_results.csv";
 
     quic_server_config_t config = {
         .listen_port = 8000,
@@ -68,6 +72,8 @@ int main(void) {
         .scheduler = "pmp",
         .enable_redundancy = 1,
         .recv_cb = on_server_recv,
+        .scheduler = scheduler,
+        .congestion = congestion,      
         .user_data = &app_ctx
     };
 

@@ -128,6 +128,7 @@ int main(int argc, char *argv[]) {
     const char *trace_file  = (argc > 1) ? argv[1] : "replay_trace.csv";
     const char *target_peer = (argc > 2) ? argv[2] : "client_1";
     const char *scheduler   = (argc > 3) ? argv[3] : "pmp";
+    const char *congestion  = (argc > 4) ? argv[4] : "cubic";
     const char *out_log_file = "rtt_results.csv";
 
     // Open output log file for RTT data
@@ -146,7 +147,8 @@ int main(int argc, char *argv[]) {
         .peer_port = 8000,
         .enable_datagram = 1,
         .recv_cb = on_client_recv,
-        .scheduler = scheduler, /* Passed dynamically from argv[3] */
+        .scheduler = scheduler,
+        .congestion = congestion,
         .enable_redundancy = 1,
         .user_data = NULL
     };
