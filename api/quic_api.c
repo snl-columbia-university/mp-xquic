@@ -244,6 +244,10 @@ static int conn_create_notify(xqc_connection_t *conn, const xqc_cid_t *cid, void
     quic_endpoint_t *ep = (quic_endpoint_t *)user_data;
     if (!ep) return -1;
     ep->conn = conn;
+    ep->max_dgram_id = 0;
+    ep->dgram_id_mask = 0;
+    ep->server_dgram_id = 0;
+    ep->quic_dgram_id = 1;
     xqc_datagram_set_user_data(conn, ep);
     xqc_conn_set_alp_user_data(conn, ep);
     return 0; 
@@ -278,6 +282,7 @@ static int server_accept(xqc_engine_t *eng, xqc_connection_t *conn, const xqc_ci
     quic_endpoint_t *ep = (quic_endpoint_t *)user_data;
     if (!ep) return -1;
     ep->conn = conn;
+    ep->max_dgram_id = 0;
     xqc_conn_set_alp_user_data(conn, ep);
     xqc_datagram_set_user_data(conn, ep);
     return 0;
