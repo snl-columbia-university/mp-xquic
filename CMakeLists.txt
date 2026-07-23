@@ -489,6 +489,24 @@ target_link_libraries(
     -lm
 )
 
+# Build client_tm executable
+add_executable(
+    client_tm
+    "simple/client_tm.c"
+)
+
+target_link_libraries(
+    client_tm
+    PRIVATE
+    quic_api
+    xquic-static
+    ${SSL_LIB_PATH}
+    ${LIBEVENT_LIB}
+    -lpthread
+    -lstdc++
+    -lm
+)
+
 # 3. Build api_server executable
 add_executable(
     api_server
