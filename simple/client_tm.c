@@ -104,9 +104,6 @@ static void citm_quic_recv_cb(const uint8_t *data, size_t len, void *user_data) 
 static void citm_ctl_set_target(const char *payload) {
     citm_state *state = (citm_state *)g_citm_state;
 
-    // The cloud re-sends SET_TARGET whenever the best path/server changes. We can
-    // only bring up a single QUIC connection (the wrapper has no re-init/add-peer
-    // path), so once one exists we latch: ignore all further target updates.
     if (g_client) return;
 
     const char *semi = strrchr(payload, ';');
@@ -311,7 +308,8 @@ static void *citm_measurement_thread(void *arg) {
 }
 
 static int citm_resolve_servers(const char *host, char out[][INET_ADDRSTRLEN], int max) {
-    struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_DGRAM }, *res, *p;
+    struct addrinfo hints = { .ai_family = AF_INET, .ai
+_socktype = SOCK_DGRAM }, *res, *p;
     int rc = getaddrinfo(host, NULL, &hints, &res);
     if (rc != 0) {
         LOG("[client-quic] DNS resolution of '%s' failed: %s", host, gai_strerror(rc));
@@ -332,8 +330,9 @@ static void usage(const char *progname) {
         "  -r            Enable experimental redundancy\n"
         "  -s <sched>    Select scheduler: pmp (proactive multipath),\n"
         "                psp (proactive singlepath), minrtt (default)\n"
+        "  -l <port>     STM peer port used with -p (default 8000; cloud sets it otherwise)\n"
         "  -p <ip>       Add peer address (can be repeated, client only)\n"
-        "  -i <id>       Sets client-id used for ctm registration"
+        "  -i <id>       Sets client-id used for ctm registration\n"
         "  -h            Show this help\n"
         "\n"
         "Example:\n"
@@ -358,8 +357,9 @@ int main(int argc, char *argv[]) {
     g_config.user_data      = &state;
 
     int opt;
-    while ((opt = getopt(argc, argv, "rs:p:i:hv")) != -1) {
+    while ((opt = getopt(argc, argv, "l:rs:p:i:hv")) != -1) {
         switch (opt) {
+            case 'l': g_config.peer_port = (uint16_t)atoi(optarg); break;
             case 'r': g_config.enable_redundancy = 1; break;
             case 's': g_config.scheduler = optarg; break;
             case 'p':
