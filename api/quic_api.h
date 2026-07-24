@@ -25,6 +25,8 @@ typedef struct {
     int enable_redundancy;      /* 1 = Enable experimental redundancy */
     const char *scheduler;      /* "minrtt", "pmp", "psp", "rmp", "spmp" */
 
+    const char *congestion;      /* "cubic", "bbrv1", ""bbrv2", "reno"*/
+
     quic_recv_cb recv_cb;       /* Application receive callback */
     void *user_data;            /* User pointer passed to recv_cb */
 } quic_client_config_t;
@@ -37,6 +39,8 @@ typedef struct {
     int enable_datagram;        /* 1 = Datagram mode, 0 = Stream mode */
     int enable_redundancy;      /* 1 = Enable experimental redundancy */
     const char *scheduler;      /* "minrtt", "pmp", "psp", "rmp", "spmp" */
+
+    const char *congestion;      /* "cubic", "bbrv1", ""bbrv2", "reno"*/
 
     quic_recv_cb recv_cb;       /* Application receive callback */
     void *user_data;            /* User pointer passed to recv_cb */

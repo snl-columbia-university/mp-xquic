@@ -73,11 +73,24 @@ xqc_proactive_multipath_scheduler_get_path(void *scheduler,
         }
 
         // get path stats for this path
-        uint64_t path_srtt = xqc_send_ctl_get_srtt(path->path_send_ctl);
-        float path_loss = xqc_send_ctl_get_spurious_loss_rate(path->path_send_ctl);
+        xqc_usec_t path_minrtt = path->path_send_ctl->ctl_minrtt;
+        xqc_usec_t path_rtt = path->path_send_ctl->ctl_latest_rtt;
+        xqc_usec_t path_srtt = path->path_send_ctl->ctl_srtt;
+        xqc_usec_t path_jitter = path->path_send_ctl->ctl_rttvar;
+        int path_loss = path->path_send_ctl->ctl_spurious_loss_count;
         float path_retrans = xqc_send_ctl_get_retrans_rate(path->path_send_ctl);
-
-        xqc_log(conn->log, XQC_LOG_INFO, "DEBUG: %s, %i", xqc_frame_type_2_str(conn->engine, packet_out->po_frame_types), packet_out->po_frame_types & (XQC_FRAME_BIT_DATAGRAM | XQC_FRAME_BIT_STREAM));
+        uint64_t path_bw = xqc_send_ctl_get_est_bw(path->path_send_ctl);
+        xqc_log(conn->log, XQC_LOG_INFO,
+            "|PATH_STATS|path %ui|min_rtt:%ui, rtt:%ui, srtt:%ui, "
+            "jitter:%ui, spurious_loss:%d, retrans_rate:%.4f, bw:%ui",
+            path->path_id,
+            (unsigned long long)path_minrtt,
+            (unsigned long long)path_rtt,
+            (unsigned long long)path_srtt,
+            (unsigned long long)path_jitter,
+            path_loss,
+            path_retrans,
+            (unsigned long long)path_bw);
         
         // select 'best' path based on some combo of stats
         if (best_path == NULL || path_srtt < min_srtt) {
@@ -88,7 +101,7 @@ xqc_proactive_multipath_scheduler_get_path(void *scheduler,
         // if redundancy is enabled, mark this path in the redundancy mask
         if (conn->conn_settings.enable_experimental_redundancy && packet_out->po_frame_types & (XQC_FRAME_BIT_DATAGRAM | XQC_FRAME_BIT_STREAM)) {
             packet_out->po_experimental_redundancy_mask |= ((uint32_t)1 << path->path_id);
-            xqc_log(conn->log, XQC_LOG_INFO,
+            xqc_log(conn->log, XQC_LOG_DEBUG,
                 "|proactive_redundancy_masked|conn:%p|pkt_num:%ui|replicated_to_path:%ui|current_mask:%ui|",
                 conn, packet_out->po_pkt.pkt_num, path->path_id, packet_out->po_experimental_redundancy_mask);
         }
@@ -111,7 +124,7 @@ skip_path:
     )
     {
         packet_out->po_experimental_redundancy_mask &= ~((uint32_t)1 << best_path->path_id);
-        xqc_log(conn->log, XQC_LOG_INFO,
+        xqc_log(conn->log, XQC_LOG_DEBUG,
                 "|proactive_redundancy_masked|conn:%p|pkt_num:%ui|replicated_to_path:%ui|current_mask:%ui|",
                 conn, packet_out->po_pkt.pkt_num, best_path->path_id, packet_out->po_experimental_redundancy_mask);
             
@@ -119,9 +132,9 @@ skip_path:
 
     // log scheduling outcome
     if (best_path == NULL) {
-        xqc_log(conn->log, XQC_LOG_INFO, "|No available paths to schedule|conn:%p|", conn);
+        xqc_log(conn->log, XQC_LOG_ERROR, "|No available paths to schedule|conn:%p|", conn);
     } else {
-        xqc_log(conn->log, XQC_LOG_INFO, "|best path chosen:%ui|pn:%ui|final_redundancy_mask:%ui|",
+        xqc_log(conn->log, XQC_LOG_DEBUG, "|best path chosen:%ui|pn:%ui|final_redundancy_mask:%ui|",
                 best_path->path_id, packet_out->po_pkt.pkt_num, 
                 packet_out->po_experimental_redundancy_mask);
     }

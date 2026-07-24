@@ -1,5 +1,4 @@
 #include "quic_api.h"
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,13 +12,26 @@
 #include <pthread.h>
 #include <arpa/inet.h>
 #include <sys/time.h>
-
 #include <event2/event.h>
 #include <xquic/xquic.h>
 
 #define MAX_PATHS 4
+#define API_QUEUE_CAPACITY 4096
+#define API_MAX_PAYLOAD 2000
 
-/* --- LOGGING SYSTEM --- */
+typedef struct {
+    uint8_t data[API_MAX_PAYLOAD];
+    size_t len;
+} api_queue_item_t;
+
+typedef struct {
+    api_queue_item_t items[API_QUEUE_CAPACITY];
+    size_t head;
+    size_t tail;
+    size_t count;
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+} api_queue_t;
 
 typedef enum {
     QUIC_LOG_DEBUG,
@@ -60,12 +72,12 @@ typedef enum {
     QUIC_MODE_SERVER
 } quic_mode_t;
 
-// ctx structure
 struct quic_endpoint {
     quic_mode_t mode;
     xqc_engine_t *engine;
     struct event_base *eb;
     struct event *timer_ev;
+    struct event *sock_evs[MAX_PATHS];
     pthread_t thread;
 
     int quic_fds[MAX_PATHS];
@@ -87,8 +99,13 @@ struct quic_endpoint {
     uint64_t max_dgram_id;
     uint64_t dgram_id_mask;
 
-    quic_recv_cb app_recv_cb;
-    void *app_user_data;
+    api_queue_t          rx_queue;
+    pthread_t            worker_thread;
+    int                  worker_running;
+
+    quic_recv_cb         app_recv_cb;
+    void                *app_user_data;
+    
     int datagram_mode;
 };
 
@@ -105,6 +122,15 @@ static xqc_scheduler_callback_t get_scheduler_cb(const char *name) {
     if (strcmp(name, "rmp") == 0) return xqc_reactive_multipath_scheduler_cb;
     if (strcmp(name, "spmp") == 0) return xqc_smart_proactive_multipath_scheduler_cb;
     return xqc_minrtt_scheduler_cb;
+}
+
+static xqc_cong_ctrl_callback_t get_cong_ctrl_cb(const char *name) {
+    if (!name) return xqc_cubic_cb;
+    if (strcmp(name, "cubic") == 0) return xqc_cubic_cb;
+    if (strcmp(name, "bbrv1") == 0) return xqc_bbr_cb;
+    if (strcmp(name, "bbrv2") == 0) return xqc_bbr2_cb;
+    if (strcmp(name, "reno") == 0) return xqc_reno_cb;
+    return xqc_cubic_cb;
 }
 
 static int is_new_datagram(uint64_t id, uint64_t *max_dgram_id, uint64_t *dgram_id_mask) {
@@ -129,6 +155,67 @@ static int is_new_datagram(uint64_t id, uint64_t *max_dgram_id, uint64_t *dgram_
             return 1;
         }
     }
+}
+
+//App queue functions
+static void api_enqueue_rx(quic_endpoint_t *ep, const uint8_t *data, size_t len) {
+    if (!ep || len > API_MAX_PAYLOAD) return;
+
+    pthread_mutex_lock(&ep->rx_queue.lock);
+    if (ep->rx_queue.count >= API_QUEUE_CAPACITY) {
+        pthread_mutex_unlock(&ep->rx_queue.lock);
+        fprintf(stderr, "[QUIC API WARNING] RX Queue Full! Dropping packet.\n");
+        return;
+    }
+
+    memcpy(ep->rx_queue.items[ep->rx_queue.tail].data, data, len);
+    ep->rx_queue.items[ep->rx_queue.tail].len = len;
+    ep->rx_queue.tail = (ep->rx_queue.tail + 1) % API_QUEUE_CAPACITY;
+    ep->rx_queue.count++;
+
+    pthread_cond_signal(&ep->rx_queue.cond);
+    pthread_mutex_unlock(&ep->rx_queue.lock);
+}
+static void *api_rx_worker_thread(void *arg) {
+    quic_endpoint_t *ep = (quic_endpoint_t *)arg;
+    uint8_t buffer[API_MAX_PAYLOAD];
+    size_t len;
+
+    while (ep->worker_running) {
+        pthread_mutex_lock(&ep->rx_queue.lock);
+
+        while (ep->rx_queue.count == 0 && ep->worker_running) {
+            pthread_cond_wait(&ep->rx_queue.cond, &ep->rx_queue.lock);
+        }
+
+        if (!ep->worker_running && ep->rx_queue.count == 0) {
+            pthread_mutex_unlock(&ep->rx_queue.lock);
+            break;
+        }
+
+        /* Pop item */
+        api_queue_item_t *item = &ep->rx_queue.items[ep->rx_queue.head];
+        memcpy(buffer, item->data, item->len);
+        len = item->len;
+
+        ep->rx_queue.head = (ep->rx_queue.head + 1) % API_QUEUE_CAPACITY;
+        ep->rx_queue.count--;
+
+        pthread_mutex_unlock(&ep->rx_queue.lock);
+
+        /* Invoke application callback safely on worker thread */
+        if (ep->app_recv_cb) {
+            ep->app_recv_cb(buffer, len, ep->app_user_data);
+        }
+    }
+    return NULL;
+}
+
+static void init_rx_worker(quic_endpoint_t *ep) {
+    pthread_mutex_init(&ep->rx_queue.lock, NULL);
+    pthread_cond_init(&ep->rx_queue.cond, NULL);
+    ep->worker_running = 1;
+    pthread_create(&ep->worker_thread, NULL, api_rx_worker_thread, ep);
 }
 
 // QUIC logging callback
@@ -218,9 +305,7 @@ static int stream_read_notify(xqc_stream_t *strm, void *user_data) {
         ssize_t n = xqc_stream_recv(strm, buf, sizeof(buf), &fin);
         LOG_DEBUG("[quic] stream_read_notify called for stream %lu, received %zd bytes\n", (unsigned long)xqc_stream_id(strm), n);
         if (n > 0) {
-            if (ep->app_recv_cb) {
-                ep->app_recv_cb(buf, n, ep->app_user_data);
-            }
+            api_enqueue_rx(ep, buf, (size_t)n);
         } else if (fin) {
             LOG_INFO("[quic] stream %lu finished\n", (unsigned long)xqc_stream_id(strm));
             break;
@@ -329,9 +414,7 @@ static void datagram_read_notify(xqc_connection_t *conn, void *user_data, const 
     const uint8_t *payload = (const uint8_t *)data + 8;
     size_t payload_len = data_len - 8;
 
-    if (ep->app_recv_cb) {
-        ep->app_recv_cb(payload, payload_len, ep->app_user_data);
-    }
+    api_enqueue_rx(ep, payload, payload_len);
 }
 static void datagram_write_notify(xqc_connection_t *conn, void *user_data) { 
     LOG_DEBUG("[quic] datagram sent to peer\n"); 
@@ -355,8 +438,6 @@ static void engine_timer_cb(int fd, short what, void *arg) {
     quic_endpoint_t *ep = (quic_endpoint_t *)arg;
     if (!ep) return;
     xqc_engine_main_logic(ep->engine);
-    struct timeval tv = {0, 10000};
-    event_add(ep->timer_ev, &tv);
 }
 
 // QUIC packet read callback
@@ -366,7 +447,6 @@ static void packet_read_cb(int fd, short what, void *arg) {
     quic_endpoint_t *ep = (quic_endpoint_t *)arg;
     if (!ep) return;
 
-    // parse dst addr of incoming packet
     struct iovec iov = { .iov_base = buf, .iov_len = sizeof(buf) };
     char cmsg_buf[CMSG_SPACE(sizeof(struct in_pktinfo))];
     struct msghdr msg = {
@@ -410,7 +490,6 @@ static void *event_loop_worker(void *arg) {
 quic_endpoint_t *quic_client_start(const quic_client_config_t *config) {
     if (!config) return NULL;
 
-    // initialize QUIC context
     quic_endpoint_t *ep = calloc(1, sizeof(quic_endpoint_t));
     if (!ep) return NULL;
 
@@ -419,7 +498,8 @@ quic_endpoint_t *quic_client_start(const quic_client_config_t *config) {
     ep->app_user_data = config->user_data;
     ep->datagram_mode = config->enable_datagram;
 
-    // define QUIC connection settings
+    init_rx_worker(ep);
+
     xqc_conn_settings_t conn_settings = {
         .proto_version = XQC_VERSION_V1,
         .enable_multipath = 1,
@@ -432,7 +512,8 @@ quic_endpoint_t *quic_client_start(const quic_client_config_t *config) {
         .max_pkt_out_size = config->enable_datagram ? 2000 : 0,
         .datagram_force_retrans_on = 0,
         .enable_experimental_redundancy = config->enable_redundancy,
-        .scheduler_callback = get_scheduler_cb(config->scheduler)
+        .scheduler_callback = get_scheduler_cb(config->scheduler),
+        .cong_ctrl_callback = get_cong_ctrl_cb(config->congestion)
     };
 
     if (config->enable_datagram) {
@@ -462,15 +543,12 @@ quic_endpoint_t *quic_client_start(const quic_client_config_t *config) {
     
     xqc_config_t cfg;
     xqc_engine_get_default_config(&cfg, XQC_ENGINE_CLIENT);
-    //cfg.cfg_log_level = XQC_LOG_INFO;
 
-    // define QUIC engine callbacks
     xqc_engine_callback_t eng_cb = {
         .set_event_timer = set_event_timer,
         .log_callbacks = { .xqc_log_write_err = log_write, .xqc_log_write_stat = log_write }
     };
 
-    // define QUIC transport callbacks
     xqc_transport_callbacks_t trans_cb = {
         .write_socket = write_socket,
         .write_socket_ex = write_socket_ex,
@@ -481,13 +559,11 @@ quic_endpoint_t *quic_client_start(const quic_client_config_t *config) {
         .path_created_notify = path_created_notify
     };
 
-    // define SSL/TLS settings
     xqc_engine_ssl_config_t ssl_cfg = {
         .ciphers = XQC_TLS_CIPHERS,
         .groups = XQC_TLS_GROUPS
     };
 
-    // create QUIC engine
     ep->engine = xqc_engine_create(XQC_ENGINE_CLIENT, &cfg, &ssl_cfg, &eng_cb, &trans_cb, ep);
     if (!ep->engine) { free(ep); return NULL; }
 
@@ -512,7 +588,6 @@ quic_endpoint_t *quic_client_start(const quic_client_config_t *config) {
     };
     xqc_engine_register_alpn(ep->engine, "raw", 3, &ap_cbs, ep);
 
-    // create QUIC socket
     for (int i = 0; i < ep->num_local_addrs; i++) {
         ep->quic_fds[i] = socket(AF_INET, SOCK_DGRAM, 0);
         fcntl(ep->quic_fds[i], F_SETFL, O_NONBLOCK);
@@ -535,18 +610,15 @@ quic_endpoint_t *quic_client_start(const quic_client_config_t *config) {
 
         bind(ep->quic_fds[i], (struct sockaddr*)&ep->local_addrs[i], sizeof(ep->local_addrs[i]));
         
-        // add QUIC socket to libevent loop
-        struct event *sock_ev = event_new(ep->eb, ep->quic_fds[i], EV_READ | EV_PERSIST, packet_read_cb, ep);
-        event_add(sock_ev, NULL);
+        ep->sock_evs[i] = event_new(ep->eb, ep->quic_fds[i], EV_READ | EV_PERSIST, packet_read_cb, ep);
+        event_add(ep->sock_evs[i], NULL);
     }
     ep->num_fds = ep->num_local_addrs;
 
-    // add QUIC engine timer to libevent loop
     ep->timer_ev = event_new(ep->eb, -1, 0, engine_timer_cb, ep);
     struct timeval tv = {0, 10000};
     event_add(ep->timer_ev, &tv);
 
-    // connect to QUIC server, using the first peer address as the initial path
     xqc_conn_ssl_config_t conn_ssl_config = {0};
     const xqc_cid_t *cidp = xqc_connect(ep->engine, &conn_settings, NULL, 0, "localhost", 0,
                                         &conn_ssl_config, 
@@ -562,7 +634,6 @@ quic_endpoint_t *quic_client_start(const quic_client_config_t *config) {
 quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
     if (!config) return NULL;
 
-    // initialize QUIC context
     quic_endpoint_t *ep = calloc(1, sizeof(quic_endpoint_t));
     if (!ep) return NULL;
 
@@ -571,20 +642,20 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
     ep->app_user_data = config->user_data;
     ep->datagram_mode = config->enable_datagram;
 
+    /* Initialize RX worker thread on server */
+    init_rx_worker(ep);
+
     ep->eb = event_base_new();
 
     xqc_config_t cfg;
     xqc_engine_get_default_config(&cfg, XQC_ENGINE_SERVER);
-    //cfg.cfg_log_level = XQC_LOG_INFO;
 
-    // define QUIC engine callbacks
     xqc_engine_callback_t eng_cb = {
         .set_event_timer = set_event_timer,
         .log_callbacks = { .xqc_log_write_err = log_write, .xqc_log_write_stat = log_write },
         .cid_generate_cb = cid_generate_cb
     };
 
-    // define QUIC transport callbacks
     xqc_transport_callbacks_t trans_cb = {
         .server_accept = server_accept,
         .write_socket = write_socket,
@@ -594,7 +665,6 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
         .path_created_notify = path_created_notify
     };
 
-    // define SSL/TLS settings
     xqc_engine_ssl_config_t ssl_cfg = {
         .private_key_file = (char *)(config->key_file ? config->key_file : "server.key"),
         .cert_file = (char *)(config->cert_file ? config->cert_file : "server.crt"),
@@ -602,7 +672,6 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
         .groups = XQC_TLS_GROUPS
     };
 
-    // define QUIC connection settings
     xqc_conn_settings_t conn_settings = {
         .proto_version = XQC_VERSION_V1,
         .enable_multipath = 1,
@@ -616,7 +685,8 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
         .max_pkt_out_size = config->enable_datagram ? 2000 : 0,
         .datagram_force_retrans_on = 0,
         .enable_experimental_redundancy = config->enable_redundancy,
-        .scheduler_callback = get_scheduler_cb(config->scheduler)
+        .scheduler_callback = get_scheduler_cb(config->scheduler),
+        .cong_ctrl_callback = get_cong_ctrl_cb(config->congestion)
     };
 
     if (config->enable_datagram) {
@@ -627,7 +697,6 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
     }
     if (ep->num_paths == 0) ep->num_paths = 1;
 
-    // create QUIC engine
     ep->engine = xqc_engine_create(XQC_ENGINE_SERVER, &cfg, &ssl_cfg, &eng_cb, &trans_cb, ep);
     if (!ep->engine) { free(ep); return NULL; }
 
@@ -654,7 +723,6 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
     };
     xqc_engine_register_alpn(ep->engine, "raw", 3, &ap_cbs, ep);
 
-    // create QUIC socket listening on 0.0.0.0
     ep->quic_fds[0] = socket(AF_INET, SOCK_DGRAM, 0);
     fcntl(ep->quic_fds[0], F_SETFL, O_NONBLOCK);
     int reuse = 1;
@@ -670,11 +738,9 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
     bind(ep->quic_fds[0], (struct sockaddr*)&addr, sizeof(addr));
     ep->num_fds = 1;
 
-    // add QUIC socket to libevent loop
-    struct event *sock_ev = event_new(ep->eb, ep->quic_fds[0], EV_READ | EV_PERSIST, packet_read_cb, ep);
-    event_add(sock_ev, NULL);
+    ep->sock_evs[0] = event_new(ep->eb, ep->quic_fds[0], EV_READ | EV_PERSIST, packet_read_cb, ep);
+    event_add(ep->sock_evs[0], NULL);
 
-    // add engine timer to libevent loop
     ep->timer_ev = event_new(ep->eb, -1, 0, engine_timer_cb, ep);
     struct timeval tv = {0, 10000};
     event_add(ep->timer_ev, &tv);
@@ -704,16 +770,43 @@ int quic_send(quic_endpoint_t *ep, const uint8_t *data, size_t len) {
 
 void quic_endpoint_stop(quic_endpoint_t *ep) {
     if (!ep) return;
+
+    /* 1. Stop Worker Thread */
+    ep->worker_running = 0;
+    pthread_mutex_lock(&ep->rx_queue.lock);
+    pthread_cond_broadcast(&ep->rx_queue.cond);
+    pthread_mutex_unlock(&ep->rx_queue.lock);
+
+    pthread_join(ep->worker_thread, NULL);
+    pthread_mutex_destroy(&ep->rx_queue.lock);
+    pthread_cond_destroy(&ep->rx_queue.cond);
+
+    /* 2. Stop Libevent Loop */
     if (ep->eb) {
         event_base_loopbreak(ep->eb);
     }
     if (ep->thread) {
         pthread_join(ep->thread, NULL);
     }
+
+    /* 3. Destroy Engine */
     if (ep->engine) {
         xqc_engine_destroy(ep->engine);
         ep->engine = NULL;
     }
+
+    /* 4. Free Sockets & Events */
+    for (int i = 0; i < ep->num_fds; i++) {
+        if (ep->sock_evs[i]) {
+            event_free(ep->sock_evs[i]);
+            ep->sock_evs[i] = NULL;
+        }
+        if (ep->quic_fds[i] >= 0) {
+            close(ep->quic_fds[i]);
+            ep->quic_fds[i] = -1;
+        }
+    }
+
     if (ep->timer_ev) {
         event_free(ep->timer_ev);
         ep->timer_ev = NULL;
@@ -722,5 +815,6 @@ void quic_endpoint_stop(quic_endpoint_t *ep) {
         event_base_free(ep->eb);
         ep->eb = NULL;
     }
+
     free(ep);
 }
