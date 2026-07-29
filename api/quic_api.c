@@ -75,6 +75,7 @@ typedef enum {
 struct quic_endpoint {
     quic_mode_t mode;
     xqc_engine_t *engine;
+    FILE *qlog_file;
     struct event_base *eb;
     struct event *timer_ev;
     struct event *sock_evs[MAX_PATHS];
@@ -210,7 +211,6 @@ static void *api_rx_worker_thread(void *arg) {
     }
     return NULL;
 }
-
 static void init_rx_worker(quic_endpoint_t *ep) {
     pthread_mutex_init(&ep->rx_queue.lock, NULL);
     pthread_cond_init(&ep->rx_queue.cond, NULL);
@@ -221,6 +221,16 @@ static void init_rx_worker(quic_endpoint_t *ep) {
 // QUIC logging callback
 static void log_write(xqc_log_level_t lvl, const void *buf, size_t size, void *arg) { 
     LOG_DEBUG("%.*s", (int)size, (char*)buf); 
+}
+static void qlog_event_write(qlog_event_importance_t imp, const void *buf, 
+                             size_t size, void *user_data) 
+{
+    quic_endpoint_t *ep = (quic_endpoint_t *)user_data;
+    if (ep && ep->qlog_file && buf && size > 0) {
+        fwrite(buf, 1, size, ep->qlog_file);
+        fputc('\n', ep->qlog_file);
+        fflush(ep->qlog_file);
+    }
 }
 
 // QUIC socket callbacks
@@ -494,6 +504,7 @@ quic_endpoint_t *quic_client_start(const quic_client_config_t *config) {
     if (!ep) return NULL;
 
     ep->mode = QUIC_MODE_CLIENT;
+    ep->qlog_file = fopen("client.qlog", "wb");
     ep->app_recv_cb = config->recv_cb;
     ep->app_user_data = config->user_data;
     ep->datagram_mode = config->enable_datagram;
@@ -505,6 +516,7 @@ quic_endpoint_t *quic_client_start(const quic_client_config_t *config) {
         .enable_multipath = 1,
         .mp_enable_reinjection = 0,
         .mp_ping_on = 1,
+        .mp_ack_on_any_path = 0,
         .init_max_path_id = MAX_PATHS,
         .max_streams_bidi = 32,
         .max_datagram_frame_size = config->enable_datagram ? 65535 : 0,
@@ -546,7 +558,11 @@ quic_endpoint_t *quic_client_start(const quic_client_config_t *config) {
 
     xqc_engine_callback_t eng_cb = {
         .set_event_timer = set_event_timer,
-        .log_callbacks = { .xqc_log_write_err = log_write, .xqc_log_write_stat = log_write }
+        .log_callbacks = { 
+            .xqc_log_write_err = log_write, 
+            .xqc_log_write_stat = log_write,
+            .xqc_qlog_event_write = qlog_event_write 
+        }
     };
 
     xqc_transport_callbacks_t trans_cb = {
@@ -638,6 +654,7 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
     if (!ep) return NULL;
 
     ep->mode = QUIC_MODE_SERVER;
+    ep->qlog_file = fopen("server.qlog", "wb");
     ep->app_recv_cb = config->recv_cb;
     ep->app_user_data = config->user_data;
     ep->datagram_mode = config->enable_datagram;
@@ -652,8 +669,12 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
 
     xqc_engine_callback_t eng_cb = {
         .set_event_timer = set_event_timer,
-        .log_callbacks = { .xqc_log_write_err = log_write, .xqc_log_write_stat = log_write },
-        .cid_generate_cb = cid_generate_cb
+        .cid_generate_cb = cid_generate_cb,
+        .log_callbacks = { 
+            .xqc_log_write_err = log_write, 
+            .xqc_log_write_stat = log_write,
+            .xqc_qlog_event_write = qlog_event_write 
+        }
     };
 
     xqc_transport_callbacks_t trans_cb = {
@@ -677,6 +698,7 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
         .enable_multipath = 1,
         .mp_enable_reinjection = 0,
         .mp_ping_on = 1,
+        .mp_ack_on_any_path = 0,
         .init_max_path_id = 4,
         .least_available_cid_count = 4,
         .max_streams_bidi = 32,
@@ -771,7 +793,6 @@ int quic_send(quic_endpoint_t *ep, const uint8_t *data, size_t len) {
 void quic_endpoint_stop(quic_endpoint_t *ep) {
     if (!ep) return;
 
-    /* 1. Stop Worker Thread */
     ep->worker_running = 0;
     pthread_mutex_lock(&ep->rx_queue.lock);
     pthread_cond_broadcast(&ep->rx_queue.cond);
@@ -781,7 +802,6 @@ void quic_endpoint_stop(quic_endpoint_t *ep) {
     pthread_mutex_destroy(&ep->rx_queue.lock);
     pthread_cond_destroy(&ep->rx_queue.cond);
 
-    /* 2. Stop Libevent Loop */
     if (ep->eb) {
         event_base_loopbreak(ep->eb);
     }
@@ -789,13 +809,16 @@ void quic_endpoint_stop(quic_endpoint_t *ep) {
         pthread_join(ep->thread, NULL);
     }
 
-    /* 3. Destroy Engine */
+    if (ep->qlog_file) {
+        fclose(ep->qlog_file);
+        ep->qlog_file = NULL;
+    }
+
     if (ep->engine) {
         xqc_engine_destroy(ep->engine);
         ep->engine = NULL;
     }
 
-    /* 4. Free Sockets & Events */
     for (int i = 0; i < ep->num_fds; i++) {
         if (ep->sock_evs[i]) {
             event_free(ep->sock_evs[i]);

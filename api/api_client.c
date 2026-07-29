@@ -10,9 +10,9 @@ static void on_client_recv(const uint8_t *data, size_t len, void *user_data) {
 
 int main(void) {
     quic_client_config_t config = {
-        .peer_ips = { "127.0.0.1", "127.0.0.2" },
+        .peer_ips = { "127.0.0.3", "127.0.0.4" },
         .num_peer_addrs = 2,
-        .local_ips = { "127.0.0.1" , "127.0.0.3"},
+        .local_ips = { "127.0.0.1" , "127.0.0.2"},
         .num_local_addrs = 2,
         .peer_port = 8000,
         .enable_datagram = 1,

@@ -56,7 +56,7 @@ static void on_server_recv(const uint8_t *data, size_t len, void *user_data) {
         printf(">>> [SERVER ACK SEND] hitId=%d to client_%d\n", req->hit_id, req->client_id);
         if (server) {
             quic_send(g_server1, (const uint8_t *)&ack, sizeof(ack));
-            quic_send(g_server2, (const uint8_t *)&ack, sizeof(ack));
+            //quic_send(g_server2, (const uint8_t *)&ack, sizeof(ack));
         }
     }
 }
@@ -66,6 +66,7 @@ int main(int argc, char *argv[]) {
     quic_server_config_t config1 = {
         .listen_port = 8000,
         .enable_datagram = 1,
+        .enable_redundancy = 1,
         .recv_cb = on_server_recv,
         .scheduler = "pmp",
         .congestion = "cubic",
@@ -76,6 +77,7 @@ int main(int argc, char *argv[]) {
     quic_server_config_t config2 = {
         .listen_port = 8001,
         .enable_datagram = 1,
+        .enable_redundancy = 1,
         .recv_cb = on_server_recv,
         .scheduler = "pmp",
         .congestion = "cubic",
