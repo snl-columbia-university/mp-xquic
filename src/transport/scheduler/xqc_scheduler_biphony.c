@@ -129,8 +129,8 @@ xqc_biphony_scheduler_get_path(void *scheduler,
     xqc_path_ctx_t *best_path = (metric > 0.0) ? paths[1] : paths[0];
 
     xqc_log(conn->log, XQC_LOG_DEBUG,
-            "|Biphony|chosen_path:%ui|stream_pkt_len:%zu|Q0:%zu|Q1:%zu|metric:%.4f|",
-            best_path->path_id, D, Q[0], Q[1], metric);
+        "|Biphony|chosen_path:%ui|used_size:%ui|buf_size:%ui|Q0:%ui|Q1:%ui|metric:%.4f|",
+        best_path->path_id, packet_out->po_used_size, packet_out->po_buf_size, Q[0], Q[1], metric);
 
     return best_path;
 }

@@ -122,6 +122,7 @@ static xqc_scheduler_callback_t get_scheduler_cb(const char *name) {
     if (strcmp(name, "psp") == 0) return xqc_proactive_singlepath_scheduler_cb;
     if (strcmp(name, "rmp") == 0) return xqc_reactive_multipath_scheduler_cb;
     if (strcmp(name, "spmp") == 0) return xqc_smart_proactive_multipath_scheduler_cb;
+    if (strcmp(name, "bi") == 0) return xqc_biphony_scheduler_cb;
     return xqc_minrtt_scheduler_cb;
 }
 
