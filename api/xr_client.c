@@ -140,6 +140,18 @@ void print_usage(const char *prog_name) {
     printf("  -s, --scheduler ALG    Scheduler algorithm (default: pmp)\n");
     printf("  -c, --congestion ALG   Congestion algorithm (default: cubic)\n");
     printf("  -o, --out FILE         Output log (default: rtt_results.csv)\n");
+    printf("  -P, --peer-ips LIST    Comma-separated peer addresses, max 4\n");
+    printf("                         (default: 127.0.0.2,127.0.0.3)\n");
+    printf("  -l, --local-ips LIST   Comma-separated local addresses to bind, max 4\n");
+    printf("                         (default: 127.0.0.1)\n");
+}
+
+static size_t parse_ip_list(char *arg, const char *out[], size_t max) {
+    size_t n = 0;
+    for (char *tok = strtok(arg, ","); tok != NULL && n < max; tok = strtok(NULL, ",")) {
+        out[n++] = tok;
+    }
+    return n;
 }
 
 int main(int argc, char *argv[]) {
@@ -149,6 +161,10 @@ int main(int argc, char *argv[]) {
     const char *scheduler    = "pmp";
     const char *congestion   = "cubic";
     const char *out_log_file = "rtt_results.csv";
+    const char *peer_ips[4]  = { "127.0.0.2", "127.0.0.3" };
+    size_t num_peer_addrs    = 2;
+    const char *local_ips[4] = { "127.0.0.1" };
+    size_t num_local_addrs   = 1;
 
     static struct option long_options[] = {
         {"trace",      required_argument, 0, 't'},
@@ -157,12 +173,14 @@ int main(int argc, char *argv[]) {
         {"scheduler",  required_argument, 0, 's'},
         {"congestion", required_argument, 0, 'c'},
         {"out",        required_argument, 0, 'o'},
+        {"peer-ips",   required_argument, 0, 'P'},
+        {"local-ips",  required_argument, 0, 'l'},
         {"help",       no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
     int opt, option_index = 0;
-    while ((opt = getopt_long(argc, argv, "t:i:p:s:c:o:h", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "t:i:p:s:c:o:P:l:h", long_options, &option_index)) != -1) {
         switch (opt) {
             case 't': trace_file   = optarg; break;
             case 'i': target_peer  = optarg; break;
@@ -170,9 +188,16 @@ int main(int argc, char *argv[]) {
             case 's': scheduler    = optarg; break;
             case 'c': congestion   = optarg; break;
             case 'o': out_log_file = optarg; break;
+            case 'P': num_peer_addrs  = parse_ip_list(optarg, peer_ips, 4); break;
+            case 'l': num_local_addrs = parse_ip_list(optarg, local_ips, 4); break;
             case 'h': print_usage(argv[0]); return EXIT_SUCCESS;
             default:  print_usage(argv[0]); return EXIT_FAILURE;
         }
+    }
+
+    if (num_peer_addrs == 0 || num_local_addrs == 0) {
+        fprintf(stderr, "peer-ips/local-ips must name at least one address\n");
+        return EXIT_FAILURE;
     }
 
     if (sscanf(target_peer, "client_%d", &g_my_client_id) != 1) {
@@ -188,10 +213,8 @@ int main(int argc, char *argv[]) {
     fprintf(g_rtt_log_file, "hit_id,is_mine,send_time_ms,recv_time_ms,rtt_ms\n");
 
     quic_client_config_t config = {
-        .peer_ips = { "127.0.0.2", "127.0.0.3" },
-        .num_peer_addrs = 2,
-        .local_ips = { "127.0.0.1" },
-        .num_local_addrs = 1,
+        .num_peer_addrs = num_peer_addrs,
+        .num_local_addrs = num_local_addrs,
         .peer_port = peer_port,
         .enable_datagram = 1,
         .recv_cb = on_client_recv,
@@ -200,6 +223,8 @@ int main(int argc, char *argv[]) {
         .enable_redundancy = 1,
         .user_data = NULL
     };
+    memcpy(config.peer_ips, peer_ips, sizeof(peer_ips));
+    memcpy(config.local_ips, local_ips, sizeof(local_ips));
 
     printf("Starting QUIC Client [ID: %d | Peer: '%s']...\n", g_my_client_id, target_peer);
     fflush(stdout);
