@@ -28,6 +28,8 @@ int main(void) {
         .listen_port = 8000,
         .cert_file = "server.crt",
         .key_file = "server.key",
+        .local_ips = { "127.0.0.3", "127.0.0.4" },
+        .num_local_addrs = 2,
         .enable_datagram = 1,
         .scheduler = "pmp",
         .enable_redundancy = 1,

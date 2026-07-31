@@ -7,6 +7,7 @@
 #include "quic_api.h"
 
 #define MAX_HITS 4096
+#define MAX_IPS  16
 
 // --- Network Packet Structures ---
 
@@ -43,6 +44,36 @@ static double get_time_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (ts.tv_sec * 1000.0) + (ts.tv_nsec / 1000000.0);
+}
+
+// --- IP Parser Helper ---
+
+static int parse_ip_list(const char *str, char bufs[MAX_IPS][64], const char *ptrs[MAX_IPS]) {
+    if (!str || !*str) return 0;
+    
+    char tmp[1024];
+    strncpy(tmp, str, sizeof(tmp) - 1);
+    tmp[sizeof(tmp) - 1] = '\0';
+
+    int count = 0;
+    char *token = strtok(tmp, ",");
+    while (token && count < MAX_IPS) {
+        // Trim leading spaces
+        while (*token == ' ') token++;
+        // Trim trailing spaces
+        char *end = token + strlen(token) - 1;
+        while (end > token && *end == ' ') { 
+            *end = '\0'; 
+            end--; 
+        }
+
+        strncpy(bufs[count], token, 63);
+        bufs[count][63] = '\0';
+        ptrs[count] = bufs[count];
+        count++;
+        token = strtok(NULL, ",");
+    }
+    return count;
 }
 
 // --- Receive Callback ---
@@ -136,24 +167,32 @@ static void print_rtt_summary(void) {
 void print_usage(const char *prog_name) {
     printf("Usage: %s [options]\n\n", prog_name);
     printf("  -t, --trace FILE       Trace CSV file (default: replay_trace.csv)\n");
-    printf("  -p, --peer NAME        Target peer ID (default: client_1)\n");
+    printf("  -i, --id NAME          Target peer ID / Client ID (default: client_1)\n");
+    printf("  -p, --port PORT        Peer port (default: 8000)\n");
+    printf("  -l, --local-ips IPS    Comma-separated local IPs (default: 127.0.0.1)\n");
+    printf("  -r, --peer-ips IPS     Comma-separated peer IPs (default: 127.0.0.2,127.0.0.3)\n");
     printf("  -s, --scheduler ALG    Scheduler algorithm (default: pmp)\n");
     printf("  -c, --congestion ALG   Congestion algorithm (default: cubic)\n");
     printf("  -o, --out FILE         Output log (default: rtt_results.csv)\n");
+    printf("  -h, --help             Show this help message\n");
 }
 
 int main(int argc, char *argv[]) {
     const char *trace_file   = "replay_trace.csv";
     const char *target_peer  = "client_1";
-    int peer_port     = 8000;
+    int peer_port            = 8000;
     const char *scheduler    = "pmp";
     const char *congestion   = "cubic";
     const char *out_log_file = "rtt_results.csv";
+    const char *raw_local_ips = "127.0.0.1";
+    const char *raw_peer_ips  = "127.0.0.2,127.0.0.3";
 
     static struct option long_options[] = {
         {"trace",      required_argument, 0, 't'},
         {"id",         required_argument, 0, 'i'},
         {"port",       required_argument, 0, 'p'},
+        {"local-ips",  required_argument, 0, 'l'},
+        {"peer-ips",   required_argument, 0, 'r'},
         {"scheduler",  required_argument, 0, 's'},
         {"congestion", required_argument, 0, 'c'},
         {"out",        required_argument, 0, 'o'},
@@ -162,17 +201,33 @@ int main(int argc, char *argv[]) {
     };
 
     int opt, option_index = 0;
-    while ((opt = getopt_long(argc, argv, "t:i:p:s:c:o:h", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "t:i:p:l:r:s:c:o:h", long_options, &option_index)) != -1) {
         switch (opt) {
-            case 't': trace_file   = optarg; break;
-            case 'i': target_peer  = optarg; break;
-            case 'p': peer_port    = atoi(optarg); break;
-            case 's': scheduler    = optarg; break;
-            case 'c': congestion   = optarg; break;
-            case 'o': out_log_file = optarg; break;
+            case 't': trace_file    = optarg; break;
+            case 'i': target_peer   = optarg; break;
+            case 'p': peer_port     = atoi(optarg); break;
+            case 'l': raw_local_ips = optarg; break;
+            case 'r': raw_peer_ips  = optarg; break;
+            case 's': scheduler     = optarg; break;
+            case 'c': congestion    = optarg; break;
+            case 'o': out_log_file  = optarg; break;
             case 'h': print_usage(argv[0]); return EXIT_SUCCESS;
             default:  print_usage(argv[0]); return EXIT_FAILURE;
         }
+    }
+
+    // Parse CSV IP strings into arrays
+    char local_bufs[MAX_IPS][64];
+    const char *local_ips[MAX_IPS];
+    int num_local_addrs = parse_ip_list(raw_local_ips, local_bufs, local_ips);
+
+    char peer_bufs[MAX_IPS][64];
+    const char *peer_ips[MAX_IPS];
+    int num_peer_addrs = parse_ip_list(raw_peer_ips, peer_bufs, peer_ips);
+
+    if (num_local_addrs == 0 || num_peer_addrs == 0) {
+        fprintf(stderr, "Error: Must specify at least one local and peer IP address.\n");
+        return EXIT_FAILURE;
     }
 
     if (sscanf(target_peer, "client_%d", &g_my_client_id) != 1) {
@@ -188,10 +243,8 @@ int main(int argc, char *argv[]) {
     fprintf(g_rtt_log_file, "hit_id,is_mine,send_time_ms,recv_time_ms,rtt_ms\n");
 
     quic_client_config_t config = {
-        .peer_ips = { "127.0.0.2", "127.0.0.3" },
-        .num_peer_addrs = 2,
-        .local_ips = { "127.0.0.1" },
-        .num_local_addrs = 1,
+        .num_peer_addrs = num_peer_addrs,
+        .num_local_addrs = num_local_addrs,
         .peer_port = peer_port,
         .enable_datagram = 1,
         .recv_cb = on_client_recv,
@@ -201,7 +254,19 @@ int main(int argc, char *argv[]) {
         .user_data = NULL
     };
 
+    for (int i = 0; i < num_peer_addrs; i++) {
+        config.peer_ips[i] = peer_ips[i];
+    }
+    for (int i = 0; i < num_local_addrs; i++) {
+        config.local_ips[i] = local_ips[i];
+    }
+
     printf("Starting QUIC Client [ID: %d | Peer: '%s']...\n", g_my_client_id, target_peer);
+    printf("Local IPs (%d): ", num_local_addrs);
+    for (int i = 0; i < num_local_addrs; i++) printf("%s ", local_ips[i]);
+    printf("\nPeer IPs  (%d): ", num_peer_addrs);
+    for (int i = 0; i < num_peer_addrs; i++) printf("%s ", peer_ips[i]);
+    printf("\n");
     fflush(stdout);
 
     quic_endpoint_t *client = quic_client_start(&config);
@@ -240,9 +305,6 @@ int main(int argc, char *argv[]) {
         strncpy(line_copy, line, sizeof(line_copy) - 1);
         line_copy[sizeof(line_copy) - 1] = '\0';
 
-        // Parse 11 CSV columns:
-        // 0:offset_ms, 1:inter_event_delay_ms, 2:peer, 3:sender, 4:event, 
-        // 5:direction, 6:tick, 7:hitId, 8:client_prep_ms, 9:server_proc_ms, 10:payload
         char *cols[12];
         int col_count = 0;
         char *ptr = line_copy;
@@ -271,20 +333,17 @@ int main(int argc, char *argv[]) {
 
         matched_lines++;
 
-        // Zero-align the timer to the peer's FIRST event
         if (first_match) {
             first_offset_ms = send_offset_ms;
             test_start_ms = get_time_ms();
             first_match = 0;
         }
 
-        // Relative offset from this peer's start
         double rel_offset_ms = send_offset_ms - first_offset_ms;
         double target_time = test_start_ms + rel_offset_ms;
         double now = get_time_ms();
         double delay_ms = target_time - now;
 
-        // Safely sleep only if delay is positive (prevents unsigned long overflow)
         if (delay_ms > 0.1) {
             usleep((useconds_t)(delay_ms * 1000.0));
         }
