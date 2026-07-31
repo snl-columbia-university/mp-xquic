@@ -15,7 +15,7 @@
 #include <event2/event.h>
 #include <xquic/xquic.h>
 
-#define MAX_PATHS 4
+#define MAX_PATHS 16
 #define API_QUEUE_CAPACITY 4096
 #define API_MAX_PAYLOAD 2000
 
@@ -700,7 +700,7 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
         .mp_enable_reinjection = 0,
         .mp_ping_on = 1,
         .mp_ack_on_any_path = 0,
-        .init_max_path_id = 4,
+        .init_max_path_id = MAX_PATHS,
         .least_available_cid_count = 4,
         .max_streams_bidi = 32,
         .max_datagram_frame_size = config->enable_datagram ? 65535 : 0,
