@@ -1,3 +1,4 @@
+#include <getopt.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -61,9 +62,42 @@ static void on_server_recv(const uint8_t *data, size_t len, void *user_data) {
     }
 }
 
+void print_usage(const char *prog_name) {
+    printf("Usage: %s [options]\n\n", prog_name);
+    printf("  -l, --local-ips LIST   Comma-separated addresses to bind, max 4\n");
+    printf("                         (default: wildcard, one socket)\n");
+}
+
+static size_t parse_ip_list(char *arg, const char *out[], size_t max) {
+    size_t n = 0;
+    for (char *tok = strtok(arg, ","); tok != NULL && n < max; tok = strtok(NULL, ",")) {
+        out[n++] = tok;
+    }
+    return n;
+}
+
 int main(int argc, char *argv[]) {
+    const char *local_ips[4] = { 0 };
+    size_t num_local_addrs   = 0;
+
+    static struct option long_options[] = {
+        {"local-ips", required_argument, 0, 'l'},
+        {"help",      no_argument,       0, 'h'},
+        {0, 0, 0, 0}
+    };
+
+    int opt, option_index = 0;
+    while ((opt = getopt_long(argc, argv, "l:h", long_options, &option_index)) != -1) {
+        switch (opt) {
+            case 'l': num_local_addrs = parse_ip_list(optarg, local_ips, 4); break;
+            case 'h': print_usage(argv[0]); return EXIT_SUCCESS;
+            default:  print_usage(argv[0]); return EXIT_FAILURE;
+        }
+    }
+
     // --- Server Endpoint 1 Config (Port 8000) ---
     quic_server_config_t config1 = {
+        .num_local_addrs = num_local_addrs,
         .listen_port = 8000,
         .enable_datagram = 1,
         .enable_redundancy = 1,
@@ -72,9 +106,11 @@ int main(int argc, char *argv[]) {
         .congestion = "cubic",
         .user_data = &g_server1
     };
+    memcpy(config1.local_ips, local_ips, sizeof(local_ips));
 
     // --- Server Endpoint 2 Config (Port 8001) ---
     quic_server_config_t config2 = {
+        .num_local_addrs = num_local_addrs,
         .listen_port = 8001,
         .enable_datagram = 1,
         .enable_redundancy = 1,
@@ -83,6 +119,7 @@ int main(int argc, char *argv[]) {
         .congestion = "cubic",
         .user_data = &g_server2
     };
+    memcpy(config2.local_ips, local_ips, sizeof(local_ips));
 
     printf("Starting QUIC Replay Server 1 on port 8000...\n");
     g_server1 = quic_server_start(&config1);

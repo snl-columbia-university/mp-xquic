@@ -32,6 +32,9 @@ typedef struct {
 } quic_client_config_t;
 
 typedef struct {
+    const char *local_ips[4];   /* One bound socket per address; empty = wildcard */
+    size_t num_local_addrs;
+
     uint16_t listen_port;       /* Default: 8000 */
     const char *cert_file;      /* Default: "server.crt" */
     const char *key_file;       /* Default: "server.key" */
