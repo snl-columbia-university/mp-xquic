@@ -831,6 +831,50 @@ else
 fi
 
 clear_log
+echo -e "active_connection_id_limit accepts in-limit NEW_CONNECTION_ID ...\c"
+killall test_server 2> /dev/null
+${SERVER_BIN} -l d -e -x 1 > /dev/null &
+sleep 1
+${CLIENT_BIN} -s 1024 -l d -t 1 -E > stdlog
+result=`grep ">>>>>>>> pass:1" stdlog`
+conn_err_zero=`grep -E "conn_err:0[^0-9]" stdlog`
+errlog=`grep_err_log`
+if [ -z "$errlog" ] && [ "$result" == ">>>>>>>> pass:1" ] && [ -n "$conn_err_zero" ]; then
+    echo ">>>>>>>> pass:1"
+    case_print_result "active_cid_limit_accept" "pass"
+else
+    echo ">>>>>>>> pass:0"
+    case_print_result "active_cid_limit_accept" "fail"
+    echo "$errlog"
+fi
+
+clear_log
+echo -e "active_connection_id_limit rejects extra NEW_CONNECTION_ID ...\c"
+killall test_server 2> /dev/null
+${SERVER_BIN} -l d -e -x 704 > svr_stdlog &
+sleep 1
+${CLIENT_BIN} -s 1024 -l d -t 2 -E > stdlog 2>&1
+forced_cid=`grep "\[active-cid-limit-test\]" svr_stdlog`
+conn_id_limit_err=`grep -E "(conn errno:9|conn_err:9)" stdlog`
+frame_encoding_err=`grep -E "(conn errno:7|conn_err:7)" stdlog`
+transport_type=`grep "conn_err_type:1" stdlog`
+if [ -n "$forced_cid" ] && [ -n "$conn_id_limit_err" ] \
+    && [ -z "$frame_encoding_err" ] && [ -n "$transport_type" ]; then
+    echo ">>>>>>>> pass:1"
+    case_print_result "active_cid_limit_exceeded" "pass"
+else
+    echo ">>>>>>>> pass:0"
+    case_print_result "active_cid_limit_exceeded" "fail"
+    echo "$forced_cid"
+    echo "$conn_id_limit_err"
+    echo "$frame_encoding_err"
+fi
+
+killall test_server 2> /dev/null
+${SERVER_BIN} -l d -e > /dev/null &
+sleep 1
+
+clear_log
 echo -e "GET request ...\c"
 result=`${CLIENT_BIN} -l d -t 1 -E -G|grep ">>>>>>>> pass"`
 errlog=`grep_err_log`
@@ -1242,11 +1286,10 @@ echo "$result"
 clear_log
 echo -e "test client long header ...\c"
 ${CLIENT_BIN} -l d -x 29 >> clog
-#clog_res=`grep "xqc_process_conn_close_frame|with err:" clog`
-#slog_res=`grep "READ_VALUE error" slog`
 slog_res=`grep -a "large nv|conn" slog`
-clog_res=`grep -a "xqc_process_conn_close_frame|with err:" clog`
-if [ -n "$clog_res" ] && [ -n "$slog_res" ]; then
+stream_reset=`grep -a "xqc_parse_reset_stream_frame|" clog \
+    | grep "err_code:270"`
+if [ -n "$stream_reset" ] && [ -n "$slog_res" ]; then
     case_print_result "test_client_long_header" "pass"
 else
     case_print_result "test_client_long_header" "fail"
@@ -1944,6 +1987,44 @@ if [ -n "$cli_result" ] && [ -n "$cli_err" ] && [ -n "$svr_err" ]; then
 else
     echo ">>>>>>>> pass:0"
     case_print_result "0rtt_max_datagram_frame_size_is_invalid" "fail"
+fi
+rm -f test_session tp_localhost xqc_token
+
+# issue #672: RFC 9000 7.4.1 forbidden remembered transport params must not be used in 0-RTT
+killall test_server
+${SERVER_BIN} -l d -e > /dev/null &
+sleep 1
+clear_log
+echo -e "0RTT forbidden remembered params (normal) ...\c"
+${CLIENT_BIN} -s 1024 -l d -t 1 -E > stdlog
+clear_log
+${CLIENT_BIN} -s 1024 -l d -t 1 -E > stdlog
+cli_restore=`grep "|0RTT_transport_params|" clog`
+cli_pto=`grep "max_ack_delay:25|" clog`
+flag=`grep "early_data_flag:1" stdlog`
+errlog=`grep_err_log`
+if [ -n "$cli_restore" ] && [ -n "$cli_pto" ] && [ -n "$flag" ] && [ -z "$errlog" ]; then
+    echo ">>>>>>>> pass:1"
+    case_print_result "0rtt_forbidden_remembered_params_normal" "pass"
+else
+    echo ">>>>>>>> pass:0"
+    case_print_result "0rtt_forbidden_remembered_params_normal" "fail"
+fi
+
+clear_log
+echo -e "0RTT forbidden remembered params (stale max_ack_delay not used) ...\c"
+sed -i 's/max_ack_delay=[0-9]*/max_ack_delay=100/' tp_localhost
+${CLIENT_BIN} -s 1024 -l d -t 1 -E > stdlog
+cli_restore=`grep "|0RTT_transport_params|" clog`
+cli_stale=`grep "max_ack_delay:100|" clog`
+flag=`grep "early_data_flag:1" stdlog`
+errlog=`grep_err_log`
+if [ -n "$cli_restore" ] && [ -z "$cli_stale" ] && [ -n "$flag" ] && [ -z "$errlog" ]; then
+    echo ">>>>>>>> pass:1"
+    case_print_result "0rtt_forbidden_remembered_params_stale_not_used" "pass"
+else
+    echo ">>>>>>>> pass:0"
+    case_print_result "0rtt_forbidden_remembered_params_stale_not_used" "fail"
 fi
 rm -f test_session tp_localhost xqc_token
 
@@ -5224,5 +5305,270 @@ else
     case_print_result "0RTT_rejected_param_reduction" "fail"
 fi
 rm -f test_session xqc_token tp_localhost
+
+## RFC 9114 Section 6.2 unidirectional stream handling
+
+killall test_server 2> /dev/null
+clear_log
+rm -f test_session xqc_token tp_localhost
+${SERVER_BIN} -l d -e > /dev/null &
+sleep 1
+echo -e "HTTP/3 reserved unidirectional stream remains usable ...\c"
+${CLIENT_BIN} -s 1024 -l d -t 1 -E -x 1000 > stdlog
+sent=`grep "\\[h3-uni-stream-test\\]|type:0x21|ret:0|" stdlog`
+received=`grep "|remote|stream_id:.*|stream_type:33|" slog`
+result=`grep ">>>>>>>> pass:1" stdlog`
+conn_err_zero=`grep -E "conn_err:0[^0-9]" stdlog`
+if [ -n "$sent" ] && [ -n "$received" ] && [ -n "$result" ] \
+    && [ -n "$conn_err_zero" ]; then
+    echo ">>>>>>>> pass:1"
+    case_print_result "h3_reserved_uni_stream_survives" "pass"
+else
+    echo ">>>>>>>> pass:0"
+    case_print_result "h3_reserved_uni_stream_survives" "fail"
+fi
+
+killall test_server 2> /dev/null
+clear_log
+rm -f test_session xqc_token tp_localhost
+${SERVER_BIN} -l d -e > /dev/null &
+sleep 1
+echo -e "HTTP/3 client push stream gets stream creation error ...\c"
+${CLIENT_BIN} -s 1024 -l d -t 1 -E -x 1001 > stdlog
+sent=`grep "\\[h3-uni-stream-test\\]|type:0x1|ret:0|" stdlog`
+received=`grep "|remote|stream_id:.*|stream_type:1|" slog`
+server_err=`grep "err:0x103" slog`
+client_err=`grep -E "(conn errno:259|conn_err:259)" stdlog`
+if [ -n "$sent" ] && [ -n "$received" ] && [ -n "$server_err" ] \
+    && [ -n "$client_err" ]; then
+    echo ">>>>>>>> pass:1"
+    case_print_result "h3_client_push_stream_creation_error" "pass"
+else
+    echo ">>>>>>>> pass:0"
+    case_print_result "h3_client_push_stream_creation_error" "fail"
+fi
+killall test_server 2> /dev/null
+
+
+## RFC 9114 Sections 7.2.5 and 9 request-stream frame handling
+
+clear_log
+rm -f test_session xqc_token tp_localhost h3_request_frame_server.log
+${SERVER_BIN} -l d -e -x 1002 > h3_request_frame_server.log &
+sleep 1
+echo -e "HTTP/3 reserved request frame remains usable ...\c"
+${CLIENT_BIN} -s 1024 -l d -t 1 -E -x 1002 > stdlog
+sent=`grep "\\[h3-request-frame-test\\]|type:0x21|ret:0|" stdlog`
+received=`grep "parse frame type success|frame_type:21|" slog`
+server_ok=`grep "\\[h3-request-frame-test\\]|reserved-frame|conn_err:0|" \
+    h3_request_frame_server.log`
+client_ok=`grep "conn errno:256" stdlog`
+if [ -n "$sent" ] && [ -n "$received" ] && [ -n "$server_ok" ] \
+    && [ -n "$client_ok" ]; then
+    echo ">>>>>>>> pass:1"
+    case_print_result "h3_reserved_request_frame_accepted" "pass"
+else
+    echo ">>>>>>>> pass:0"
+    case_print_result "h3_reserved_request_frame_accepted" "fail"
+fi
+
+killall test_server 2> /dev/null
+clear_log
+rm -f test_session xqc_token tp_localhost h3_request_frame_server.log
+${SERVER_BIN} -l d -e -x 1003 > h3_request_frame_server.log &
+sleep 1
+echo -e "HTTP/3 client PUSH_PROMISE gets frame unexpected ...\c"
+${CLIENT_BIN} -s 1024 -l d -t 1 -E -x 1003 > stdlog
+sent=`grep "\\[h3-request-frame-test\\]|type:0x5|ret:0|" stdlog`
+server_err=`grep "\\[h3-request-frame-test\\]|push-promise|conn_err:261|" \
+    h3_request_frame_server.log`
+wire_err=`grep "err:0x105" slog`
+client_err=`grep -E "(conn errno:261|conn_err:261)" stdlog`
+application_type=`grep "conn_err_type:2" stdlog`
+if [ -n "$sent" ] && [ -n "$server_err" ] && [ -n "$wire_err" ] \
+    && [ -n "$client_err" ] && [ -n "$application_type" ]; then
+    echo ">>>>>>>> pass:1"
+    case_print_result "h3_client_push_promise_rejected" "pass"
+else
+    echo ">>>>>>>> pass:0"
+    case_print_result "h3_client_push_promise_rejected" "fail"
+fi
+killall test_server 2> /dev/null
+rm -f h3_request_frame_server.log
+
+
+## RFC 9114 Section 7.2.7 MAX_PUSH_ID handling
+
+clear_log
+rm -f test_session xqc_token tp_localhost
+${SERVER_BIN} -l d -e -x 1005 > /dev/null &
+sleep 1
+echo -e "HTTP/3 increasing MAX_PUSH_ID values are accepted ...\c"
+${CLIENT_BIN} -s 1024 -l d -t 1 -E -x 1005 > stdlog
+sent=`grep "\\[h3-max-push-id-test\\]|first:1|second:3|write:0,0|send:0|" \
+    stdlog`
+first_received=`grep "|H3_MAX_PUSH_ID|max_push_id:1|" slog`
+second_received=`grep "|H3_MAX_PUSH_ID|max_push_id:3|" slog`
+result=`grep ">>>>>>>> pass:1" stdlog`
+conn_err_zero=`grep -E "conn_err:0[^0-9]" stdlog`
+if [ -n "$sent" ] && [ -n "$first_received" ] \
+    && [ -n "$second_received" ] && [ -n "$result" ] \
+    && [ -n "$conn_err_zero" ]; then
+    echo ">>>>>>>> pass:1"
+    case_print_result "h3_max_push_id_increase_accepted" "pass"
+else
+    echo ">>>>>>>> pass:0"
+    case_print_result "h3_max_push_id_increase_accepted" "fail"
+fi
+
+killall test_server 2> /dev/null
+clear_log
+rm -f test_session xqc_token tp_localhost
+${SERVER_BIN} -l d -e -x 1006 > /dev/null &
+sleep 1
+echo -e "HTTP/3 decreasing MAX_PUSH_ID gets H3_ID_ERROR ...\c"
+${CLIENT_BIN} -s 1024 -l d -t 1 -E -x 1006 > stdlog
+sent=`grep "\\[h3-max-push-id-test\\]|first:3|second:1|write:0,0|send:0|" \
+    stdlog`
+server_err=`grep "err:0x108" slog`
+client_err=`grep -E "(conn errno:264|conn_err:264)" stdlog`
+if [ -n "$sent" ] && [ -n "$server_err" ] && [ -n "$client_err" ]; then
+    echo ">>>>>>>> pass:1"
+    case_print_result "h3_max_push_id_decrease_rejected" "pass"
+else
+    echo ">>>>>>>> pass:0"
+    case_print_result "h3_max_push_id_decrease_rejected" "fail"
+fi
+
+killall test_server 2> /dev/null
+clear_log
+rm -f test_session xqc_token tp_localhost
+stdbuf -oL ${SERVER_BIN} -l d -e -x 1004 > svr_stdlog &
+sleep 1
+echo -e "HTTP/3 server MAX_PUSH_ID gets H3_FRAME_UNEXPECTED ...\c"
+${CLIENT_BIN} -s 1024 -l d -t 1 -E -x 1004 > stdlog
+sent=`grep "\\[h3-max-push-id-test\\]|server_send:1|write:0|send:0|" svr_stdlog`
+client_err_log=`grep "err:0x105" clog`
+server_err=`grep -E "(conn errno:261|conn_err:261)" svr_stdlog`
+if [ -n "$sent" ] && [ -n "$client_err_log" ] && [ -n "$server_err" ]; then
+    echo ">>>>>>>> pass:1"
+    case_print_result "h3_max_push_id_wrong_role_rejected" "pass"
+else
+    echo ">>>>>>>> pass:0"
+    case_print_result "h3_max_push_id_wrong_role_rejected" "fail"
+fi
+
+killall test_server 2> /dev/null
+
+
+## RFC 9114 Section 7.1 single-varint frame payload lengths
+
+clear_log
+rm -f test_session xqc_token tp_localhost h3_frame_length_server.log
+${SERVER_BIN} -l d -e -x 1007 > h3_frame_length_server.log &
+sleep 1
+echo -e "HTTP/3 non-minimal MAX_PUSH_ID length is accepted ...\c"
+${CLIENT_BIN} -s 1024 -l d -t 1 -E -x 1007 > stdlog
+sent=`grep "\\[h3-frame-length-test\\]|declared:2|actual:2|write:0|send:0|" \
+    stdlog`
+received=`grep "|H3_MAX_PUSH_ID|max_push_id:1|" slog`
+server_ok=`grep "\\[h3-frame-length-test\\]|case:1007|conn_err:0|" \
+    h3_frame_length_server.log`
+result=`grep ">>>>>>>> pass:1" stdlog`
+if [ -n "$sent" ] && [ -n "$received" ] && [ -n "$server_ok" ] \
+    && [ -n "$result" ]; then
+    echo ">>>>>>>> pass:1"
+    case_print_result "h3_non_minimal_max_push_id_accepted" "pass"
+else
+    echo ">>>>>>>> pass:0"
+    case_print_result "h3_non_minimal_max_push_id_accepted" "fail"
+fi
+
+killall test_server 2> /dev/null
+clear_log
+rm -f test_session xqc_token tp_localhost h3_frame_length_server.log
+${SERVER_BIN} -l d -e -x 1008 > h3_frame_length_server.log &
+sleep 1
+echo -e "HTTP/3 overlong MAX_PUSH_ID gets H3_FRAME_ERROR ...\c"
+${CLIENT_BIN} -s 1024 -l d -t 1 -E -x 1008 > stdlog
+sent=`grep "\\[h3-frame-length-test\\]|declared:5|actual:2|write:0|send:0|" \
+    stdlog`
+server_err=`grep "\\[h3-frame-length-test\\]|case:1008|conn_err:262|" \
+    h3_frame_length_server.log`
+wire_err=`grep "err:0x106" slog`
+client_err=`grep -E "(conn errno:262|conn_err:262)" stdlog`
+applied=`grep "|H3_MAX_PUSH_ID|max_push_id:1|" slog`
+if [ -n "$sent" ] && [ -n "$server_err" ] && [ -n "$wire_err" ] \
+    && [ -n "$client_err" ] && [ -z "$applied" ]; then
+    echo ">>>>>>>> pass:1"
+    case_print_result "h3_overlong_max_push_id_rejected" "pass"
+else
+    echo ">>>>>>>> pass:0"
+    case_print_result "h3_overlong_max_push_id_rejected" "fail"
+fi
+
+killall test_server 2> /dev/null
+rm -f h3_frame_length_server.log
+
+
+## RFC 9114 Sections 4.1.2 and 10.5.1 field-section limits
+
+clear_log
+rm -f test_session xqc_token tp_localhost h3_field_section_server.log
+${SERVER_BIN} -l d -e -x 1011 > h3_field_section_server.log &
+sleep 1
+echo -e "HTTP/3 fields within limit keep all request streams usable ...\c"
+${CLIENT_BIN} -s 1024 -l d -t 1 -E -P 2 -n 2 -x 1011 > stdlog
+server_limit=`grep "\\[h3-field-section-test\\]|server_limit:512|" \
+    h3_field_section_server.log`
+received_count=`grep -c "\\[h3-field-section-test\\]|request_received|" \
+    h3_field_section_server.log`
+success_count=`grep -c ">>>>>>>> pass:1" stdlog`
+server_ok=`grep "\\[h3-field-section-test\\]|server_conn_close|case:1011|"\
+"conn_err:0|" h3_field_section_server.log`
+client_ok=`grep "\\[h3-field-section-test\\]|client_conn_close|case:1011|"\
+"conn_err:0|" stdlog`
+if [ -n "$server_limit" ] && [ "$received_count" -eq 2 ] \
+    && [ "$success_count" -eq 2 ] && [ -n "$server_ok" ] \
+    && [ -n "$client_ok" ]; then
+    echo ">>>>>>>> pass:1"
+    case_print_result "h3_field_section_within_limit_succeeds" "pass"
+else
+    echo ">>>>>>>> pass:0"
+    case_print_result "h3_field_section_within_limit_succeeds" "fail"
+fi
+
+killall test_server 2> /dev/null
+clear_log
+rm -f test_session xqc_token tp_localhost h3_field_section_server.log
+${SERVER_BIN} -l d -e -x 1012 > h3_field_section_server.log &
+sleep 1
+echo -e "HTTP/3 oversized fields reset one stream only ...\c"
+${CLIENT_BIN} -s 1024 -l d -t 1 -E -P 2 -n 2 -x 1012 > stdlog
+oversized=`grep "\\[h3-field-section-test\\]|oversized_request_sent|" stdlog`
+stream_reset=`grep "\\[h3-field-section-test\\]|server_stream_close|"\
+".*|stream_err:270|" h3_field_section_server.log`
+peer_error=`grep "\\[h3-field-section-test\\]|client_stream_closing|"\
+".*|err:270|" stdlog`
+received_count=`grep -c "\\[h3-field-section-test\\]|request_received|" \
+    h3_field_section_server.log`
+success_count=`grep -c ">>>>>>>> pass:1" stdlog`
+server_ok=`grep "\\[h3-field-section-test\\]|server_conn_close|case:1012|"\
+"conn_err:0|" h3_field_section_server.log`
+client_ok=`grep "\\[h3-field-section-test\\]|client_conn_close|case:1012|"\
+"conn_err:0|" stdlog`
+if [ -n "$oversized" ] && [ -n "$stream_reset" ] \
+    && [ -n "$peer_error" ] && [ "$received_count" -eq 1 ] \
+    && [ "$success_count" -eq 1 ] && [ -n "$server_ok" ] \
+    && [ -n "$client_ok" ]; then
+    echo ">>>>>>>> pass:1"
+    case_print_result "h3_field_section_over_limit_is_stream_error" "pass"
+else
+    echo ">>>>>>>> pass:0"
+    case_print_result "h3_field_section_over_limit_is_stream_error" "fail"
+fi
+
+killall test_server 2> /dev/null
+rm -f h3_field_section_server.log
 
 cd -

@@ -923,7 +923,15 @@ xqc_conn_create(xqc_engine_t *engine, xqc_cid_t *dcid, xqc_cid_t *scid,
     {
         goto fail;
     }
-    xqc_cid_set_mark_original(&xc->dcid_set, dcid, XQC_INITIAL_PATH_ID);
+    /*
+     * Only the client's self-generated initial DCID is NOT from the peer
+     * and should be excluded from the active_connection_id_limit count
+     * (RFC 9000 §18.2).  The server's dcid (client's SCID) IS from the
+     * peer and must count toward the limit.
+     */
+    if (type == XQC_CONN_TYPE_CLIENT) {
+        xqc_cid_set_mark_original(&xc->dcid_set, dcid, XQC_INITIAL_PATH_ID);
+    }
     xqc_cid_copy(&(xc->dcid_set.current_dcid), dcid);
     xqc_hex_dump(xc->dcid_set.current_dcid_str, dcid->cid_buf, dcid->cid_len);
     xc->dcid_set.current_dcid_str[dcid->cid_len * 2] = '\0';
@@ -934,7 +942,6 @@ xqc_conn_create(xqc_engine_t *engine, xqc_cid_t *dcid, xqc_cid_t *scid,
     {
         goto fail;
     }
-    xqc_cid_set_mark_original(&xc->scid_set, scid, XQC_INITIAL_PATH_ID);
     xqc_cid_copy(&(xc->scid_set.user_scid), scid);
     xqc_hex_dump(xc->scid_set.original_scid_str, scid->cid_buf, scid->cid_len);
     xc->scid_set.original_scid_str[scid->cid_len * 2] = '\0';
@@ -3275,6 +3282,12 @@ xqc_conn_get_errno(xqc_connection_t *conn)
     return conn->conn_err;
 }
 
+xqc_conn_err_type_t
+xqc_conn_get_err_type(xqc_connection_t *conn)
+{
+    return conn->conn_err_type;
+}
+
 void *
 xqc_conn_get_ssl(xqc_connection_t *conn)
 {
@@ -4894,7 +4907,6 @@ xqc_conn_confirm_cid(xqc_connection_t *c, xqc_packet_t *pkt)
                         xqc_cid_set_get_used_cnt(&c->dcid_set, XQC_INITIAL_PATH_ID));
                 return ret;
             }
-            xqc_cid_set_mark_original(&c->dcid_set, &pkt->pkt_scid, XQC_INITIAL_PATH_ID);
         }
 
         if (XQC_OK != xqc_cid_is_equal(&c->dcid_set.current_dcid, &pkt->pkt_scid)) {
@@ -6561,6 +6573,16 @@ xqc_conn_set_early_remote_transport_params(xqc_connection_t *conn,
     }
 
     xqc_settings_copy_from_transport_params(&conn->remote_settings, params);
+
+    /*
+     * RFC 9000 §7.4.1: a client MUST NOT use remembered values for
+     * max_ack_delay, ack_delay_exponent, or stateless_reset_token.
+     * Reset them to defaults so the 0-RTT path never relies on stale values.
+     */
+    conn->remote_settings.max_ack_delay = XQC_DEFAULT_MAX_ACK_DELAY;
+    conn->remote_settings.ack_delay_exponent = XQC_DEFAULT_ACK_DELAY_EXPONENT;
+    conn->remote_settings.stateless_reset_token_present = 0;
+
     xqc_conn_update_flow_ctl_settings(conn);
     return XQC_OK;
 }

@@ -8,6 +8,18 @@
 #include <stdint.h>
 
 /**
+ * @brief namespace of an error code received in CONNECTION_CLOSE
+ */
+typedef enum {
+    /** no peer CONNECTION_CLOSE frame has been received */
+    XQC_CONN_ERR_TYPE_UNKNOWN       = 0,
+    /** error code from CONNECTION_CLOSE type 0x1c */
+    XQC_CONN_ERR_TYPE_TRANSPORT     = 1,
+    /** error code from CONNECTION_CLOSE type 0x1d */
+    XQC_CONN_ERR_TYPE_APPLICATION   = 2,
+} xqc_conn_err_type_t;
+
+/**
  * @brief QUIC Transport Protocol error codes
  */
 typedef enum {
@@ -26,6 +38,7 @@ typedef enum {
     TRA_APPLICATION_ERROR           =  0xC,
     TRA_CRYPTO_BUFFER_EXCEEDED      =  0xD,
     TRA_0RTT_TRANS_PARAMS_ERROR     =  0xE,   /**< MUST delete the current saved 0RTT transport parameters */
+    TRA_AEAD_LIMIT_REACHED          =  0x1e,  /**< RFC 9001 §6.6: AEAD integrity limit reached */
     /*
      * RFC 9000 Section 6.2 does not assign a CONNECTION_CLOSE code for
      * the Version Negotiation abort path, because the client cannot
@@ -120,6 +133,7 @@ typedef enum {
     XQC_ESTREAM_BLOCKED                 = 620,      /**< stream-level flow control */
     XQC_EENCRYPT                        = 621,      /**< encryption error */
     XQC_EDECRYPT                        = 622,      /**< decryption error */
+    XQC_EAEAD_LIMIT                     = 623,      /**< AEAD integrity limit reached per RFC 9001 §6.6 */
     XQC_ESTREAM_NFOUND                  = 623,      /**< fail to find the corresponding stream */
     XQC_EWRITE_PKT                      = 624,      /**< fail to create a package or write a package header */
     XQC_ECREATE_STREAM                  = 625,      /**< fail to create stream */
@@ -272,6 +286,7 @@ typedef enum {
     XQC_H3_CONTROL_FRAME_UNEXPECTED     = 833,  /**< request-only frame received on control stream (RFC 9114 §7.2.1/§7.2.5) */
     XQC_H3_MISSING_SETTINGS             = 834,  /**< first frame on control stream is not SETTINGS, RFC 9114 §6.2.1 */
     XQC_H3_REQUEST_FRAME_UNEXPECTED     = 835,  /**< control-only frame received on request stream (RFC 9114 §7.2) */
+    XQC_H3_INVALID_MAX_PUSH_ID          = 836,  /**< RFC 9114 §7.2.7 */
 
     XQC_H3_ERR_MAX,
 } xqc_h3_error_t;
