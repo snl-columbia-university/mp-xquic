@@ -36,6 +36,9 @@ typedef struct {
     const char *cert_file;      /* Default: "server.crt" */
     const char *key_file;       /* Default: "server.key" */
 
+    const char *local_ips[4];
+    size_t num_local_addrs;
+
     int enable_datagram;        /* 1 = Datagram mode, 0 = Stream mode */
     int enable_redundancy;      /* 1 = Enable experimental redundancy */
     const char *scheduler;      /* "minrtt", "pmp", "psp", "rmp", "spmp" */

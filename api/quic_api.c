@@ -78,11 +78,10 @@ struct quic_endpoint {
     FILE *qlog_file;
     struct event_base *eb;
     struct event *timer_ev;
-    struct event *sock_evs[MAX_PATHS];
+    struct event *quic_ev;
     pthread_t thread;
 
-    int quic_fds[MAX_PATHS];
-    int num_fds;
+    int quic_fd;
 
     xqc_connection_t *conn;
     xqc_stream_t *stream;
@@ -239,36 +238,47 @@ static ssize_t write_socket(const unsigned char *buf, size_t size,
                             const struct sockaddr *peer_addr, socklen_t peer_addrlen,
                             void *user_data) {
     quic_endpoint_t *ep = (quic_endpoint_t *)user_data;
-    if (!ep || ep->num_fds == 0) return -1;
-    int quic_fd = ep->quic_fds[0];
-    return sendto(quic_fd, buf, size, 0, peer_addr, peer_addrlen);
+    if (!ep || ep->quic_fd <= 0) return -1;
+    return sendto(ep->quic_fd, buf, size, 0, peer_addr, peer_addrlen);
 }
 static ssize_t write_socket_ex(uint64_t path_id, const unsigned char *buf, size_t size,
                                const struct sockaddr *_peer_addr, socklen_t _peer_addrlen,
                                void *user_data) { 
     quic_endpoint_t *ep = (quic_endpoint_t *)user_data;
-    if (!ep) return -1;
+    if (!ep || ep->quic_fd <= 0) return -1;
 
-    if (ep->mode == QUIC_MODE_CLIENT) {
-        struct sockaddr_in *peer_addr = &ep->peer_addrs[(path_id / ep->num_local_addrs) % ep->num_peer_addrs];
-        struct sockaddr_in *local_addr = &ep->local_addrs[path_id % ep->num_local_addrs];
-        int *quic_fd = &ep->quic_fds[path_id % ep->num_local_addrs];
+    struct sockaddr_in *peer_addr = ep->mode == QUIC_MODE_CLIENT ? &ep->peer_addrs[path_id % ep->num_peer_addrs] : (struct sockaddr_in *)_peer_addr;
+    struct sockaddr_in *local_addr = ep->mode == QUIC_MODE_CLIENT ? &ep->local_addrs[(path_id / ep->num_peer_addrs) % ep->num_local_addrs] : &ep->local_addrs[path_id % ep->num_local_addrs]; 
 
-        char local_ip[INET_ADDRSTRLEN];
-        char peer_ip[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &local_addr->sin_addr, local_ip, sizeof(local_ip));
-        inet_ntop(AF_INET, &peer_addr->sin_addr, peer_ip, sizeof(peer_ip));
+    char local_ip[INET_ADDRSTRLEN];
+    char peer_ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &local_addr->sin_addr, local_ip, sizeof(local_ip));
+    inet_ntop(AF_INET, &peer_addr->sin_addr, peer_ip, sizeof(peer_ip));
+    
+    LOG_DEBUG("[%s-quic] write_socket_ex called for path_id %lu from %s:%d to %s:%d\n", 
+                ep->mode == QUIC_MODE_CLIENT ? "client" : "server", path_id, 
+                local_ip, ntohs(local_addr->sin_port),
+                peer_ip, ntohs(peer_addr->sin_port));
 
-        LOG_DEBUG("[client-quic] write_socket_ex called for path_id %lu from %s:%d to %s:%d\n", 
-                  path_id, 
-                  local_ip, ntohs(local_addr->sin_port),
-                  peer_ip, ntohs(peer_addr->sin_port));
-        return sendto(*quic_fd, buf, size, 0, (const struct sockaddr *)peer_addr, sizeof(*peer_addr));
-    } else {
-        LOG_DEBUG("[server-quic] write_socket_ex called for path_id %lu to %s:%d\n", path_id, 
-                  inet_ntoa(((struct sockaddr_in*)_peer_addr)->sin_addr), ntohs(((struct sockaddr_in*)_peer_addr)->sin_port));
-        return write_socket(buf, size, _peer_addr, _peer_addrlen, user_data);
-    }
+
+    struct iovec iov = { (void *)buf, size };
+    char cbuf[CMSG_SPACE(sizeof(struct in_pktinfo))] = {0};
+    struct msghdr msg = {
+        .msg_name = (void *)peer_addr,
+        .msg_namelen = sizeof(*peer_addr),
+        .msg_iov = &iov,
+        .msg_iovlen = 1,
+        .msg_control = cbuf,
+        .msg_controllen = sizeof(cbuf)
+    };
+
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+    cmsg->cmsg_level = IPPROTO_IP;
+    cmsg->cmsg_type  = IP_PKTINFO;
+    cmsg->cmsg_len   = CMSG_LEN(sizeof(struct in_pktinfo));
+    ((struct in_pktinfo *)CMSG_DATA(cmsg))->ipi_spec_dst = local_addr->sin_addr;
+
+    return sendmsg(ep->quic_fd, &msg, 0);
 }
 
 // QUIC certificate callback
@@ -435,7 +445,7 @@ static void datagram_acked_notify(xqc_connection_t *conn, uint64_t dgram_id, voi
 }
 static xqc_int_t datagram_lost_notify(xqc_connection_t *conn, uint64_t dgram_id, void *user_data) { 
     LOG_WARN("[quic] datagram %lu lost\n", dgram_id); 
-    return XQC_DGRAM_RETX_ASKED_BY_APP;
+    return 0;
 }
 
 static void set_event_timer(xqc_usec_t wake_after, void *user_data) {
@@ -605,32 +615,22 @@ quic_endpoint_t *quic_client_start(const quic_client_config_t *config) {
     };
     xqc_engine_register_alpn(ep->engine, "raw", 3, &ap_cbs, ep);
 
-    for (int i = 0; i < ep->num_local_addrs; i++) {
-        ep->quic_fds[i] = socket(AF_INET, SOCK_DGRAM, 0);
-        fcntl(ep->quic_fds[i], F_SETFL, O_NONBLOCK);
+    ep->quic_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    fcntl(ep->quic_fd, F_SETFL, O_NONBLOCK);
+    int reuse = 1;
+    setsockopt(ep->quic_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    int pktinfo = 1;
+    setsockopt(ep->quic_fd, IPPROTO_IP, IP_PKTINFO, &pktinfo, sizeof(pktinfo));
 
-        struct ifaddrs *ifaddr, *ifa;
-        if (getifaddrs(&ifaddr) == 0) {
-            for (ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
-                if (ifa->ifa_addr && ifa->ifa_addr->sa_family == AF_INET &&
-                    ((struct sockaddr_in *)ifa->ifa_addr)->sin_addr.s_addr == ep->local_addrs[i].sin_addr.s_addr) {
-                    if (setsockopt(ep->quic_fds[i], SOL_SOCKET, SO_BINDTODEVICE, ifa->ifa_name, strlen(ifa->ifa_name)) < 0) {
-                        LOG_WARN("[client-quic] SO_BINDTODEVICE failed: %s\n", strerror(errno));
-                    } else {
-                        LOG_INFO("[client-quic] Bound socket %d to interface device: %s\n", i, ifa->ifa_name);
-                    }
-                    break;
-                }
-            }
-            freeifaddrs(ifaddr);
-        }
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = htonl(INADDR_ANY),
+        .sin_port = htons(0)
+    };
+    bind(ep->quic_fd, (struct sockaddr*)&addr, sizeof(addr));
 
-        bind(ep->quic_fds[i], (struct sockaddr*)&ep->local_addrs[i], sizeof(ep->local_addrs[i]));
-        
-        ep->sock_evs[i] = event_new(ep->eb, ep->quic_fds[i], EV_READ | EV_PERSIST, packet_read_cb, ep);
-        event_add(ep->sock_evs[i], NULL);
-    }
-    ep->num_fds = ep->num_local_addrs;
+    ep->quic_ev = event_new(ep->eb, ep->quic_fd, EV_READ | EV_PERSIST, packet_read_cb, ep);
+    event_add(ep->quic_ev, NULL);
 
     ep->timer_ev = event_new(ep->eb, -1, 0, engine_timer_cb, ep);
     struct timeval tv = {0, 10000};
@@ -712,6 +712,13 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
         .cong_ctrl_callback = get_cong_ctrl_cb(config->congestion)
     };
 
+    for (size_t i = 0; i < config->num_local_addrs && i < MAX_PATHS; i++) {
+        struct sockaddr_in *addr = &ep->local_addrs[ep->num_local_addrs++];
+        addr->sin_family = AF_INET;
+        addr->sin_port = htons(0);
+        inet_pton(AF_INET, config->local_ips[i], &addr->sin_addr);
+    }
+
     if (config->enable_datagram) {
         ep->quic_dgram_id = 1;
         ep->server_dgram_id = 0;
@@ -746,23 +753,22 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
     };
     xqc_engine_register_alpn(ep->engine, "raw", 3, &ap_cbs, ep);
 
-    ep->quic_fds[0] = socket(AF_INET, SOCK_DGRAM, 0);
-    fcntl(ep->quic_fds[0], F_SETFL, O_NONBLOCK);
+    ep->quic_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    fcntl(ep->quic_fd, F_SETFL, O_NONBLOCK);
     int reuse = 1;
-    setsockopt(ep->quic_fds[0], SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    setsockopt(ep->quic_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
     int pktinfo = 1;
-    setsockopt(ep->quic_fds[0], IPPROTO_IP, IP_PKTINFO, &pktinfo, sizeof(pktinfo));
+    setsockopt(ep->quic_fd, IPPROTO_IP, IP_PKTINFO, &pktinfo, sizeof(pktinfo));
 
     struct sockaddr_in addr = {
         .sin_family = AF_INET,
         .sin_addr.s_addr = htonl(INADDR_ANY),
         .sin_port = htons(config->listen_port ? config->listen_port : 8000)
     };
-    bind(ep->quic_fds[0], (struct sockaddr*)&addr, sizeof(addr));
-    ep->num_fds = 1;
+    bind(ep->quic_fd, (struct sockaddr*)&addr, sizeof(addr));
 
-    ep->sock_evs[0] = event_new(ep->eb, ep->quic_fds[0], EV_READ | EV_PERSIST, packet_read_cb, ep);
-    event_add(ep->sock_evs[0], NULL);
+    ep->quic_ev = event_new(ep->eb, ep->quic_fd, EV_READ | EV_PERSIST, packet_read_cb, ep);
+    event_add(ep->quic_ev, NULL);
 
     ep->timer_ev = event_new(ep->eb, -1, 0, engine_timer_cb, ep);
     struct timeval tv = {0, 10000};
@@ -820,15 +826,13 @@ void quic_endpoint_stop(quic_endpoint_t *ep) {
         ep->engine = NULL;
     }
 
-    for (int i = 0; i < ep->num_fds; i++) {
-        if (ep->sock_evs[i]) {
-            event_free(ep->sock_evs[i]);
-            ep->sock_evs[i] = NULL;
-        }
-        if (ep->quic_fds[i] >= 0) {
-            close(ep->quic_fds[i]);
-            ep->quic_fds[i] = -1;
-        }
+    if (ep->quic_ev) {
+        event_free(ep->quic_ev);
+        ep->quic_ev = NULL;
+    }
+    if (ep->quic_fd >= 0) {
+        close(ep->quic_fd);
+        ep->quic_fd = -1;
     }
 
     if (ep->timer_ev) {
