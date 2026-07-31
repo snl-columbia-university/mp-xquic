@@ -1,7 +1,3 @@
-/**
- * @copyright Copyright (c) 2022, Alibaba Group Holding Limited
- */
-
 #ifndef _XQC_SCHEDULER_PROACTIVE_MULTIPATH_H_INCLUDED_
 #define _XQC_SCHEDULER_PROACTIVE_MULTIPATH_H_INCLUDED_
 
