@@ -436,6 +436,11 @@ find_library(LIBEVENT_LIB NAMES event)
 if(NOT LIBEVENT_LIB)
     message(FATAL_ERROR "Libevent (libevent) not found! Please install it (e.g., apt install libevent-dev)")
 endif()
+# evthread_use_pthreads() in api/quic_api.c lives in the pthreads companion lib
+find_library(LIBEVENT_PTHREADS_LIB NAMES event_pthreads)
+if(NOT LIBEVENT_PTHREADS_LIB)
+    message(FATAL_ERROR "libevent_pthreads not found! Please install libevent-dev.")
+endif()
 
 # 2. Add the Simple Client Target
 add_executable(
@@ -485,6 +490,7 @@ target_link_libraries(
     xquic-static
     ${SSL_LIB_PATH}
     ${LIBEVENT_LIB}
+    ${LIBEVENT_PTHREADS_LIB}
     -lpthread
     -lstdc++
     -lm

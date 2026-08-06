@@ -13,6 +13,7 @@
 #include <arpa/inet.h>
 #include <sys/time.h>
 #include <event2/event.h>
+#include <event2/thread.h>
 #include <xquic/xquic.h>
 
 #define MAX_PATHS 16
@@ -105,8 +106,15 @@ struct quic_endpoint {
 
     quic_recv_cb         app_recv_cb;
     void                *app_user_data;
-    
+
     int datagram_mode;
+
+    /* Shutdown coordination: set by quic_endpoint_stop, acted on by the
+       event loop thread (engine_timer_cb) so all xquic/libevent teardown
+       happens on the thread that owns those objects. */
+    volatile int stopping;
+    int close_sent;
+    int stop_ticks;
 };
 
 static xqc_usec_t get_timestamp(void) {
@@ -216,6 +224,39 @@ static void init_rx_worker(quic_endpoint_t *ep) {
     pthread_cond_init(&ep->rx_queue.cond, NULL);
     ep->worker_running = 1;
     pthread_create(&ep->worker_thread, NULL, api_rx_worker_thread, ep);
+}
+
+static void stop_rx_worker(quic_endpoint_t *ep) {
+    pthread_mutex_lock(&ep->rx_queue.lock);
+    ep->worker_running = 0;
+    pthread_cond_broadcast(&ep->rx_queue.cond);
+    pthread_mutex_unlock(&ep->rx_queue.lock);
+    pthread_join(ep->worker_thread, NULL);
+    pthread_mutex_destroy(&ep->rx_queue.lock);
+    pthread_cond_destroy(&ep->rx_queue.cond);
+}
+
+/* Cleanup for start-path failures: the event loop thread has not launched
+   yet, but the rx worker holds ep — it must be joined before free(ep). */
+static void endpoint_destroy_partial(quic_endpoint_t *ep) {
+    stop_rx_worker(ep);
+    if (ep->engine) xqc_engine_destroy(ep->engine);
+    if (ep->quic_ev) event_free(ep->quic_ev);
+    if (ep->timer_ev) event_free(ep->timer_ev);
+    if (ep->quic_fd > 0) close(ep->quic_fd);
+    if (ep->eb) event_base_free(ep->eb);
+    if (ep->qlog_file) fclose(ep->qlog_file);
+    free(ep);
+}
+
+/* libevent thread-awareness must be enabled once, before any event_base is
+   created, for the cross-thread wakeup in quic_endpoint_stop to be legal. */
+static void ensure_evthread(void) {
+    static int done = 0;
+    if (!done) {
+        evthread_use_pthreads();
+        done = 1;
+    }
 }
 
 // QUIC logging callback
@@ -458,7 +499,31 @@ static void set_event_timer(xqc_usec_t wake_after, void *user_data) {
 static void engine_timer_cb(int fd, short what, void *arg) {
     quic_endpoint_t *ep = (quic_endpoint_t *)arg;
     if (!ep) return;
+
+    if (ep->stopping) {
+        /* Wind down on the loop thread: close the connection gracefully,
+           let the engine drain the CONNECTION_CLOSE, then exit the loop.
+           Servers just exit; their conns die with the engine. */
+        if (!ep->close_sent) {
+            ep->close_sent = 1;
+            if (ep->mode == QUIC_MODE_CLIENT && ep->conn) {
+                xqc_conn_close(ep->engine, &ep->cid);
+            }
+        }
+        if (ep->mode == QUIC_MODE_SERVER || !ep->conn
+            || ++ep->stop_ticks > 100 /* ~1s close timeout */) {
+            event_base_loopbreak(ep->eb);
+            return;
+        }
+    }
+
     xqc_engine_main_logic(ep->engine);
+
+    if (ep->stopping) {
+        /* Poll fast while the close drains so we exit promptly */
+        struct timeval tv = {0, 10000};
+        event_add(ep->timer_ev, &tv);
+    }
 }
 
 // QUIC packet read callback
@@ -562,8 +627,9 @@ quic_endpoint_t *quic_client_start(const quic_client_config_t *config) {
     if (ep->num_local_addrs == 0) ep->num_local_addrs = 1;
     if (ep->num_paths == 0) ep->num_paths = 1;
 
+    ensure_evthread();
     ep->eb = event_base_new();
-    
+
     xqc_config_t cfg;
     xqc_engine_get_default_config(&cfg, XQC_ENGINE_CLIENT);
 
@@ -592,7 +658,7 @@ quic_endpoint_t *quic_client_start(const quic_client_config_t *config) {
     };
 
     ep->engine = xqc_engine_create(XQC_ENGINE_CLIENT, &cfg, &ssl_cfg, &eng_cb, &trans_cb, ep);
-    if (!ep->engine) { free(ep); return NULL; }
+    if (!ep->engine) { endpoint_destroy_partial(ep); return NULL; }
 
     xqc_app_proto_callbacks_t ap_cbs = {
         .conn_cbs = {
@@ -641,7 +707,7 @@ quic_endpoint_t *quic_client_start(const quic_client_config_t *config) {
                                         &conn_ssl_config, 
                                         (struct sockaddr*)&ep->peer_addrs[0], sizeof(ep->peer_addrs[0]),
                                         "raw", ep);
-    if (!cidp) { free(ep); return NULL; }
+    if (!cidp) { endpoint_destroy_partial(ep); return NULL; }
     memcpy(&ep->cid, cidp, sizeof(ep->cid));
 
     pthread_create(&ep->thread, NULL, event_loop_worker, ep);
@@ -663,6 +729,7 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
     /* Initialize RX worker thread on server */
     init_rx_worker(ep);
 
+    ensure_evthread();
     ep->eb = event_base_new();
 
     xqc_config_t cfg;
@@ -728,7 +795,7 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
     if (ep->num_paths == 0) ep->num_paths = 1;
 
     ep->engine = xqc_engine_create(XQC_ENGINE_SERVER, &cfg, &ssl_cfg, &eng_cb, &trans_cb, ep);
-    if (!ep->engine) { free(ep); return NULL; }
+    if (!ep->engine) { endpoint_destroy_partial(ep); return NULL; }
 
     xqc_server_set_conn_settings(ep->engine, &conn_settings);
 
@@ -800,44 +867,43 @@ int quic_send(quic_endpoint_t *ep, const uint8_t *data, size_t len) {
 void quic_endpoint_stop(quic_endpoint_t *ep) {
     if (!ep) return;
 
-    ep->worker_running = 0;
-    pthread_mutex_lock(&ep->rx_queue.lock);
-    pthread_cond_broadcast(&ep->rx_queue.cond);
-    pthread_mutex_unlock(&ep->rx_queue.lock);
-
-    pthread_join(ep->worker_thread, NULL);
-    pthread_mutex_destroy(&ep->rx_queue.lock);
-    pthread_cond_destroy(&ep->rx_queue.cond);
-
-    if (ep->eb) {
-        event_base_loopbreak(ep->eb);
+    /* Ask the event loop thread to wind down (close the connection, drain,
+       loopbreak — see engine_timer_cb), wake it, and wait for it. All
+       xquic/libevent work happens on the thread that owns those objects. */
+    ep->stopping = 1;
+    if (ep->timer_ev) {
+        event_active(ep->timer_ev, 0, 0);
     }
     if (ep->thread) {
         pthread_join(ep->thread, NULL);
     }
 
-    if (ep->qlog_file) {
-        fclose(ep->qlog_file);
-        ep->qlog_file = NULL;
-    }
+    /* Loop thread is gone, so nothing enqueues to the rx queue anymore:
+       let the worker drain what's left and exit. */
+    stop_rx_worker(ep);
 
+    /* Single-threaded from here on. Destroy the engine before closing the
+       qlog its callbacks write to. */
     if (ep->engine) {
         xqc_engine_destroy(ep->engine);
         ep->engine = NULL;
+    }
+    if (ep->qlog_file) {
+        fclose(ep->qlog_file);
+        ep->qlog_file = NULL;
     }
 
     if (ep->quic_ev) {
         event_free(ep->quic_ev);
         ep->quic_ev = NULL;
     }
-    if (ep->quic_fd >= 0) {
-        close(ep->quic_fd);
-        ep->quic_fd = -1;
-    }
-
     if (ep->timer_ev) {
         event_free(ep->timer_ev);
         ep->timer_ev = NULL;
+    }
+    if (ep->quic_fd > 0) {
+        close(ep->quic_fd);
+        ep->quic_fd = -1;
     }
     if (ep->eb) {
         event_base_free(ep->eb);
