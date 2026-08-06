@@ -1502,10 +1502,9 @@ xqc_engine_free_alpn_list(xqc_engine_t *engine)
         alpn_reg = xqc_list_entry(pos, xqc_alpn_registration_t, head);
 
         if (alpn_reg) {
-            if (alpn_reg->alp_ctx) {
-                xqc_free(alpn_reg->alp_ctx);
-            }
-            
+            /* alp_ctx is owned by the registrant (see xqc_h3_ctx_destroy for
+               the h3 ctx lifecycle); freeing it here destroys caller-owned
+               state that may outlive the engine */
             if (alpn_reg->alpn) {
                 xqc_free(alpn_reg->alpn);
             }

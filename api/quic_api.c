@@ -104,6 +104,12 @@ struct quic_endpoint {
     pthread_t            worker_thread;
     int                  worker_running;
 
+    /* Outbound queue: quic_send() enqueues from any thread; tx_ev drains on
+       the event loop thread, which is the only thread allowed to touch the
+       xquic engine/connection (xquic is not thread-safe). */
+    api_queue_t          tx_queue;
+    struct event        *tx_ev;
+
     quic_recv_cb         app_recv_cb;
     void                *app_user_data;
 
@@ -236,12 +242,56 @@ static void stop_rx_worker(quic_endpoint_t *ep) {
     pthread_cond_destroy(&ep->rx_queue.cond);
 }
 
+/* Drain pending app sends on the event loop thread. Activated from
+   quic_send() via event_active; also runs any time the loop wakes it. */
+static void tx_drain_cb(int fd, short what, void *arg) {
+    quic_endpoint_t *ep = (quic_endpoint_t *)arg;
+    uint8_t buf[API_MAX_PAYLOAD];
+    size_t len;
+
+    for (;;) {
+        pthread_mutex_lock(&ep->tx_queue.lock);
+        if (ep->tx_queue.count == 0) {
+            pthread_mutex_unlock(&ep->tx_queue.lock);
+            break;
+        }
+        api_queue_item_t *item = &ep->tx_queue.items[ep->tx_queue.head];
+        memcpy(buf, item->data, item->len);
+        len = item->len;
+        ep->tx_queue.head = (ep->tx_queue.head + 1) % API_QUEUE_CAPACITY;
+        ep->tx_queue.count--;
+        pthread_mutex_unlock(&ep->tx_queue.lock);
+
+        if (ep->datagram_mode) {
+            if (ep->conn) {
+                xqc_datagram_send(ep->conn, buf, len, &ep->quic_dgram_id, 1);
+            }
+        } else if (ep->stream) {
+            xqc_stream_send(ep->stream, buf, len, 0);
+        }
+    }
+}
+
+static void init_tx_queue(quic_endpoint_t *ep) {
+    pthread_mutex_init(&ep->tx_queue.lock, NULL);
+    ep->tx_ev = event_new(ep->eb, -1, 0, tx_drain_cb, ep);
+}
+
+static void destroy_tx_queue(quic_endpoint_t *ep) {
+    if (ep->tx_ev) {
+        event_free(ep->tx_ev);
+        ep->tx_ev = NULL;
+    }
+    pthread_mutex_destroy(&ep->tx_queue.lock);
+}
+
 /* Cleanup for start-path failures: the event loop thread has not launched
    yet, but the rx worker holds ep — it must be joined before free(ep). */
 static void endpoint_destroy_partial(quic_endpoint_t *ep) {
     stop_rx_worker(ep);
     if (ep->engine) xqc_engine_destroy(ep->engine);
     if (ep->quic_ev) event_free(ep->quic_ev);
+    if (ep->tx_ev) destroy_tx_queue(ep);
     if (ep->timer_ev) event_free(ep->timer_ev);
     if (ep->quic_fd > 0) close(ep->quic_fd);
     if (ep->eb) event_base_free(ep->eb);
@@ -702,6 +752,8 @@ quic_endpoint_t *quic_client_start(const quic_client_config_t *config) {
     struct timeval tv = {0, 10000};
     event_add(ep->timer_ev, &tv);
 
+    init_tx_queue(ep);
+
     xqc_conn_ssl_config_t conn_ssl_config = {0};
     const xqc_cid_t *cidp = xqc_connect(ep->engine, &conn_settings, NULL, 0, "localhost", 0,
                                         &conn_ssl_config, 
@@ -841,27 +893,44 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
     struct timeval tv = {0, 10000};
     event_add(ep->timer_ev, &tv);
 
+    init_tx_queue(ep);
+
     pthread_create(&ep->thread, NULL, event_loop_worker, ep);
     return ep;
 }
 
 int quic_send(quic_endpoint_t *ep, const uint8_t *data, size_t len) {
-    if (!ep || !ep->conn) return -1;
+    if (!ep || ep->stopping) return -1;
 
+    size_t framed_len = ep->datagram_mode ? len + 8 : len;
+    if (framed_len > API_MAX_PAYLOAD) return -1;
+
+    /* Enqueue only; the actual xqc_datagram_send/xqc_stream_send happens in
+       tx_drain_cb on the event loop thread. Calling into xquic from this
+       thread would race the engine and corrupt its internal lists. */
+    pthread_mutex_lock(&ep->tx_queue.lock);
+    if (ep->tx_queue.count >= API_QUEUE_CAPACITY) {
+        pthread_mutex_unlock(&ep->tx_queue.lock);
+        fprintf(stderr, "[QUIC API WARNING] TX Queue Full! Dropping packet.\n");
+        return -1;
+    }
+
+    api_queue_item_t *item = &ep->tx_queue.items[ep->tx_queue.tail];
     if (ep->datagram_mode) {
-        uint8_t buf[2000];
-        if (len + 8 > sizeof(buf)) return -1;
-
         uint64_t dgram_id = (ep->mode == QUIC_MODE_CLIENT) ? ep->client_dgram_id++ : ep->server_dgram_id++;
         uint64_t net_val = htobe64(dgram_id);
-        memcpy(buf, &net_val, sizeof(uint64_t));
-        memcpy(buf + 8, data, len);
-
-        return xqc_datagram_send(ep->conn, buf, len + 8, &ep->quic_dgram_id, 1);
-    } else if (ep->stream) {
-        return (int)xqc_stream_send(ep->stream, (unsigned char *)data, len, 0);
+        memcpy(item->data, &net_val, sizeof(uint64_t));
+        memcpy(item->data + 8, data, len);
+    } else {
+        memcpy(item->data, data, len);
     }
-    return -1;
+    item->len = framed_len;
+    ep->tx_queue.tail = (ep->tx_queue.tail + 1) % API_QUEUE_CAPACITY;
+    ep->tx_queue.count++;
+    pthread_mutex_unlock(&ep->tx_queue.lock);
+
+    event_active(ep->tx_ev, 0, 0);
+    return 0;
 }
 
 void quic_endpoint_stop(quic_endpoint_t *ep) {
@@ -897,6 +966,7 @@ void quic_endpoint_stop(quic_endpoint_t *ep) {
         event_free(ep->quic_ev);
         ep->quic_ev = NULL;
     }
+    destroy_tx_queue(ep);
     if (ep->timer_ev) {
         event_free(ep->timer_ev);
         ep->timer_ev = NULL;
