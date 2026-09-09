@@ -19,7 +19,7 @@ ssl_path=$4
 
 # if ssl_path is not defined, try to use the default path
 if [ -z "$ssl_path" ] ; then
-    ssl_path="`pwd`/third_party/boringssl"
+    ssl_path="`pwd`/boringssl"
     echo "use default ssl path: $ssl_path"
 fi
 
