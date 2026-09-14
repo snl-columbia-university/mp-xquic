@@ -27,7 +27,7 @@ xqc_proactive_singlepath_scheduler_get_path(void *scheduler,
 {
     // initalize redundancy mask (which paths) and redundancy factor (how many copies)
     packet_out->po_experimental_redundancy_mask = 0;
-    packet_out->po_experimental_redundancy_factor = 2;
+    packet_out->po_experimental_redundancy_factor = 1;
 
     xqc_list_head_t *pos, *next;
     xqc_path_ctx_t *path;

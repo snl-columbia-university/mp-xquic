@@ -276,7 +276,7 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    sleep(1); // Wait for connection handshake
+    sleep(3); // Wait for connection handshake
 
     FILE *f = fopen(trace_file, "r");
     if (!f) {
@@ -382,5 +382,7 @@ int main(int argc, char *argv[]) {
     if (g_rtt_log_file) fclose(g_rtt_log_file);
 
     quic_endpoint_stop(client);
-    return EXIT_SUCCESS;
+    fflush(stdout);
+    fflush(stderr);
+    exit(EXIT_SUCCESS);
 }
