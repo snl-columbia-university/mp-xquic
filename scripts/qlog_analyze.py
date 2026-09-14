@@ -171,12 +171,13 @@ def write_ndjson_qlog(output_file, traces, title):
 
 
 def compute_metrics_and_plot(all_events, global_start_ts, plot_output_path):
-    """Calculates summary statistics and generates performance graphs."""
+    """Calculates summary statistics and generates performance graphs with direct loss annotations."""
     metrics_data = defaultdict(lambda: {
         "times": [], "cwnd": [], "srtt": [], "latest_rtt": [], "inflight": []
     })
     
     pkt_stats = defaultdict(lambda: {"sent": 0, "recv": 0, "lost": 0, "bytes_sent": 0})
+    loss_events = defaultdict(list)
 
     for ev in all_events:
         rel_t = round(ev["ts_ms"] - global_start_ts, 3)
@@ -187,7 +188,7 @@ def compute_metrics_and_plot(all_events, global_start_ts, plot_output_path):
         event = ev["event_name"]
         data = ev["data"]
 
-        # Track packet counts
+        # Track packet counts and loss timestamps
         if event == "packet_sent":
             pkt_stats[key]["sent"] += 1
             pkt_stats[key]["bytes_sent"] += data.get("size", 0)
@@ -195,12 +196,13 @@ def compute_metrics_and_plot(all_events, global_start_ts, plot_output_path):
             pkt_stats[key]["recv"] += 1
         elif event == "packet_lost":
             pkt_stats[key]["lost"] += 1
+            loss_events[key].append(rel_t)
 
         # Track congestion control metrics
         if event in ("rec_metrics_updated", "metrics_updated"):
             metrics_data[key]["times"].append(rel_t)
             metrics_data[key]["cwnd"].append(data.get("cwnd", 0))
-            metrics_data[key]["srtt"].append(data.get("srtt", 0) / 1000.0)  # convert us to ms
+            metrics_data[key]["srtt"].append(data.get("srtt", 0) / 1000.0)  # us -> ms
             metrics_data[key]["latest_rtt"].append(data.get("latest_rtt", 0) / 1000.0)
             metrics_data[key]["inflight"].append(data.get("inflight", 0))
 
@@ -231,33 +233,86 @@ def compute_metrics_and_plot(all_events, global_start_ts, plot_output_path):
         print(f"  Avg Smoothed RTT: {avg_srtt:.2f} ms")
     print("="*70 + "\n")
 
-    # Generate Visualization Plots
-    fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
-    fig.suptitle("XQUIC Performance Metrics Over Time", fontsize=14, fontweight="bold")
+    # Determine max duration for adaptive x-axis unit scaling
+    max_ts = max((m["times"][-1] for m in metrics_data.values() if m["times"]), default=0)
+    use_seconds = max_ts > 3000
+    scale = 1000.0 if use_seconds else 1.0
+    time_unit = "s" if use_seconds else "ms"
 
-    for key, m in metrics_data.items():
+    colors = plt.cm.tab10.colors
+    fig, axes = plt.subplots(3, 1, figsize=(11, 8), sharex=True)
+    
+    lines_for_legend = []
+    labels_for_legend = []
+    all_loss_times = []
+
+    for idx, (key, m) in enumerate(metrics_data.items()):
         if not m["times"]:
             continue
-        axes[0].plot(m["times"], [c / 1024.0 for c in m["cwnd"]], label=f"{key} CWND")
-        axes[1].plot(m["times"], m["srtt"], label=f"{key} SRTT")
-        axes[2].plot(m["times"], [inf / 1024.0 for inf in m["inflight"]], label=f"{key} In-Flight")
+        
+        color = colors[idx % len(colors)]
+        t_scaled = [t / scale for t in m["times"]]
+        cwnd_kb = [c / 1024.0 for c in m["cwnd"]]
+        inflight_kb = [inf / 1024.0 for inf in m["inflight"]]
 
-    # Configure Axes
-    axes[0].set_ylabel("CWND (KB)", fontweight="bold")
-    axes[0].grid(True, linestyle="--", alpha=0.6)
-    axes[0].legend(loc="upper right")
+        # 1. Congestion Window (CWND)
+        line, = axes[0].plot(t_scaled, cwnd_kb, label=key, color=color, linewidth=1.8)
+        lines_for_legend.append(line)
+        labels_for_legend.append(key)
 
-    axes[1].set_ylabel("Smoothed RTT (ms)", fontweight="bold")
-    axes[1].grid(True, linestyle="--", alpha=0.6)
-    axes[1].legend(loc="upper right")
+        # 2. RTT (Latest vs Smoothed)
+        axes[1].plot(t_scaled, m["latest_rtt"], color=color, alpha=0.25, linewidth=1.0)
+        axes[1].plot(t_scaled, m["srtt"], color=color, linewidth=1.8)
 
-    axes[2].set_ylabel("In-Flight Data (KB)", fontweight="bold")
-    axes[2].set_xlabel("Time Relative to Start (ms)", fontweight="bold")
-    axes[2].grid(True, linestyle="--", alpha=0.6)
-    axes[2].legend(loc="upper right")
+        # 3. In-Flight Data
+        axes[2].plot(t_scaled, inflight_kb, color=color, linewidth=1.8)
 
+        # Collect and draw packet loss vertical lines
+        if key in loss_events and loss_events[key]:
+            loss_t = [t / scale for t in loss_events[key]]
+            all_loss_times.extend(loss_t)
+            for ax in axes:
+                for lt in loss_t:
+                    ax.axvline(x=lt, color="#d62728", alpha=0.35, linestyle="--", linewidth=0.9)
+
+    # Annotate Packet Loss Directly on top panel if loss occurred
+    if all_loss_times:
+        first_loss_t = min(all_loss_times)
+        y_max = axes[1].get_ylim()[1]
+        x_span = (max_ts / scale) if max_ts > 0 else 1.0
+        
+        axes[1].annotate(
+            "Packet Loss",
+            xy=(first_loss_t, y_max * 0.80),
+            xytext=(first_loss_t + (x_span * 0.04), y_max * 0.85),
+            arrowprops=dict(arrowstyle="->", color="#d62728", lw=1.0),
+            color="#d62728",
+            fontsize=8.5,
+            fontweight="bold"
+        )
+
+    # Axes Formatting & Styling
+    axes[0].set_ylabel("CWND (KB)", fontweight="bold", fontsize=10)
+    axes[1].set_ylabel("RTT (ms)\n[Raw & Smoothed]", fontweight="bold", fontsize=10)
+    axes[2].set_ylabel("In-Flight (KB)", fontweight="bold", fontsize=10)
+    axes[2].set_xlabel(f"Elapsed Time ({time_unit})", fontweight="bold", fontsize=10)
+
+    for ax in axes:
+        ax.grid(True, linestyle=":", alpha=0.5, color="gray")
+        ax.tick_params(direction="out", length=4, width=1, labelsize=9)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+
+    # Global Clean Legend (Only Path Keys)
+    fig.legend(
+        lines_for_legend, labels_for_legend,
+        loc="upper center", bbox_to_anchor=(0.5, 0.98),
+        ncol=min(len(labels_for_legend), 4), frameon=True, facecolor="white", edgecolor="none"
+    )
+
+    fig.suptitle("XQUIC Transport Metrics Over Time", fontsize=13, fontweight="bold", y=1.02)
     plt.tight_layout()
-    plt.savefig(plot_output_path, dpi=300)
+    plt.savefig(plot_output_path, dpi=300, bbox_inches="tight")
     print(f"[✓] Saved metrics plot visualization to: {plot_output_path}")
 
 

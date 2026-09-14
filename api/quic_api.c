@@ -17,7 +17,7 @@
 
 #define MAX_PATHS 16
 #define API_QUEUE_CAPACITY 4096
-#define API_MAX_PAYLOAD 2000
+#define API_MAX_PAYLOAD 2048
 
 typedef struct {
     uint8_t data[API_MAX_PAYLOAD];
@@ -701,7 +701,7 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
         .mp_ping_on = 1,
         .mp_ack_on_any_path = 0,
         .init_max_path_id = MAX_PATHS,
-        .least_available_cid_count = 4,
+        .least_available_cid_count = MAX_PATHS,
         .max_streams_bidi = 32,
         .max_datagram_frame_size = config->enable_datagram ? 65535 : 0,
         .max_udp_payload_size = config->enable_datagram ? 65527 : 0,
@@ -800,19 +800,29 @@ int quic_send(quic_endpoint_t *ep, const uint8_t *data, size_t len) {
 void quic_endpoint_stop(quic_endpoint_t *ep) {
     if (!ep) return;
 
-    ep->worker_running = 0;
+    if (ep->engine && ep->conn) {
+        xqc_conn_close(ep->engine, &ep->cid);
+        ep->conn = NULL;
+        xqc_engine_main_logic(ep->engine);
+    }
+
     pthread_mutex_lock(&ep->rx_queue.lock);
+    ep->worker_running = 0;
     pthread_cond_broadcast(&ep->rx_queue.cond);
     pthread_mutex_unlock(&ep->rx_queue.lock);
 
-    pthread_join(ep->worker_thread, NULL);
+    if (ep->worker_thread && !pthread_equal(pthread_self(), ep->worker_thread)) {
+        pthread_join(ep->worker_thread, NULL);
+    }
+
     pthread_mutex_destroy(&ep->rx_queue.lock);
     pthread_cond_destroy(&ep->rx_queue.cond);
 
     if (ep->eb) {
         event_base_loopbreak(ep->eb);
     }
-    if (ep->thread) {
+
+    if (ep->thread && !pthread_equal(pthread_self(), ep->thread)) {
         pthread_join(ep->thread, NULL);
     }
 
@@ -830,15 +840,17 @@ void quic_endpoint_stop(quic_endpoint_t *ep) {
         event_free(ep->quic_ev);
         ep->quic_ev = NULL;
     }
-    if (ep->quic_fd >= 0) {
-        close(ep->quic_fd);
-        ep->quic_fd = -1;
-    }
 
     if (ep->timer_ev) {
         event_free(ep->timer_ev);
         ep->timer_ev = NULL;
     }
+
+    if (ep->quic_fd >= 0) {
+        close(ep->quic_fd);
+        ep->quic_fd = -1;
+    }
+
     if (ep->eb) {
         event_base_free(ep->eb);
         ep->eb = NULL;

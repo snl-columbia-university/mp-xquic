@@ -153,21 +153,8 @@ int main(int argc, char *argv[]) {
         .user_data = &g_server1
     };
 
-    // --- Server Endpoint 2 Config (Port 8001) ---
-    quic_server_config_t config2 = {
-        .listen_port = 8001,
-        .num_local_addrs = num_local_addrs,
-        .enable_datagram = 1,
-        .enable_redundancy = 1,
-        .recv_cb = on_server_recv,
-        .scheduler = scheduler,
-        .congestion = congestion,
-        .user_data = &g_server2
-    };
-
     for (int i = 0; i < num_local_addrs; i++) {
         config1.local_ips[i] = local_ips[i];
-        config2.local_ips[i] = local_ips[i];
     }
 
     printf("Starting QUIC Replay Server 1 on port 8000...\n");
@@ -177,20 +164,11 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    printf("Starting QUIC Replay Server 2 on port 8001...\n");
-    g_server2 = quic_server_start(&config2);
-    if (!g_server2) {
-        fprintf(stderr, "Failed to start Server 2!\n");
-        quic_endpoint_stop(g_server1);
-        return EXIT_FAILURE;
-    }
-
-    printf("Both servers running. Press Ctrl+C to stop.\n");
+    printf("Server running. Press Ctrl+C to stop.\n");
     while (1) {
         sleep(1);
     }
 
     quic_endpoint_stop(g_server1);
-    quic_endpoint_stop(g_server2);
     return EXIT_SUCCESS;
 }
