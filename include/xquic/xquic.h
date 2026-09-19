@@ -1572,7 +1572,7 @@ typedef enum {
 } xqc_0rtt_flag_t;
 
 
-#define XQC_MAX_PATHS_COUNT 8
+#define XQC_MAX_PATHS_COUNT 16
 #define XQC_CONN_INFO_LEN 400
 #define XQC_EXTERN_CONN_INFO_LEN 128
 
