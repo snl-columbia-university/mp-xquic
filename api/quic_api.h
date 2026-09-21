@@ -28,7 +28,7 @@ typedef struct {
     const char *congestion;      /* "cubic", "bbrv1", ""bbrv2", "reno"*/
 
     quic_recv_cb recv_cb;       /* Application receive callback */
-    char *qlog;                 /* Qlog file path */
+    const char *qlog;                 /* Qlog file path */
     void *user_data;            /* User pointer passed to recv_cb */
 } quic_client_config_t;
 
@@ -47,7 +47,7 @@ typedef struct {
     const char *congestion;      /* "cubic", "bbrv1", ""bbrv2", "reno"*/
 
     quic_recv_cb recv_cb;       /* Application receive callback */
-    char *qlog;                 /* Qlog file path */
+    const char *qlog;                 /* Qlog file path */
     void *user_data;            /* User pointer passed to recv_cb */
 } quic_server_config_t;
 

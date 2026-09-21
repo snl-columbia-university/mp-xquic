@@ -106,13 +106,14 @@ int main(int argc, char *argv[]) {
     const char *scheduler     = "pmp";
     const char *congestion    = "cubic";
     const char *raw_local_ips = "127.0.0.2,127.0.0.3";
-    const char *out_qlog_file = "server.qlog"
+    const char *out_qlog_file = "server.qlog";
 
 
     static struct option long_options[] = {
         {"local-ips",  required_argument, 0, 'l'},
         {"scheduler",  required_argument, 0, 's'},
         {"congestion", required_argument, 0, 'c'},
+        {"qlog",       required_argument, 0, 'q'},
         {"help",       no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };

@@ -184,7 +184,7 @@ int main(int argc, char *argv[]) {
     const char *scheduler    = "pmp";
     const char *congestion   = "cubic";
     const char *out_log_file = "rtt_results.csv";
-    const char *out_qlog_file = "client.qlog"
+    const char *out_qlog_file = "client.qlog";
     const char *raw_local_ips = "127.0.0.1";
     const char *raw_peer_ips  = "127.0.0.2,127.0.0.3";
 
@@ -196,13 +196,14 @@ int main(int argc, char *argv[]) {
         {"peer-ips",   required_argument, 0, 'r'},
         {"scheduler",  required_argument, 0, 's'},
         {"congestion", required_argument, 0, 'c'},
+        {"qlog",       required_argument, 0, 'q'},
         {"out",        required_argument, 0, 'o'},
         {"help",       no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
     int opt, option_index = 0;
-    while ((opt = getopt_long(argc, argv, "t:i:p:l:r:s:c:o:h", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "t:i:p:l:r:s:c:o:q:h", long_options, &option_index)) != -1) {
         switch (opt) {
             case 't': trace_file    = optarg; break;
             case 'i': target_peer   = optarg; break;
