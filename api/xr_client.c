@@ -184,6 +184,7 @@ int main(int argc, char *argv[]) {
     const char *scheduler    = "pmp";
     const char *congestion   = "cubic";
     const char *out_log_file = "rtt_results.csv";
+    const char *out_qlog_file = "client.qlog"
     const char *raw_local_ips = "127.0.0.1";
     const char *raw_peer_ips  = "127.0.0.2,127.0.0.3";
 
