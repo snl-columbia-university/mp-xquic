@@ -116,11 +116,12 @@ int main(int argc, char *argv[]) {
     };
 
     int opt, option_index = 0;
-    while ((opt = getopt_long(argc, argv, "l:s:c:h", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "l:s:c:q:h", long_options, &option_index)) != -1) {
         switch (opt) {
             case 'l': raw_local_ips = optarg; break;
             case 's': scheduler     = optarg; break;
             case 'c': congestion    = optarg; break;
+            case 'q': out_qlog_file = optarg; break;
             case 'h': print_usage(argv[0]); return EXIT_SUCCESS;
             default:  print_usage(argv[0]); return EXIT_FAILURE;
         }
@@ -150,6 +151,7 @@ int main(int argc, char *argv[]) {
         .recv_cb = on_server_recv,
         .scheduler = scheduler,
         .congestion = congestion,
+        .qlog = out_qlog_file,
         .user_data = &g_server1
     };
 

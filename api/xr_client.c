@@ -211,6 +211,7 @@ int main(int argc, char *argv[]) {
             case 's': scheduler     = optarg; break;
             case 'c': congestion    = optarg; break;
             case 'o': out_log_file  = optarg; break;
+            case 'q': out_qlog_file = optarg; break;
             case 'h': print_usage(argv[0]); return EXIT_SUCCESS;
             default:  print_usage(argv[0]); return EXIT_FAILURE;
         }
@@ -251,6 +252,7 @@ int main(int argc, char *argv[]) {
         .scheduler = scheduler,
         .congestion = congestion,
         .enable_redundancy = 1,
+        .qlog = out_qlog_file,
         .user_data = NULL
     };
 

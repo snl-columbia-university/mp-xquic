@@ -515,7 +515,11 @@ quic_endpoint_t *quic_client_start(const quic_client_config_t *config) {
     if (!ep) return NULL;
 
     ep->mode = QUIC_MODE_CLIENT;
-    ep->qlog_file = fopen("client.qlog", "wb");
+    if (config->qlog && config->qlog[0] != '\0') {
+        ep->qlog_file = fopen(config->qlog, "wb");
+    } else {
+        ep->qlog_file = NULL;
+    }
     ep->app_recv_cb = config->recv_cb;
     ep->app_user_data = config->user_data;
     ep->datagram_mode = config->enable_datagram;
@@ -524,6 +528,8 @@ quic_endpoint_t *quic_client_start(const quic_client_config_t *config) {
 
     xqc_conn_settings_t conn_settings = {
         .proto_version = XQC_VERSION_V1,
+        .ping_on = 1,
+        .standby_path_probe_timeout = 500,
         .enable_multipath = 1,
         .mp_enable_reinjection = 0,
         .mp_ping_on = 1,
@@ -655,7 +661,11 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
     if (!ep) return NULL;
 
     ep->mode = QUIC_MODE_SERVER;
-    ep->qlog_file = fopen("server.qlog", "wb");
+    if (config->qlog && config->qlog[0] != '\0') {
+        ep->qlog_file = fopen(config->qlog, "wb");
+    } else {
+        ep->qlog_file = NULL;
+    }
     ep->app_recv_cb = config->recv_cb;
     ep->app_user_data = config->user_data;
     ep->datagram_mode = config->enable_datagram;
@@ -696,6 +706,8 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
 
     xqc_conn_settings_t conn_settings = {
         .proto_version = XQC_VERSION_V1,
+        .ping_on = 1,
+        .standby_path_probe_timeout = 500,
         .enable_multipath = 1,
         .mp_enable_reinjection = 0,
         .mp_ping_on = 1,
