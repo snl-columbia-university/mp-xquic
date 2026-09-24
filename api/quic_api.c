@@ -103,6 +103,8 @@ struct quic_endpoint {
     pthread_t            worker_thread;
     int                  worker_running;
 
+    pthread_mutex_t      engine_lock;
+
     quic_recv_cb         app_recv_cb;
     void                *app_user_data;
     
@@ -458,7 +460,9 @@ static void set_event_timer(xqc_usec_t wake_after, void *user_data) {
 static void engine_timer_cb(int fd, short what, void *arg) {
     quic_endpoint_t *ep = (quic_endpoint_t *)arg;
     if (!ep) return;
+    pthread_mutex_lock(&ep->engine_lock);
     xqc_engine_main_logic(ep->engine);
+    pthread_mutex_unlock(&ep->engine_lock);
 }
 
 // QUIC packet read callback
@@ -494,11 +498,13 @@ static void packet_read_cb(int fd, short what, void *arg) {
             }
         }
 
+        pthread_mutex_lock(&ep->engine_lock);
         xqc_engine_packet_process(ep->engine, buf, n,
                                   (struct sockaddr*)&local_addr, local_len,
                                   (struct sockaddr*)&peer_addr, msg.msg_namelen,
                                   get_timestamp(), ep);
         xqc_engine_finish_recv(ep->engine);
+        pthread_mutex_unlock(&ep->engine_lock);
     }
 }
 
@@ -568,6 +574,7 @@ quic_endpoint_t *quic_client_start(const quic_client_config_t *config) {
     if (ep->num_local_addrs == 0) ep->num_local_addrs = 1;
     if (ep->num_paths == 0) ep->num_paths = 1;
 
+    pthread_mutex_init(&ep->engine_lock, NULL);
     ep->eb = event_base_new();
     
     xqc_config_t cfg;
@@ -673,6 +680,7 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
     /* Initialize RX worker thread on server */
     init_rx_worker(ep);
 
+    pthread_mutex_init(&ep->engine_lock, NULL);
     ep->eb = event_base_new();
 
     xqc_config_t cfg;
@@ -791,32 +799,48 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
 }
 
 int quic_send(quic_endpoint_t *ep, const uint8_t *data, size_t len) {
-    if (!ep || !ep->conn) return -1;
+    int ret = -1;
+
+    if (!ep) return -1;
+
+    pthread_mutex_lock(&ep->engine_lock);
+
+    if (!ep->conn) {
+        pthread_mutex_unlock(&ep->engine_lock);
+        return -1;
+    }
 
     if (ep->datagram_mode) {
         uint8_t buf[2000];
-        if (len + 8 > sizeof(buf)) return -1;
+        if (len + 8 > sizeof(buf)) {
+            pthread_mutex_unlock(&ep->engine_lock);
+            return -1;
+        }
 
         uint64_t dgram_id = (ep->mode == QUIC_MODE_CLIENT) ? ep->client_dgram_id++ : ep->server_dgram_id++;
         uint64_t net_val = htobe64(dgram_id);
         memcpy(buf, &net_val, sizeof(uint64_t));
         memcpy(buf + 8, data, len);
 
-        return xqc_datagram_send(ep->conn, buf, len + 8, &ep->quic_dgram_id, 1);
+        ret = xqc_datagram_send(ep->conn, buf, len + 8, &ep->quic_dgram_id, 1);
     } else if (ep->stream) {
-        return (int)xqc_stream_send(ep->stream, (unsigned char *)data, len, 0);
+        ret = (int)xqc_stream_send(ep->stream, (unsigned char *)data, len, 0);
     }
-    return -1;
+
+    pthread_mutex_unlock(&ep->engine_lock);
+    return ret;
 }
 
 void quic_endpoint_stop(quic_endpoint_t *ep) {
     if (!ep) return;
 
+    pthread_mutex_lock(&ep->engine_lock);
     if (ep->engine && ep->conn) {
         xqc_conn_close(ep->engine, &ep->cid);
         ep->conn = NULL;
         xqc_engine_main_logic(ep->engine);
     }
+    pthread_mutex_unlock(&ep->engine_lock);
 
     pthread_mutex_lock(&ep->rx_queue.lock);
     ep->worker_running = 0;
@@ -837,6 +861,8 @@ void quic_endpoint_stop(quic_endpoint_t *ep) {
     if (ep->thread && !pthread_equal(pthread_self(), ep->thread)) {
         pthread_join(ep->thread, NULL);
     }
+
+    pthread_mutex_destroy(&ep->engine_lock);
 
     if (ep->qlog_file) {
         fclose(ep->qlog_file);
