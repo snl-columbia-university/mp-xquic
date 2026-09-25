@@ -9,6 +9,8 @@
 #define MAX_HITS 4096
 #define MAX_IPS  16
 
+extern void quic_endpoint_step(quic_endpoint_t *ep);
+
 // --- Network Packet Structures ---
 
 typedef struct __attribute__((packed)) {
@@ -219,7 +221,6 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // Parse CSV IP strings into arrays
     char local_bufs[MAX_IPS][64];
     const char *local_ips[MAX_IPS];
     int num_local_addrs = parse_ip_list(raw_local_ips, local_bufs, local_ips);
@@ -280,7 +281,12 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    sleep(3); // Wait for connection handshake
+    // Process network events to allow handshake
+    double handshake_end = get_time_ms() + 3000.0;
+    while(get_time_ms() < handshake_end) {
+        quic_endpoint_step(client);
+        usleep(100);
+    }
 
     FILE *f = fopen(trace_file, "r");
     if (!f) {
@@ -345,11 +351,13 @@ int main(int argc, char *argv[]) {
 
         double rel_offset_ms = send_offset_ms - first_offset_ms;
         double target_time = test_start_ms + rel_offset_ms;
-        double now = get_time_ms();
-        double delay_ms = target_time - now;
-
-        if (delay_ms > 0.1) {
-            usleep((useconds_t)(delay_ms * 1000.0));
+        
+        // Wait non-blocking until target send time
+        while (1) {
+            double now = get_time_ms();
+            if (now >= target_time) break;
+            quic_endpoint_step(client);
+            usleep(100); 
         }
 
         hit_request_t req = {
@@ -381,7 +389,13 @@ int main(int argc, char *argv[]) {
         fflush(stdout);
     }
 
-    sleep(3);
+    // Process network events to catch final ACKs
+    double end_wait = get_time_ms() + 3000.0;
+    while(get_time_ms() < end_wait) {
+        quic_endpoint_step(client);
+        usleep(100);
+    }
+
     print_rtt_summary();
     if (g_rtt_log_file) fclose(g_rtt_log_file);
 

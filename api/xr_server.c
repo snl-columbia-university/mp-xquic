@@ -7,6 +7,9 @@
 #include "quic_api.h"
 
 #define MAX_IPS 16
+#define MAX_PENDING 4096
+
+extern void quic_endpoint_step(quic_endpoint_t *ep);
 
 // --- Network Packet Structures ---
 
@@ -23,8 +26,15 @@ typedef struct __attribute__((packed)) {
     uint8_t status;
 } hit_ack_t;
 
+typedef struct {
+    int active;
+    hit_ack_t ack;
+    double target_send_time_ms;
+} pending_ack_t;
+
 static quic_endpoint_t *g_server1 = NULL;
 static quic_endpoint_t *g_server2 = NULL;
+static pending_ack_t g_pending_acks[MAX_PENDING] = {0};
 
 static double get_time_ms(void) {
     struct timespec ts;
@@ -65,31 +75,26 @@ static int parse_ip_list(const char *str, char bufs[MAX_IPS][64], const char *pt
 // --- Receive Callback ---
 
 static void on_server_recv(const uint8_t *data, size_t len, void *user_data) {
-    // Retrieve the target server handle passed via user_data
-    quic_endpoint_t *server = *(quic_endpoint_t **)user_data;
-
     if (len >= sizeof(hit_request_t)) {
         const hit_request_t *req = (const hit_request_t *)data;
 
         printf("<<< [SERVER RECV] hitId=%d from client_%d | Requested processing delay: %.2f ms\n",
                req->hit_id, req->client_id, req->server_proc_ms);
 
-        // Simulate exact processing overhead from log trace
-        if (req->server_proc_ms > 0.0f) {
-            usleep((useconds_t)(req->server_proc_ms * 1000.0));
-        }
-
-        // Construct ACK response
         hit_ack_t ack = {
             .hit_id = req->hit_id,
             .client_id = req->client_id,
             .status = 1
         };
 
-        printf(">>> [SERVER ACK SEND] hitId=%d to client_%d\n", req->hit_id, req->client_id);
-        if (server) {
-            quic_send(g_server1, (const uint8_t *)&ack, sizeof(ack));
-            //quic_send(g_server2, (const uint8_t *)&ack, sizeof(ack));
+        // Queue the ACK instead of sleeping
+        for (int i = 0; i < MAX_PENDING; i++) {
+            if (!g_pending_acks[i].active) {
+                g_pending_acks[i].ack = ack;
+                g_pending_acks[i].target_send_time_ms = get_time_ms() + req->server_proc_ms;
+                g_pending_acks[i].active = 1;
+                break;
+            }
         }
     }
 }
@@ -170,8 +175,23 @@ int main(int argc, char *argv[]) {
     }
 
     printf("Server running. Press Ctrl+C to stop.\n");
+    
+    // Main Non-Blocking Loop
     while (1) {
-        sleep(1);
+        if (g_server1) quic_endpoint_step(g_server1);
+
+        double now = get_time_ms();
+        for (int i = 0; i < MAX_PENDING; i++) {
+            if (g_pending_acks[i].active && now >= g_pending_acks[i].target_send_time_ms) {
+                printf(">>> [SERVER ACK SEND] hitId=%d to client_%d\n", g_pending_acks[i].ack.hit_id, g_pending_acks[i].ack.client_id);
+                if (g_server1) {
+                    quic_send(g_server1, (const uint8_t *)&g_pending_acks[i].ack, sizeof(hit_ack_t));
+                }
+                g_pending_acks[i].active = 0;
+            }
+        }
+        
+        usleep(100);
     }
 
     quic_endpoint_stop(g_server1);

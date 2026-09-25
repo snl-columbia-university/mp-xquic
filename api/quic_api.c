@@ -16,22 +16,6 @@
 #include <xquic/xquic.h>
 
 #define MAX_PATHS 16
-#define API_QUEUE_CAPACITY 4096
-#define API_MAX_PAYLOAD 2048
-
-typedef struct {
-    uint8_t data[API_MAX_PAYLOAD];
-    size_t len;
-} api_queue_item_t;
-
-typedef struct {
-    api_queue_item_t items[API_QUEUE_CAPACITY];
-    size_t head;
-    size_t tail;
-    size_t count;
-    pthread_mutex_t lock;
-    pthread_cond_t cond;
-} api_queue_t;
 
 typedef enum {
     QUIC_LOG_DEBUG,
@@ -79,7 +63,6 @@ struct quic_endpoint {
     struct event_base *eb;
     struct event *timer_ev;
     struct event *quic_ev;
-    pthread_t thread;
 
     int quic_fd;
 
@@ -99,15 +82,17 @@ struct quic_endpoint {
     uint64_t max_dgram_id;
     uint64_t dgram_id_mask;
 
-    api_queue_t          rx_queue;
-    pthread_t            worker_thread;
-    int                  worker_running;
-
     quic_recv_cb         app_recv_cb;
     void                *app_user_data;
     
     int datagram_mode;
 };
+
+void quic_endpoint_step(quic_endpoint_t *ep) {
+    if (ep && ep->eb) {
+        event_base_loop(ep->eb, EVLOOP_NONBLOCK);
+    }
+}
 
 static xqc_usec_t get_timestamp(void) {
     struct timeval tv;
@@ -158,66 +143,6 @@ static int is_new_datagram(uint64_t id, uint64_t *max_dgram_id, uint64_t *dgram_
     }
 }
 
-//App queue functions
-static void api_enqueue_rx(quic_endpoint_t *ep, const uint8_t *data, size_t len) {
-    if (!ep || len > API_MAX_PAYLOAD) return;
-
-    pthread_mutex_lock(&ep->rx_queue.lock);
-    if (ep->rx_queue.count >= API_QUEUE_CAPACITY) {
-        pthread_mutex_unlock(&ep->rx_queue.lock);
-        fprintf(stderr, "[QUIC API WARNING] RX Queue Full! Dropping packet.\n");
-        return;
-    }
-
-    memcpy(ep->rx_queue.items[ep->rx_queue.tail].data, data, len);
-    ep->rx_queue.items[ep->rx_queue.tail].len = len;
-    ep->rx_queue.tail = (ep->rx_queue.tail + 1) % API_QUEUE_CAPACITY;
-    ep->rx_queue.count++;
-
-    pthread_cond_signal(&ep->rx_queue.cond);
-    pthread_mutex_unlock(&ep->rx_queue.lock);
-}
-static void *api_rx_worker_thread(void *arg) {
-    quic_endpoint_t *ep = (quic_endpoint_t *)arg;
-    uint8_t buffer[API_MAX_PAYLOAD];
-    size_t len;
-
-    while (ep->worker_running) {
-        pthread_mutex_lock(&ep->rx_queue.lock);
-
-        while (ep->rx_queue.count == 0 && ep->worker_running) {
-            pthread_cond_wait(&ep->rx_queue.cond, &ep->rx_queue.lock);
-        }
-
-        if (!ep->worker_running && ep->rx_queue.count == 0) {
-            pthread_mutex_unlock(&ep->rx_queue.lock);
-            break;
-        }
-
-        /* Pop item */
-        api_queue_item_t *item = &ep->rx_queue.items[ep->rx_queue.head];
-        memcpy(buffer, item->data, item->len);
-        len = item->len;
-
-        ep->rx_queue.head = (ep->rx_queue.head + 1) % API_QUEUE_CAPACITY;
-        ep->rx_queue.count--;
-
-        pthread_mutex_unlock(&ep->rx_queue.lock);
-
-        /* Invoke application callback safely on worker thread */
-        if (ep->app_recv_cb) {
-            ep->app_recv_cb(buffer, len, ep->app_user_data);
-        }
-    }
-    return NULL;
-}
-static void init_rx_worker(quic_endpoint_t *ep) {
-    pthread_mutex_init(&ep->rx_queue.lock, NULL);
-    pthread_cond_init(&ep->rx_queue.cond, NULL);
-    ep->worker_running = 1;
-    pthread_create(&ep->worker_thread, NULL, api_rx_worker_thread, ep);
-}
-
 // QUIC logging callback
 static void log_write(xqc_log_level_t lvl, const void *buf, size_t size, void *arg) { 
     LOG_DEBUG("%.*s", (int)size, (char*)buf); 
@@ -259,7 +184,6 @@ static ssize_t write_socket_ex(uint64_t path_id, const unsigned char *buf, size_
                 ep->mode == QUIC_MODE_CLIENT ? "client" : "server", path_id, 
                 local_ip, ntohs(local_addr->sin_port),
                 peer_ip, ntohs(peer_addr->sin_port));
-
 
     struct iovec iov = { (void *)buf, size };
     char cbuf[CMSG_SPACE(sizeof(struct in_pktinfo))] = {0};
@@ -326,7 +250,9 @@ static int stream_read_notify(xqc_stream_t *strm, void *user_data) {
         ssize_t n = xqc_stream_recv(strm, buf, sizeof(buf), &fin);
         LOG_DEBUG("[quic] stream_read_notify called for stream %lu, received %zd bytes\n", (unsigned long)xqc_stream_id(strm), n);
         if (n > 0) {
-            api_enqueue_rx(ep, buf, (size_t)n);
+            if (ep->app_recv_cb) {
+                ep->app_recv_cb(buf, (size_t)n, ep->app_user_data);
+            }
         } else if (fin) {
             LOG_INFO("[quic] stream %lu finished\n", (unsigned long)xqc_stream_id(strm));
             break;
@@ -435,7 +361,9 @@ static void datagram_read_notify(xqc_connection_t *conn, void *user_data, const 
     const uint8_t *payload = (const uint8_t *)data + 8;
     size_t payload_len = data_len - 8;
 
-    api_enqueue_rx(ep, payload, payload_len);
+    if (ep->app_recv_cb) {
+        ep->app_recv_cb(payload, payload_len, ep->app_user_data);
+    }
 }
 static void datagram_write_notify(xqc_connection_t *conn, void *user_data) { 
     LOG_DEBUG("[quic] datagram sent to peer\n"); 
@@ -502,12 +430,6 @@ static void packet_read_cb(int fd, short what, void *arg) {
     }
 }
 
-static void *event_loop_worker(void *arg) {
-    quic_endpoint_t *ep = (quic_endpoint_t *)arg;
-    event_base_dispatch(ep->eb);
-    return NULL;
-}
-
 quic_endpoint_t *quic_client_start(const quic_client_config_t *config) {
     if (!config) return NULL;
 
@@ -523,8 +445,6 @@ quic_endpoint_t *quic_client_start(const quic_client_config_t *config) {
     ep->app_recv_cb = config->recv_cb;
     ep->app_user_data = config->user_data;
     ep->datagram_mode = config->enable_datagram;
-
-    init_rx_worker(ep);
 
     xqc_conn_settings_t conn_settings = {
         .proto_version = XQC_VERSION_V1,
@@ -650,7 +570,6 @@ quic_endpoint_t *quic_client_start(const quic_client_config_t *config) {
     if (!cidp) { free(ep); return NULL; }
     memcpy(&ep->cid, cidp, sizeof(ep->cid));
 
-    pthread_create(&ep->thread, NULL, event_loop_worker, ep);
     return ep;
 }
 
@@ -669,9 +588,6 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
     ep->app_recv_cb = config->recv_cb;
     ep->app_user_data = config->user_data;
     ep->datagram_mode = config->enable_datagram;
-
-    /* Initialize RX worker thread on server */
-    init_rx_worker(ep);
 
     ep->eb = event_base_new();
 
@@ -786,7 +702,6 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
     struct timeval tv = {0, 10000};
     event_add(ep->timer_ev, &tv);
 
-    pthread_create(&ep->thread, NULL, event_loop_worker, ep);
     return ep;
 }
 
@@ -818,24 +733,8 @@ void quic_endpoint_stop(quic_endpoint_t *ep) {
         xqc_engine_main_logic(ep->engine);
     }
 
-    pthread_mutex_lock(&ep->rx_queue.lock);
-    ep->worker_running = 0;
-    pthread_cond_broadcast(&ep->rx_queue.cond);
-    pthread_mutex_unlock(&ep->rx_queue.lock);
-
-    if (ep->worker_thread && !pthread_equal(pthread_self(), ep->worker_thread)) {
-        pthread_join(ep->worker_thread, NULL);
-    }
-
-    pthread_mutex_destroy(&ep->rx_queue.lock);
-    pthread_cond_destroy(&ep->rx_queue.cond);
-
     if (ep->eb) {
         event_base_loopbreak(ep->eb);
-    }
-
-    if (ep->thread && !pthread_equal(pthread_self(), ep->thread)) {
-        pthread_join(ep->thread, NULL);
     }
 
     if (ep->qlog_file) {
