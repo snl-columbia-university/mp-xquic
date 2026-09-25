@@ -279,10 +279,10 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    double handshake_deadline = get_time_ms() + 3000.0;
+    double handshake_deadline = get_time_ms() + CONNECTION_TIMEOUT * num_peer_addrs;
     while (!is_connected(client)) {
         if (get_time_ms() >= handshake_deadline) {
-            fprintf(stderr, "Handshake did not complete within 3000 ms\n");
+            fprintf(stderr, "Handshake did not complete within %d ms\n", CONNECTION_TIMEOUT * num_peer_addrs);
             quic_endpoint_stop(client);
             fclose(g_rtt_log_file);
             return EXIT_FAILURE;

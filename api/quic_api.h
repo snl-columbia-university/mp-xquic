@@ -8,6 +8,8 @@
 extern "C" {
 #endif
 
+#define CONNECTION_TIMEOUT 10000
+
 typedef struct quic_endpoint quic_endpoint_t;
 
 /* Callback function to deliver received payload data to the application */

@@ -182,7 +182,8 @@ static ssize_t write_socket_ex(uint64_t path_id, const unsigned char *buf, size_
     quic_endpoint_t *ep = (quic_endpoint_t *)user_data;
     if (!ep || ep->quic_fd <= 0) return -1;
 
-    struct sockaddr_in *peer_addr = ep->mode == QUIC_MODE_CLIENT ? &ep->peer_addrs[path_id % ep->num_peer_addrs] : (struct sockaddr_in *)_peer_addr;
+
+    struct sockaddr_in *peer_addr = ep->mode == QUIC_MODE_CLIENT ? &ep->peer_addrs[(path_id + ep->path_idx) % ep->num_peer_addrs] : (struct sockaddr_in *)_peer_addr;
     struct sockaddr_in *local_addr = ep->mode == QUIC_MODE_CLIENT ? &ep->local_addrs[(path_id / ep->num_peer_addrs) % ep->num_local_addrs] : &ep->local_addrs[path_id % ep->num_local_addrs]; 
 
     char local_ip[INET_ADDRSTRLEN];
@@ -296,26 +297,31 @@ static int conn_create_notify(xqc_connection_t *conn, const xqc_cid_t *cid, void
 }
 static int conn_close_notify(xqc_connection_t *conn, const xqc_cid_t *cid, void *user_data, void *proto_data) { 
     quic_endpoint_t *ep = (quic_endpoint_t *)user_data;
+    if (!ep) return 0;
 
-    if(ep->path_idx < MAX_PATHS){
+    if (ep->mode == QUIC_MODE_CLIENT && !ep->connected
+        && ep->path_idx + 1 < ep->num_peer_addrs)
+    {
+        char ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &ep->peer_addrs[ep->path_idx].sin_addr, ip, sizeof(ip));
+        LOG_INFO("[quic] connection failed to establish with %s:%u, trying next peer addr\n", ip, ntohs(ep->peer_addrs[ep->path_idx].sin_port));
         ep->path_idx++;
         const xqc_cid_t *cidp = xqc_connect(ep->engine, &ep->ep_conn_settings, NULL, 0, "localhost", 0,
-                                        &ep->ep_ssl_config, 
-                                        (struct sockaddr*)&ep->peer_addrs[ep->path_idx], sizeof(ep->peer_addrs[ep->path_idx]),
-                                        "raw", ep);
-        
+                                            &ep->ep_ssl_config,
+                                            (struct sockaddr*)&ep->peer_addrs[ep->path_idx], sizeof(ep->peer_addrs[ep->path_idx]),
+                                            "raw", ep);
+        if (cidp) {
+            memcpy(&ep->cid, cidp, sizeof(ep->cid));
+            return 0;
+        }
+        LOG_ERROR("[client-quic] retry connect failed\n");
     }
-    else{
-    LOG_INFO("[quic] connection closed\n");
 
-    quic_endpoint_t *ep = (quic_endpoint_t *)user_data;
-    if (ep) {
-        ep->conn = NULL;
-        ep->stream = NULL;
-        ep->connected = 0;
-    }
+    LOG_INFO("[quic] connection closed\n");
+    ep->conn = NULL;
+    ep->stream = NULL;
+    ep->connected = 0;
     return 0; 
-    }
 }
 static void conn_handshake_finished(xqc_connection_t *conn, void *user_data, void *proto_data) {
     LOG_INFO("[quic] handshake finished\n");
@@ -475,6 +481,8 @@ quic_endpoint_t *quic_client_start(const quic_client_config_t *config) {
         .proto_version = XQC_VERSION_V1,
         .ping_on = 1,
         .standby_path_probe_timeout = 500,
+        .init_idle_time_out = CONNECTION_TIMEOUT,
+        .idle_time_out = CONNECTION_TIMEOUT,
         .enable_multipath = 1,
         .mp_enable_reinjection = 0,
         .mp_ping_on = 1,
@@ -653,6 +661,8 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
     xqc_conn_settings_t conn_settings = {
         .proto_version = XQC_VERSION_V1,
         .ping_on = 1,
+        .init_idle_time_out = CONNECTION_TIMEOUT,
+        .idle_time_out = CONNECTION_TIMEOUT,
         .standby_path_probe_timeout = 500,
         .enable_multipath = 1,
         .mp_enable_reinjection = 0,
