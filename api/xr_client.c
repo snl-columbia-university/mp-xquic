@@ -291,6 +291,12 @@ int main(int argc, char *argv[]) {
         usleep(100);
     }
 
+    double time_for_paths_to_setup = get_time_ms() + 10000.0;
+    while (get_time_ms() < time_for_paths_to_setup) {
+        quic_endpoint_step(client);
+        usleep(100);
+    }
+
     FILE *f = fopen(trace_file, "r");
     if (!f) {
         perror("Failed to open trace CSV");
