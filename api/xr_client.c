@@ -9,8 +9,6 @@
 #define MAX_HITS 4096
 #define MAX_IPS  16
 
-extern void quic_endpoint_step(quic_endpoint_t *ep);
-
 // --- Network Packet Structures ---
 
 typedef struct __attribute__((packed)) {
@@ -281,9 +279,14 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    // Process network events to allow handshake
-    double handshake_end = get_time_ms() + 3000.0;
-    while(get_time_ms() < handshake_end) {
+    double handshake_deadline = get_time_ms() + 3000.0;
+    while (!is_connected(client)) {
+        if (get_time_ms() >= handshake_deadline) {
+            fprintf(stderr, "Handshake did not complete within 3000 ms\n");
+            quic_endpoint_stop(client);
+            fclose(g_rtt_log_file);
+            return EXIT_FAILURE;
+        }
         quic_endpoint_step(client);
         usleep(100);
     }

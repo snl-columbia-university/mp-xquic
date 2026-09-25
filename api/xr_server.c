@@ -9,8 +9,6 @@
 #define MAX_IPS 16
 #define MAX_PENDING 4096
 
-extern void quic_endpoint_step(quic_endpoint_t *ep);
-
 // --- Network Packet Structures ---
 
 typedef struct __attribute__((packed)) {

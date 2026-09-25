@@ -84,7 +84,13 @@ struct quic_endpoint {
 
     quic_recv_cb         app_recv_cb;
     void                *app_user_data;
-    
+
+    int connected;
+    int path_idx;
+
+    xqc_conn_settings_t ep_conn_settings;
+    xqc_conn_ssl_config_t ep_ssl_config;
+
     int datagram_mode;
 };
 
@@ -92,6 +98,10 @@ void quic_endpoint_step(quic_endpoint_t *ep) {
     if (ep && ep->eb) {
         event_base_loop(ep->eb, EVLOOP_NONBLOCK);
     }
+}
+
+int is_connected(quic_endpoint_t *ep) {
+    return ep ? ep->connected : 0;
 }
 
 static xqc_usec_t get_timestamp(void) {
@@ -285,19 +295,34 @@ static int conn_create_notify(xqc_connection_t *conn, const xqc_cid_t *cid, void
     return 0; 
 }
 static int conn_close_notify(xqc_connection_t *conn, const xqc_cid_t *cid, void *user_data, void *proto_data) { 
+    quic_endpoint_t *ep = (quic_endpoint_t *)user_data;
+
+    if(ep->path_idx < MAX_PATHS){
+        ep->path_idx++;
+        const xqc_cid_t *cidp = xqc_connect(ep->engine, &ep->ep_conn_settings, NULL, 0, "localhost", 0,
+                                        &ep->ep_ssl_config, 
+                                        (struct sockaddr*)&ep->peer_addrs[ep->path_idx], sizeof(ep->peer_addrs[ep->path_idx]),
+                                        "raw", ep);
+        
+    }
+    else{
     LOG_INFO("[quic] connection closed\n");
+
     quic_endpoint_t *ep = (quic_endpoint_t *)user_data;
     if (ep) {
         ep->conn = NULL;
         ep->stream = NULL;
+        ep->connected = 0;
     }
     return 0; 
+    }
 }
 static void conn_handshake_finished(xqc_connection_t *conn, void *user_data, void *proto_data) {
     LOG_INFO("[quic] handshake finished\n");
     quic_endpoint_t *ep = (quic_endpoint_t *)user_data;
     if (!ep) return;
     ep->conn = conn;
+    ep->connected = 1;
     if (ep->mode == QUIC_MODE_CLIENT && !ep->quic_dgram_id) {
         ep->stream = xqc_stream_create(ep->engine, &ep->cid, NULL, user_data);
         if (ep->stream) {
@@ -563,9 +588,14 @@ quic_endpoint_t *quic_client_start(const quic_client_config_t *config) {
     event_add(ep->timer_ev, &tv);
 
     xqc_conn_ssl_config_t conn_ssl_config = {0};
-    const xqc_cid_t *cidp = xqc_connect(ep->engine, &conn_settings, NULL, 0, "localhost", 0,
-                                        &conn_ssl_config, 
-                                        (struct sockaddr*)&ep->peer_addrs[0], sizeof(ep->peer_addrs[0]),
+
+    ep->path_idx = 0;
+    ep->ep_conn_settings = conn_settings;
+    ep->ep_ssl_config = conn_ssl_config;
+
+    const xqc_cid_t *cidp = xqc_connect(ep->engine, &ep->ep_conn_settings, NULL, 0, "localhost", 0,
+                                        &ep->ep_ssl_config, 
+                                        (struct sockaddr*)&ep->peer_addrs[ep->path_idx], sizeof(ep->peer_addrs[ep->path_idx]),
                                         "raw", ep);
     if (!cidp) { free(ep); return NULL; }
     memcpy(&ep->cid, cidp, sizeof(ep->cid));

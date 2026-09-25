@@ -71,6 +71,16 @@ int quic_send(quic_endpoint_t *ep, const uint8_t *data, size_t len);
  */
 void quic_endpoint_stop(quic_endpoint_t *ep);
 
+/**
+ * Run any pending network and timer work for this endpoint and return.
+ */
+void quic_endpoint_step(quic_endpoint_t *ep);
+
+/**
+ * 1 once the handshake has completed, 0 before that and after a close.
+ */
+int is_connected(quic_endpoint_t *ep);
+
 #ifdef __cplusplus
 }
 #endif
