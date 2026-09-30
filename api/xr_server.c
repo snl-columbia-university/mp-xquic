@@ -9,18 +9,13 @@
 #define MAX_IPS 16
 #define MAX_PENDING 4096
 
-// --- Network Packet Structures ---
-
 typedef struct __attribute__((packed)) {
-    int32_t hit_id;
-    int32_t client_id;      // Numeric ID of origin client
-    float client_prep_ms;
-    float server_proc_ms;   // Exact delay recorded in trace
+    int32_t hit_id, client_id;
+    float client_prep_ms, server_proc_ms;
 } hit_request_t;
 
 typedef struct __attribute__((packed)) {
-    int32_t hit_id;
-    int32_t client_id;      // Origin client ID preserved
+    int32_t hit_id, client_id;
     uint8_t status;
 } hit_ack_t;
 
@@ -30,9 +25,9 @@ typedef struct {
     double target_send_time_ms;
 } pending_ack_t;
 
-static quic_endpoint_t *g_server1 = NULL;
-static quic_endpoint_t *g_server2 = NULL;
+static quic_endpoint_t *g_server = NULL;
 static pending_ack_t g_pending_acks[MAX_PENDING] = {0};
+static int g_active_pending_count = 0;
 
 static double get_time_ms(void) {
     struct timespec ts;
@@ -40,158 +35,84 @@ static double get_time_ms(void) {
     return (ts.tv_sec * 1000.0) + (ts.tv_nsec / 1000000.0);
 }
 
-// --- IP Parser Helper ---
-
-static int parse_ip_list(const char *str, char bufs[MAX_IPS][64], const char *ptrs[MAX_IPS]) {
-    if (!str || !*str) return 0;
-    
-    char tmp[1024];
-    strncpy(tmp, str, sizeof(tmp) - 1);
-    tmp[sizeof(tmp) - 1] = '\0';
-
+static int parse_ips(char *str, const char *ips[MAX_IPS]) {
     int count = 0;
-    char *token = strtok(tmp, ",");
-    while (token && count < MAX_IPS) {
-        // Trim leading spaces
-        while (*token == ' ') token++;
-        // Trim trailing spaces
-        char *end = token + strlen(token) - 1;
-        while (end > token && *end == ' ') { 
-            *end = '\0'; 
-            end--; 
-        }
-
-        strncpy(bufs[count], token, 63);
-        bufs[count][63] = '\0';
-        ptrs[count] = bufs[count];
-        count++;
-        token = strtok(NULL, ",");
+    for (char *tok = strtok(str, " ,"); tok && count < MAX_IPS; tok = strtok(NULL, " ,")) {
+        ips[count++] = tok;
     }
     return count;
 }
 
-// --- Receive Callback ---
-
 static void on_server_recv(const uint8_t *data, size_t len, void *user_data) {
-    if (len >= sizeof(hit_request_t)) {
-        const hit_request_t *req = (const hit_request_t *)data;
+    if (len < sizeof(hit_request_t)) return;
+    const hit_request_t *req = (const hit_request_t *)data;
 
-        printf("<<< [SERVER RECV] hitId=%d from client_%d | Requested processing delay: %.2f ms\n",
-               req->hit_id, req->client_id, req->server_proc_ms);
+    printf("<<< [SERVER RECV] hitId=%d from client_%d | delay: %.2f ms\n", req->hit_id, req->client_id, req->server_proc_ms);
 
-        hit_ack_t ack = {
-            .hit_id = req->hit_id,
-            .client_id = req->client_id,
-            .status = 1
-        };
-
-        // Queue the ACK instead of sleeping
-        for (int i = 0; i < MAX_PENDING; i++) {
-            if (!g_pending_acks[i].active) {
-                g_pending_acks[i].ack = ack;
-                g_pending_acks[i].target_send_time_ms = get_time_ms() + req->server_proc_ms;
-                g_pending_acks[i].active = 1;
-                break;
-            }
+    for (int i = 0; i < MAX_PENDING; i++) {
+        if (!g_pending_acks[i].active) {
+            g_pending_acks[i].ack = (hit_ack_t){.hit_id = req->hit_id, .client_id = req->client_id, .status = 1};
+            g_pending_acks[i].target_send_time_ms = get_time_ms() + req->server_proc_ms;
+            g_pending_acks[i].active = 1;
+            g_active_pending_count++;
+            return;
         }
     }
-}
-
-void print_usage(const char *prog_name) {
-    printf("Usage: %s [options]\n\n", prog_name);
-    printf("  -l, --local-ips IPS    Comma-separated local IPs to bind (default: 127.0.0.2,127.0.0.3)\n");
-    printf("  -s, --scheduler ALG    Scheduler algorithm (default: pmp)\n");
-    printf("  -c, --congestion ALG   Congestion algorithm (default: cubic)\n");
-    printf("  -h, --help             Show this help message\n");
+    
+    fprintf(stderr, "[ERROR] Dropping ACK for hitId=%d: Pending queue is full!\n", req->hit_id);
 }
 
 int main(int argc, char *argv[]) {
-    const char *scheduler     = "pmp";
-    const char *congestion    = "cubic";
-    const char *raw_local_ips = "127.0.0.2,127.0.0.3";
-    const char *out_qlog_file = "server.qlog";
-
-
-    static struct option long_options[] = {
-        {"local-ips",  required_argument, 0, 'l'},
-        {"scheduler",  required_argument, 0, 's'},
-        {"congestion", required_argument, 0, 'c'},
-        {"qlog",       required_argument, 0, 'q'},
-        {"help",       no_argument,       0, 'h'},
-        {0, 0, 0, 0}
+    const char *scheduler = "pmp", *congestion = "cubic", *qlog = "server.qlog";
+    char local_buf[1024] = "127.0.0.2,127.0.0.3";
+    
+    static struct option opts[] = {
+        {"local-ips", 1, 0, 'l'}, {"scheduler", 1, 0, 's'}, 
+        {"congestion", 1, 0, 'c'}, {"qlog", 1, 0, 'q'}, {0, 0, 0, 0}
     };
 
-    int opt, option_index = 0;
-    while ((opt = getopt_long(argc, argv, "l:s:c:q:h", long_options, &option_index)) != -1) {
+    int opt;
+    while ((opt = getopt_long(argc, argv, "l:s:c:q:h", opts, NULL)) != -1) {
         switch (opt) {
-            case 'l': raw_local_ips = optarg; break;
-            case 's': scheduler     = optarg; break;
-            case 'c': congestion    = optarg; break;
-            case 'q': out_qlog_file = optarg; break;
-            case 'h': print_usage(argv[0]); return EXIT_SUCCESS;
-            default:  print_usage(argv[0]); return EXIT_FAILURE;
+            case 'l': strcpy(local_buf, optarg); break; case 's': scheduler = optarg; break;
+            case 'c': congestion = optarg; break; case 'q': qlog = optarg; break;
+            default: return EXIT_FAILURE;
         }
     }
 
-    // Parse comma-separated local IPs
-    char local_bufs[MAX_IPS][64];
     const char *local_ips[MAX_IPS];
-    int num_local_addrs = parse_ip_list(raw_local_ips, local_bufs, local_ips);
-
-    if (num_local_addrs == 0) {
-        fprintf(stderr, "Error: Must specify at least one local IP address.\n");
-        return EXIT_FAILURE;
-    }
-
-    printf("Starting QUIC Servers with %d local IP(s): ", num_local_addrs);
-    for (int i = 0; i < num_local_addrs; i++) printf("%s ", local_ips[i]);
-    printf("\n");
-    fflush(stdout);
-
-    // --- Server Endpoint 1 Config (Port 8000) ---
-    quic_server_config_t config1 = {
-        .listen_port = 8000,
-        .num_local_addrs = num_local_addrs,
-        .enable_datagram = 1,
-        .enable_redundancy = 1,
-        .recv_cb = on_server_recv,
-        .scheduler = scheduler,
-        .congestion = congestion,
-        .qlog = out_qlog_file,
-        .user_data = &g_server1
+    quic_server_config_t config = {
+        .listen_port = 8000, .num_local_addrs = parse_ips(local_buf, local_ips),
+        .enable_datagram = 1, .enable_redundancy = 1, .scheduler = scheduler,
+        .congestion = congestion, .qlog = qlog, .recv_cb = on_server_recv
     };
-
-    for (int i = 0; i < num_local_addrs; i++) {
-        config1.local_ips[i] = local_ips[i];
+    for (int i = 0; i < config.num_local_addrs; i++) {
+        config.local_ips[i] = local_ips[i];
     }
 
-    printf("Starting QUIC Replay Server 1 on port 8000...\n");
-    g_server1 = quic_server_start(&config1);
-    if (!g_server1) {
-        fprintf(stderr, "Failed to start Server 1!\n");
-        return EXIT_FAILURE;
-    }
+    if (config.num_local_addrs == 0) return EXIT_FAILURE;
 
-    printf("Server running. Press Ctrl+C to stop.\n");
-    
-    // Main Non-Blocking Loop
+    printf("Starting QUIC Server on port %d...\n", config.listen_port);
+    if (!(g_server = quic_server_start(&config))) return EXIT_FAILURE;
+
     while (1) {
-        if (g_server1) quic_endpoint_step(g_server1);
+        if (g_server) quic_endpoint_step(g_server);
 
-        double now = get_time_ms();
-        for (int i = 0; i < MAX_PENDING; i++) {
-            if (g_pending_acks[i].active && now >= g_pending_acks[i].target_send_time_ms) {
-                printf(">>> [SERVER ACK SEND] hitId=%d to client_%d\n", g_pending_acks[i].ack.hit_id, g_pending_acks[i].ack.client_id);
-                if (g_server1) {
-                    quic_send(g_server1, (const uint8_t *)&g_pending_acks[i].ack, sizeof(hit_ack_t));
+        if (g_active_pending_count > 0) {
+            double now = get_time_ms();
+            for (int i = 0; i < MAX_PENDING; i++) {
+                if (g_pending_acks[i].active && now >= g_pending_acks[i].target_send_time_ms) {
+                    printf(">>> [SERVER ACK SEND] hitId=%d to client_%d\n", g_pending_acks[i].ack.hit_id, g_pending_acks[i].ack.client_id);
+                    if (g_server) quic_send(g_server, (const uint8_t *)&g_pending_acks[i].ack, sizeof(hit_ack_t));
+                    
+                    g_pending_acks[i].active = 0;
+                    g_active_pending_count--;
                 }
-                g_pending_acks[i].active = 0;
             }
         }
-        
         usleep(100);
     }
 
-    quic_endpoint_stop(g_server1);
+    quic_endpoint_stop(g_server);
     return EXIT_SUCCESS;
 }
