@@ -143,9 +143,16 @@ int main(int argc, char *argv[]) {
     if (!client) return EXIT_FAILURE;
 
     printf("Starting QUIC Client %d...\n", g_my_client_id);
-    wait_until(client, get_time_ms() + CONNECTION_TIMEOUT * config.num_peer_addrs);
-    if (!is_connected(client)) return EXIT_FAILURE;
-    wait_until(client, get_time_ms() + 10000.0); 
+    double deadline = get_time_ms() + CONNECTION_TIMEOUT * MAX_IPS;
+    while (!is_connected(client)) {
+        quic_endpoint_step(client);
+        usleep(100);
+
+        if (get_time_ms() >= deadline) {
+            fprintf(stderr, "Handshake failed to complete.\n");
+            return EXIT_FAILURE;
+        }
+    }
 
     FILE *f = fopen(trace_file, "r");
     if (!f) return EXIT_FAILURE;

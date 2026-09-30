@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-#define CONNECTION_TIMEOUT 10000
+#define CONNECTION_TIMEOUT 5000
 
 typedef struct quic_endpoint quic_endpoint_t;
 
