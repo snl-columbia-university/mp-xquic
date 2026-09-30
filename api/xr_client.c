@@ -22,6 +22,7 @@ typedef struct {
     int hit_id;
     double send_time_ms, recv_time_ms, rtt_ms;
     int ack_received;
+    int refused;          /* quic_send() rejected this datagram; it never left the host */
 } hit_record_t;
 
 static hit_record_t *g_records = NULL;
@@ -30,6 +31,9 @@ static FILE *g_rtt_log_file = NULL;
 
 /* --quiet: suppress per-packet send/ack logging at cloud-gaming packet rates */
 static int g_quiet = 0;
+static const char *g_frames_out = NULL;   /* -F: per-frame summary CSV */
+static int g_send_refused = 0;
+#define ACK_LOOKBACK 65536                /* records searched per ack, newest first */
 /* --drop-on-unacked: frame-level backpressure. Datagrams have no delivery
    guarantee and xquic refuses them (-XQC_EAGAIN) when its send queue is full,
    so without this the sender fires into a void. Skip a frame outright if too
@@ -89,8 +93,10 @@ static void on_client_recv(const uint8_t *data, size_t len, void *user_data) {
     }
 
     if (ack->hit_id < 0) return;   /* fragment, not a tracked frame */
-    for (int i = 0; i < g_record_count; i++) {
-        if (g_records[i].hit_id == ack->hit_id && !g_records[i].ack_received) {
+    int lo = g_record_count - ACK_LOOKBACK;
+    if (lo < 0) lo = 0;
+    for (int i = g_record_count - 1; i >= lo; i--) {
+        if (g_records[i].hit_id == ack->hit_id && !g_records[i].ack_received && !g_records[i].refused) {
             g_records[i].recv_time_ms = recv_time;
             g_records[i].rtt_ms = recv_time - g_records[i].send_time_ms;
             g_records[i].ack_received = 1;
@@ -99,6 +105,32 @@ static void on_client_recv(const uint8_t *data, size_t len, void *user_data) {
             return;
         }
     }
+}
+
+static void write_frames(const char *path) {
+    FILE *o = fopen(path, "w");
+    if (!o) return;
+    fprintf(o, "frame_id,first_send_ms,n_frags,n_refused,n_acked,first_ack_ms,last_ack_ms,complete_ms\n");
+    for (int i = 0; i < g_record_count; ) {
+        int j = i, refused = 0, acked = 0;
+        double first_ack = 0, last_ack = 0;
+        while (j < g_record_count && g_records[j].hit_id == g_records[i].hit_id) {
+            if (g_records[j].refused) refused++;
+            if (g_records[j].ack_received) {
+                double r = g_records[j].recv_time_ms;
+                if (!acked || r < first_ack) first_ack = r;
+                if (!acked || r > last_ack) last_ack = r;
+                acked++;
+            }
+            j++;
+        }
+        int n = j - i;
+        fprintf(o, "%d,%.3f,%d,%d,%d,", g_records[i].hit_id, g_records[i].send_time_ms, n, refused, acked);
+        if (acked) fprintf(o, "%.3f,%.3f,", first_ack, last_ack); else fprintf(o, ",,");
+        if (acked == n) fprintf(o, "%.3f\n", last_ack - g_records[i].send_time_ms); else fprintf(o, "\n");
+        i = j;
+    }
+    fclose(o);
 }
 
 static int cmp_dbl(const void *a, const void *b) {
@@ -135,13 +167,13 @@ int main(int argc, char *argv[]) {
     static struct option opts[] = {
         {"trace", 1, 0, 't'}, {"id", 1, 0, 'i'}, {"port", 1, 0, 'p'}, {"local-ips", 1, 0, 'l'},
         {"peer-ips", 1, 0, 'r'}, {"scheduler", 1, 0, 's'}, {"congestion", 1, 0, 'c'},
-        {"out", 1, 0, 'o'}, {"qlog", 1, 0, 'q'}, {"quiet", 0, 0, 'Q'},
+        {"out", 1, 0, 'o'}, {"qlog", 1, 0, 'q'}, {"quiet", 0, 0, 'Q'}, {"frames-out", 1, 0, 'F'},
         {"drop-on-unacked", 0, 0, 'D'}, {"inflight", 1, 0, 'w'}, {"ack-timeout-ms", 1, 0, 'T'},
         {0, 0, 0, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "t:i:p:l:r:s:c:o:q:QDw:T:h", opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "t:i:p:l:r:s:c:o:q:QDw:T:F:h", opts, NULL)) != -1) {
         switch (opt) {
             case 't': trace_file = optarg; break; case 'i': target_peer = optarg; break;
             case 'p': peer_port = atoi(optarg); break; case 'l': strcpy(local_buf, optarg); break;
@@ -152,6 +184,7 @@ int main(int argc, char *argv[]) {
             case 'D': g_drop_on_unacked = 1; break;
             case 'w': g_max_inflight = atoi(optarg); if (g_max_inflight < 1) g_max_inflight = 1; break;
             case 'T': g_ack_timeout_ms = atof(optarg); break;
+            case 'F': g_frames_out = optarg; break;
             default: return EXIT_FAILURE;
         }
     }
@@ -247,17 +280,22 @@ int main(int argc, char *argv[]) {
         /* with -D, one record per frame (its first fragment), not per fragment */
         int is_frame_head = !g_drop_on_unacked || g_prev_frame_idx < 0
                             || g_records[g_prev_frame_idx].hit_id != hit_id;
+        int rec_idx = -1;
         if (hit_id >= 0 && is_frame_head) {
             if (g_record_count >= g_max_hits) {
                 g_max_hits *= 2;
                 g_records = realloc(g_records, g_max_hits * sizeof(hit_record_t));
             }
             g_prev_frame_idx = g_record_count;
+            rec_idx = g_record_count;
             g_records[g_record_count++] = (hit_record_t){.hit_id = hit_id, .send_time_ms = get_time_ms()};
         }
         if (!g_quiet) printf(">>> [CLIENT SEND] hitId=%d | len=%zu\n", hit_id, send_len);
 
-        quic_send(client, sendbuf, send_len);
+        if (quic_send(client, sendbuf, send_len) < 0) {
+            g_send_refused++;
+            if (rec_idx >= 0) g_records[rec_idx].refused = 1;
+        }
     }
     fclose(f);
 
@@ -269,6 +307,9 @@ int main(int argc, char *argv[]) {
                (g_frames_sent + g_frames_skipped) ? 100.0 * g_frames_skipped / (g_frames_sent + g_frames_skipped) : 0.0);
     }
     print_summary();
+    if (g_send_refused) printf("Refused by quic_send (never sent): %d\n", g_send_refused);
+    if (g_frames_out) write_frames(g_frames_out);
+    fflush(stdout);   /* teardown can abort (xqc_conn_destroy double free); keep the summary */
 
     if (g_rtt_log_file) fclose(g_rtt_log_file);
     free(g_records);
