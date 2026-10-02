@@ -458,14 +458,26 @@ static void packet_read_cb(int fd, short what, void *arg) {
     if (n > 0) {
         getsockname(fd, (struct sockaddr*)&local_addr, &local_len);
 
+        struct in_addr hdr_dst = local_addr.sin_addr;
         struct cmsghdr *cmsg;
         for (cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
             if (cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_PKTINFO) {
                 struct in_pktinfo *pi = (struct in_pktinfo *)CMSG_DATA(cmsg);
                 local_addr.sin_addr = pi->ipi_spec_dst; 
+                hdr_dst = pi->ipi_addr;
                 break;
             }
         }
+
+        char src_ip[INET_ADDRSTRLEN], dst_ip[INET_ADDRSTRLEN], hdr_dst_ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &peer_addr.sin_addr, src_ip, sizeof(src_ip));
+        inet_ntop(AF_INET, &local_addr.sin_addr, dst_ip, sizeof(dst_ip));
+        inet_ntop(AF_INET, &hdr_dst, hdr_dst_ip, sizeof(hdr_dst_ip));
+
+        LOG_DEBUG("[%s-quic] packet_read_cb received %zd bytes from %s:%d to %s:%d (header dst %s)\n",
+                    ep->mode == QUIC_MODE_CLIENT ? "client" : "server", n,
+                    src_ip, ntohs(peer_addr.sin_port),
+                    dst_ip, ntohs(local_addr.sin_port), hdr_dst_ip);
 
         xqc_engine_packet_process(ep->engine, buf, n,
                                   (struct sockaddr*)&local_addr, local_len,
