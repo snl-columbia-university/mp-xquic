@@ -191,10 +191,24 @@ static ssize_t write_socket_ex(uint64_t path_id, const unsigned char *buf, size_
     inet_ntop(AF_INET, &local_addr->sin_addr, local_ip, sizeof(local_ip));
     inet_ntop(AF_INET, &peer_addr->sin_addr, peer_ip, sizeof(peer_ip));
     
-    LOG_DEBUG("[%s-quic] write_socket_ex called for path_id %lu from %s:%d to %s:%d\n", 
+
+    struct sockaddr_storage eng_src = {0}, eng_dst = {0};
+    socklen_t len;
+    if (ep->conn) {
+        xqc_path_get_local_addr(ep->conn, path_id, (struct sockaddr *)&eng_src, sizeof(eng_src), &len);
+        xqc_path_get_peer_addr(ep->conn, path_id, (struct sockaddr *)&eng_dst, sizeof(eng_dst), &len);
+    }
+    
+    char eng_src_ip[INET_ADDRSTRLEN], eng_dst_ip[INET_ADDRSTRLEN];
+
+    inet_ntop(AF_INET, &((struct sockaddr_in *)&eng_src)->sin_addr, eng_src_ip, sizeof(eng_src_ip));
+    inet_ntop(AF_INET, &((struct sockaddr_in *)&eng_dst)->sin_addr, eng_dst_ip, sizeof(eng_dst_ip));
+
+
+    LOG_DEBUG("[%s-quic] write_socket_ex called for path_id %lu from %s:%d to %s:%d | engine path %s -> %s\n\n", 
                 ep->mode == QUIC_MODE_CLIENT ? "client" : "server", path_id, 
                 local_ip, ntohs(local_addr->sin_port),
-                peer_ip, ntohs(peer_addr->sin_port));
+                peer_ip, ntohs(peer_addr->sin_port), eng_src_ip, eng_dst_ip);
 
     struct iovec iov = { (void *)buf, size };
     char cbuf[CMSG_SPACE(sizeof(struct in_pktinfo))] = {0};
