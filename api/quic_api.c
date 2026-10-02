@@ -197,7 +197,23 @@ static ssize_t write_socket_ex(uint64_t path_id, const unsigned char *buf, size_
     }
 
     quic_socket_t *sock = &ep->sockets[safe_local_idx];
+
+    struct sockaddr_storage eng_src = {0}, eng_dst = {0};
+    socklen_t len;
+    if (ep->conn) {
+        xqc_path_get_local_addr(ep->conn, path_id, (struct sockaddr *)&eng_src, sizeof(eng_src), &len);
+        xqc_path_get_peer_addr(ep->conn, path_id, (struct sockaddr *)&eng_dst, sizeof(eng_dst), &len);
+    }
     
+    char sock_src_ip[INET_ADDRSTRLEN], sock_dst_ip[INET_ADDRSTRLEN];
+    char eng_src_ip[INET_ADDRSTRLEN], eng_dst_ip[INET_ADDRSTRLEN];
+    LOG_DEBUG("[%s-quic] write_socket_ex path_id %lu: socket[%zu] %s -> %s | engine path %s -> %s\n",
+              ep->mode == QUIC_MODE_CLIENT ? "client" : "server", (unsigned long)path_id, safe_local_idx,
+              inet_ntop(AF_INET, &sock->local_addr.sin_addr, sock_src_ip, sizeof(sock_src_ip)),
+              inet_ntop(AF_INET, &((const struct sockaddr_in *)_peer_addr)->sin_addr, sock_dst_ip, sizeof(sock_dst_ip)),
+              inet_ntop(AF_INET, &((struct sockaddr_in *)&eng_src)->sin_addr, eng_src_ip, sizeof(eng_src_ip)),
+              inet_ntop(AF_INET, &((struct sockaddr_in *)&eng_dst)->sin_addr, eng_dst_ip, sizeof(eng_dst_ip)));
+
     return sendto(sock->fd, buf, size, 0, _peer_addr, _peer_addrlen);
 }
 
