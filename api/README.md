@@ -25,13 +25,17 @@ git submodule update --init --recursive
 mkdir -p build && cd build
 cmake -DCMAKE_BUILD_TYPE=Release -DXQC_ENABLE_TESTING=0 -DXQC_ENABLE_EVENT_LOG=1 \
       -DXQC_ENABLE_BBR2=1 -DXQC_ENABLE_RENO=1 -DGCOV=off \
-      -DSSL_TYPE=boringssl -DSSL_PATH=$PWD/../boringssl ..
+      -DSSL_TYPE=boringssl -DSSL_PATH=$PWD/../boringssl \
+      -DCMAKE_C_FLAGS="-Wno-error=dangling-pointer -Wno-error=array-bounds -Wno-error=stringop-overflow" ..
 make -j xr_client xr_server
 
 # xr_server loads server.crt / server.key from its working directory
 openssl req -newkey rsa:2048 -x509 -nodes -keyout server.key -out server.crt \
     -subj "/CN=test.xquic.com" -days 365
 ```
+
+The `CMAKE_C_FLAGS` line is needed with newer GCC (e.g. Ubuntu 24.04). Without it,
+unmodified xquic code fails with `-Werror=dangling-pointer`.
 
 The net-emulator scripts expect the binaries and the certificate in
 `mp-xquic/build/`, with mp-xquic checked out next to net-emulator. If you build
