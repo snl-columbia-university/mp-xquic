@@ -102,8 +102,10 @@ struct quic_endpoint {
 
     /* QUIC-in-RTP: per-path RTP sequence numbers and counters */
     int rtp_encap;
+    int rtp_pdu_set;                       /* 0 off, 1 basic, 2 + PSSize/NPDS */
     uint16_t rtp_seq[MAX_PATHS];
-    uint64_t rtp_tx, rtp_rx, rtp_rx_plain;
+    uint16_t rtp_pssn[MAX_PATHS];          /* 10-bit PDU Set sequence number */
+    uint64_t rtp_tx, rtp_rx, rtp_rx_plain, rtp_rx_pduset;
 };
 
 void quic_endpoint_step(quic_endpoint_t *ep) {
@@ -194,26 +196,52 @@ static ssize_t udp_send(quic_endpoint_t *ep, int fd, unsigned path_idx,
     if (!ep->rtp_encap) return sendto(fd, buf, size, 0, peer, peer_len);
 
     unsigned char out[2048];
-    if (size + RTP_HDR_LEN > sizeof(out)) return -1;
+    /* PDU Set marking extension (TS 26.522 cl. 4.2.2, RFC 8285 one-byte form):
+       0xBEDE | length(words) | ID=1,len | E R R D PSI(4) | PSSN(10) PSN(6)
+       [| PSSize(24) | NPDS(16)] | zero padding to a 32-bit boundary.
+       Dummy marking: every RTP packet is its own PDU Set (E=1, PSN=0, NPDS=1),
+       PSI=0 (importance unknown), D=0, PSSN counts packets per path. */
+    size_t ext_data = ep->rtp_pdu_set == 0 ? 0 : (ep->rtp_pdu_set == 1 ? 3 : 8);
+    size_t ext_words = ext_data ? (1 + ext_data + 3) / 4 : 0;
+    size_t hdr = RTP_HDR_LEN + (ext_data ? 4 + 4 * ext_words : 0);
+    if (size + hdr > sizeof(out)) return -1;
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     uint32_t rtp_ts = (uint32_t)((uint64_t)ts.tv_sec * 90000u + (uint64_t)ts.tv_nsec / 11111u);
     uint16_t seq = ep->rtp_seq[path_idx % MAX_PATHS]++;
     uint32_t ssrc = RTP_SSRC_BASE | (path_idx & 0xff);
 
-    out[0] = 0x80;                       /* V=2 */
+    out[0] = ext_data ? 0x90 : 0x80;     /* V=2, X=1 when the extension is present */
     out[1] = RTP_PT;                     /* M=0, PT */
     out[2] = seq >> 8;        out[3] = seq & 0xff;
     out[4] = rtp_ts >> 24;    out[5] = (rtp_ts >> 16) & 0xff;
     out[6] = (rtp_ts >> 8) & 0xff;       out[7] = rtp_ts & 0xff;
     out[8] = ssrc >> 24;      out[9] = (ssrc >> 16) & 0xff;
     out[10] = (ssrc >> 8) & 0xff;        out[11] = ssrc & 0xff;
-    memcpy(out + RTP_HDR_LEN, buf, size);
+    if (ext_data) {
+        unsigned char *x = out + RTP_HDR_LEN;
+        memset(x, 0, 4 + 4 * ext_words);
+        x[0] = 0xBE; x[1] = 0xDE;
+        x[2] = ext_words >> 8; x[3] = ext_words & 0xff;
+        unsigned char *e = x + 4;
+        e[0] = (1 << 4) | (unsigned char)(ext_data - 1);        /* ID=1, len-1 */
+        uint16_t pssn = ep->rtp_pssn[path_idx % MAX_PATHS]++ & 0x3FF;
+        uint8_t psi = 0, psn = 0;
+        e[1] = (1 << 7) | (0 << 4) | (psi & 0x0F);              /* E=1, R=00, D=0, PSI */
+        e[2] = pssn >> 2;
+        e[3] = (unsigned char)(((pssn & 0x3) << 6) | (psn & 0x3F));
+        if (ext_data == 8) {
+            uint32_t pssize = (uint32_t)(hdr + size + 28);      /* incl. RTP/UDP/IPv4 */
+            e[4] = (pssize >> 16) & 0xff; e[5] = (pssize >> 8) & 0xff; e[6] = pssize & 0xff;
+            e[7] = 0; e[8] = 1;                                  /* NPDS = 1 */
+        }
+    }
+    memcpy(out + hdr, buf, size);
 
-    ssize_t n = sendto(fd, out, size + RTP_HDR_LEN, 0, peer, peer_len);
+    ssize_t n = sendto(fd, out, size + hdr, 0, peer, peer_len);
     if (n < 0) return n;
     ep->rtp_tx++;
-    return n >= RTP_HDR_LEN ? n - RTP_HDR_LEN : 0;   /* xquic expects its own byte count */
+    return n >= (ssize_t)hdr ? n - (ssize_t)hdr : 0;      /* xquic expects its own byte count */
 }
 
 // QUIC socket callbacks
@@ -480,8 +508,14 @@ static void packet_read_cb(int fd, short what, void *arg) {
         unsigned char *pkt = buf;
         if (ep->rtp_encap) {
             if (n >= RTP_HDR_LEN && (buf[0] & 0xC0) == 0x80) {   /* RTP v2 */
-                pkt = buf + RTP_HDR_LEN;
-                n -= RTP_HDR_LEN;
+                ssize_t h = RTP_HDR_LEN + 4 * (buf[0] & 0x0F);  /* + CSRCs */
+                if ((buf[0] & 0x10) && n >= h + 4) {            /* X: extension block */
+                    if (buf[h] == 0xBE && buf[h + 1] == 0xDE) ep->rtp_rx_pduset++;
+                    h += 4 + 4 * ((buf[h + 2] << 8) | buf[h + 3]);
+                }
+                if (h > n) continue;                            /* malformed: drop */
+                pkt = buf + h;
+                n -= h;
                 ep->rtp_rx++;
             } else {
                 ep->rtp_rx_plain++;                             /* bare QUIC */
@@ -503,7 +537,8 @@ quic_endpoint_t *quic_client_start(const quic_client_config_t *config) {
     if (!ep) return NULL;
 
     ep->mode = QUIC_MODE_CLIENT;
-    ep->rtp_encap = config->rtp_encap;
+    ep->rtp_encap = config->rtp_encap || config->rtp_pdu_set;
+    ep->rtp_pdu_set = config->rtp_pdu_set;
     if (config->qlog && config->qlog[0] != '\0') {
         ep->qlog_file = fopen(config->qlog, "wb");
     } else {
@@ -659,7 +694,8 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
     if (!ep) return NULL;
 
     ep->mode = QUIC_MODE_SERVER;
-    ep->rtp_encap = config->rtp_encap;
+    ep->rtp_encap = config->rtp_encap || config->rtp_pdu_set;
+    ep->rtp_pdu_set = config->rtp_pdu_set;
     if (config->qlog && config->qlog[0] != '\0') {
         ep->qlog_file = fopen(config->qlog, "wb");
     } else {
@@ -822,9 +858,11 @@ void quic_endpoint_stop(quic_endpoint_t *ep) {
     if (!ep) return;
 
     if (ep->rtp_encap) {
-        printf("[rtp] %s: sent %lu RTP datagrams, received %lu RTP + %lu bare QUIC\n",
+        printf("[rtp] %s: sent %lu RTP datagrams (PDU Set ext %d), received %lu RTP "
+               "(%lu with BEDE ext) + %lu bare QUIC\n",
                ep->mode == QUIC_MODE_CLIENT ? "client" : "server", (unsigned long)ep->rtp_tx,
-               (unsigned long)ep->rtp_rx, (unsigned long)ep->rtp_rx_plain);
+               ep->rtp_pdu_set, (unsigned long)ep->rtp_rx, (unsigned long)ep->rtp_rx_pduset,
+               (unsigned long)ep->rtp_rx_plain);
         fflush(stdout);
     }
 
