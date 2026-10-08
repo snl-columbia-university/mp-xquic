@@ -32,6 +32,8 @@ typedef struct {
     quic_recv_cb recv_cb;       /* Application receive callback */
     const char *qlog;                 /* Qlog file path */
     void *user_data;            /* User pointer passed to recv_cb */
+    int rtp_encap;              /* 1 = wrap every UDP datagram in a 12 B RTP header
+                                   (QUIC-in-RTP experiment); both ends must match */
 } quic_client_config_t;
 
 typedef struct {
@@ -51,6 +53,8 @@ typedef struct {
     quic_recv_cb recv_cb;       /* Application receive callback */
     const char *qlog;                 /* Qlog file path */
     void *user_data;            /* User pointer passed to recv_cb */
+    int rtp_encap;              /* 1 = wrap every UDP datagram in a 12 B RTP header
+                                   (QUIC-in-RTP experiment); both ends must match */
 } quic_server_config_t;
 
 /**

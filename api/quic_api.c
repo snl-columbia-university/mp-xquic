@@ -99,6 +99,11 @@ struct quic_endpoint {
     xqc_conn_ssl_config_t ep_ssl_config;
 
     int datagram_mode;
+
+    /* QUIC-in-RTP: per-path RTP sequence numbers and counters */
+    int rtp_encap;
+    uint16_t rtp_seq[MAX_PATHS];
+    uint64_t rtp_tx, rtp_rx, rtp_rx_plain;
 };
 
 void quic_endpoint_step(quic_endpoint_t *ep) {
@@ -175,13 +180,49 @@ static void qlog_event_write(qlog_event_importance_t imp, const void *buf,
     }
 }
 
+// QUIC-in-RTP. Every UDP datagram gets an RFC 3550 header in front:
+// V=2, no padding/extension/CSRC, M=0, PT=96 (dynamic), a sequence number per
+// path, a 90 kHz timestamp, SSRC per path. The receiver tells RTP (first byte
+// 128-191) from bare QUIC (64-127 / 192-255, RFC 9443) and strips the header.
+#define RTP_HDR_LEN 12
+#define RTP_PT 96
+#define RTP_SSRC_BASE 0x51554900u   /* "QUI" + path index */
+
+static ssize_t udp_send(quic_endpoint_t *ep, int fd, unsigned path_idx,
+                        const unsigned char *buf, size_t size,
+                        const struct sockaddr *peer, socklen_t peer_len) {
+    if (!ep->rtp_encap) return sendto(fd, buf, size, 0, peer, peer_len);
+
+    unsigned char out[2048];
+    if (size + RTP_HDR_LEN > sizeof(out)) return -1;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint32_t rtp_ts = (uint32_t)((uint64_t)ts.tv_sec * 90000u + (uint64_t)ts.tv_nsec / 11111u);
+    uint16_t seq = ep->rtp_seq[path_idx % MAX_PATHS]++;
+    uint32_t ssrc = RTP_SSRC_BASE | (path_idx & 0xff);
+
+    out[0] = 0x80;                       /* V=2 */
+    out[1] = RTP_PT;                     /* M=0, PT */
+    out[2] = seq >> 8;        out[3] = seq & 0xff;
+    out[4] = rtp_ts >> 24;    out[5] = (rtp_ts >> 16) & 0xff;
+    out[6] = (rtp_ts >> 8) & 0xff;       out[7] = rtp_ts & 0xff;
+    out[8] = ssrc >> 24;      out[9] = (ssrc >> 16) & 0xff;
+    out[10] = (ssrc >> 8) & 0xff;        out[11] = ssrc & 0xff;
+    memcpy(out + RTP_HDR_LEN, buf, size);
+
+    ssize_t n = sendto(fd, out, size + RTP_HDR_LEN, 0, peer, peer_len);
+    if (n < 0) return n;
+    ep->rtp_tx++;
+    return n >= RTP_HDR_LEN ? n - RTP_HDR_LEN : 0;   /* xquic expects its own byte count */
+}
+
 // QUIC socket callbacks
 static ssize_t write_socket(const unsigned char *buf, size_t size,
                             const struct sockaddr *peer_addr, socklen_t peer_addrlen,
                             void *user_data) {
     quic_endpoint_t *ep = (quic_endpoint_t *)user_data;
     if (!ep || ep->num_sockets == 0) return -1;
-    return sendto(ep->sockets[0].fd, buf, size, 0, peer_addr, peer_addrlen);
+    return udp_send(ep, ep->sockets[0].fd, 0, buf, size, peer_addr, peer_addrlen);
 }
 static ssize_t write_socket_ex(uint64_t path_id, const unsigned char *buf, size_t size,
                                const struct sockaddr *_peer_addr, socklen_t _peer_addrlen,
@@ -214,7 +255,7 @@ static ssize_t write_socket_ex(uint64_t path_id, const unsigned char *buf, size_
               inet_ntop(AF_INET, &((struct sockaddr_in *)&eng_src)->sin_addr, eng_src_ip, sizeof(eng_src_ip)),
               inet_ntop(AF_INET, &((struct sockaddr_in *)&eng_dst)->sin_addr, eng_dst_ip, sizeof(eng_dst_ip)));
 
-    return sendto(sock->fd, buf, size, 0, _peer_addr, _peer_addrlen);
+    return udp_send(ep, sock->fd, (unsigned)path_id, buf, size, _peer_addr, _peer_addrlen);
 }
 
 // QUIC certificate callback
@@ -436,7 +477,18 @@ static void packet_read_cb(int fd, short what, void *arg) {
                              (struct sockaddr*)&peer_addr, &peer_len);
         if (n <= 0) break;
 
-        xqc_engine_packet_process(ep->engine, buf, n,
+        unsigned char *pkt = buf;
+        if (ep->rtp_encap) {
+            if (n >= RTP_HDR_LEN && (buf[0] & 0xC0) == 0x80) {   /* RTP v2 */
+                pkt = buf + RTP_HDR_LEN;
+                n -= RTP_HDR_LEN;
+                ep->rtp_rx++;
+            } else {
+                ep->rtp_rx_plain++;                             /* bare QUIC */
+            }
+        }
+
+        xqc_engine_packet_process(ep->engine, pkt, n,
                                   (struct sockaddr*)&sock->local_addr, local_len,
                                   (struct sockaddr*)&peer_addr, peer_len,
                                   get_timestamp(), ep);
@@ -451,6 +503,7 @@ quic_endpoint_t *quic_client_start(const quic_client_config_t *config) {
     if (!ep) return NULL;
 
     ep->mode = QUIC_MODE_CLIENT;
+    ep->rtp_encap = config->rtp_encap;
     if (config->qlog && config->qlog[0] != '\0') {
         ep->qlog_file = fopen(config->qlog, "wb");
     } else {
@@ -606,6 +659,7 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
     if (!ep) return NULL;
 
     ep->mode = QUIC_MODE_SERVER;
+    ep->rtp_encap = config->rtp_encap;
     if (config->qlog && config->qlog[0] != '\0') {
         ep->qlog_file = fopen(config->qlog, "wb");
     } else {
@@ -766,6 +820,13 @@ int quic_send(quic_endpoint_t *ep, const uint8_t *data, size_t len) {
 
 void quic_endpoint_stop(quic_endpoint_t *ep) {
     if (!ep) return;
+
+    if (ep->rtp_encap) {
+        printf("[rtp] %s: sent %lu RTP datagrams, received %lu RTP + %lu bare QUIC\n",
+               ep->mode == QUIC_MODE_CLIENT ? "client" : "server", (unsigned long)ep->rtp_tx,
+               (unsigned long)ep->rtp_rx, (unsigned long)ep->rtp_rx_plain);
+        fflush(stdout);
+    }
 
     if (ep->engine && ep->conn) {
         xqc_conn_close(ep->engine, &ep->cid);

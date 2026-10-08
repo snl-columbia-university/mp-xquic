@@ -68,14 +68,15 @@ int main(int argc, char *argv[]) {
     
     static struct option opts[] = {
         {"local-ips", 1, 0, 'l'}, {"scheduler", 1, 0, 's'}, 
-        {"congestion", 1, 0, 'c'}, {"qlog", 1, 0, 'q'}, {0, 0, 0, 0}
+        {"congestion", 1, 0, 'c'}, {"qlog", 1, 0, 'q'}, {"rtp", 0, 0, 'R'}, {0, 0, 0, 0}
     };
 
-    int opt;
-    while ((opt = getopt_long(argc, argv, "l:s:c:q:h", opts, NULL)) != -1) {
+    int opt, rtp = 0;
+    while ((opt = getopt_long(argc, argv, "l:s:c:q:Rh", opts, NULL)) != -1) {
         switch (opt) {
             case 'l': strcpy(local_buf, optarg); break; case 's': scheduler = optarg; break;
             case 'c': congestion = optarg; break; case 'q': qlog = optarg; break;
+            case 'R': rtp = 1; break;
             default: return EXIT_FAILURE;
         }
     }
@@ -84,7 +85,8 @@ int main(int argc, char *argv[]) {
     quic_server_config_t config = {
         .listen_port = 8000, .num_local_addrs = parse_ips(local_buf, local_ips),
         .enable_datagram = 1, .enable_redundancy = 1, .scheduler = scheduler,
-        .congestion = congestion, .qlog = qlog, .recv_cb = on_server_recv
+        .congestion = congestion, .qlog = qlog, .recv_cb = on_server_recv,
+        .rtp_encap = rtp
     };
     for (int i = 0; i < config.num_local_addrs; i++) {
         config.local_ips[i] = local_ips[i];
