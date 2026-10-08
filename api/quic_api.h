@@ -37,6 +37,10 @@ typedef struct {
     int rtp_pdu_set;            /* with rtp_encap: add a dummy 3GPP PDU Set marking RTP
                                    header extension (TS 26.522): 0 = off, 1 = E/D/PSI/
                                    PSSN/PSN, 2 = also PSSize and NPDS */
+    int rtp_tag;                /* with rtp_encap: RTP header extension element ID 2 carries
+                                   the first 4 B of the app payload + a packet counter;
+                                   the receiver checks it against the decrypted datagram and
+                                   writes rtp_check_<client|server>.csv */
 } quic_client_config_t;
 
 typedef struct {
@@ -61,6 +65,10 @@ typedef struct {
     int rtp_pdu_set;            /* with rtp_encap: add a dummy 3GPP PDU Set marking RTP
                                    header extension (TS 26.522): 0 = off, 1 = E/D/PSI/
                                    PSSN/PSN, 2 = also PSSize and NPDS */
+    int rtp_tag;                /* with rtp_encap: RTP header extension element ID 2 carries
+                                   the first 4 B of the app payload + a packet counter;
+                                   the receiver checks it against the decrypted datagram and
+                                   writes rtp_check_<client|server>.csv */
 } quic_server_config_t;
 
 /**

@@ -106,6 +106,15 @@ struct quic_endpoint {
     uint16_t rtp_seq[MAX_PATHS];
     uint16_t rtp_pssn[MAX_PATHS];          /* 10-bit PDU Set sequence number */
     uint64_t rtp_tx, rtp_rx, rtp_rx_plain, rtp_rx_pduset;
+
+    /* end-to-end tag check (rtp_tag) */
+    int rtp_tag;
+    int32_t tx_tag; int tx_tag_valid;      /* set while quic_send() runs */
+    uint32_t tx_pkt_ctr;
+    int rx_has_elem, rx_tag_valid;         /* element of the UDP packet being processed */
+    uint32_t rx_ssrc, rx_pkt_ctr; uint16_t rx_seq; int32_t rx_tag;
+    FILE *rtp_check;
+    uint64_t chk_match, chk_mismatch, chk_untagged, chk_noelem;
 };
 
 void quic_endpoint_step(quic_endpoint_t *ep) {
@@ -202,8 +211,10 @@ static ssize_t udp_send(quic_endpoint_t *ep, int fd, unsigned path_idx,
        Dummy marking: every RTP packet is its own PDU Set (E=1, PSN=0, NPDS=1),
        PSI=0 (importance unknown), D=0, PSSN counts packets per path. */
     size_t ext_data = ep->rtp_pdu_set == 0 ? 0 : (ep->rtp_pdu_set == 1 ? 3 : 8);
-    size_t ext_words = ext_data ? (1 + ext_data + 3) / 4 : 0;
-    size_t hdr = RTP_HDR_LEN + (ext_data ? 4 + 4 * ext_words : 0);
+    size_t tag_data = ep->rtp_tag ? 9 : 0;           /* element ID 2 */
+    size_t ext_bytes = (ext_data ? 1 + ext_data : 0) + (tag_data ? 1 + tag_data : 0);
+    size_t ext_words = (ext_bytes + 3) / 4;
+    size_t hdr = RTP_HDR_LEN + (ext_bytes ? 4 + 4 * ext_words : 0);
     if (size + hdr > sizeof(out)) return -1;
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -211,19 +222,21 @@ static ssize_t udp_send(quic_endpoint_t *ep, int fd, unsigned path_idx,
     uint16_t seq = ep->rtp_seq[path_idx % MAX_PATHS]++;
     uint32_t ssrc = RTP_SSRC_BASE | (path_idx & 0xff);
 
-    out[0] = ext_data ? 0x90 : 0x80;     /* V=2, X=1 when the extension is present */
+    out[0] = ext_bytes ? 0x90 : 0x80;    /* V=2, X=1 when the extension is present */
     out[1] = RTP_PT;                     /* M=0, PT */
     out[2] = seq >> 8;        out[3] = seq & 0xff;
     out[4] = rtp_ts >> 24;    out[5] = (rtp_ts >> 16) & 0xff;
     out[6] = (rtp_ts >> 8) & 0xff;       out[7] = rtp_ts & 0xff;
     out[8] = ssrc >> 24;      out[9] = (ssrc >> 16) & 0xff;
     out[10] = (ssrc >> 8) & 0xff;        out[11] = ssrc & 0xff;
-    if (ext_data) {
+    unsigned char *e = out + RTP_HDR_LEN + 4;           /* next free element byte */
+    if (ext_bytes) {
         unsigned char *x = out + RTP_HDR_LEN;
         memset(x, 0, 4 + 4 * ext_words);
         x[0] = 0xBE; x[1] = 0xDE;
         x[2] = ext_words >> 8; x[3] = ext_words & 0xff;
-        unsigned char *e = x + 4;
+    }
+    if (ext_data) {
         e[0] = (1 << 4) | (unsigned char)(ext_data - 1);        /* ID=1, len-1 */
         uint16_t pssn = ep->rtp_pssn[path_idx % MAX_PATHS]++ & 0x3FF;
         uint8_t psi = 0, psn = 0;
@@ -235,6 +248,15 @@ static ssize_t udp_send(quic_endpoint_t *ep, int fd, unsigned path_idx,
             e[4] = (pssize >> 16) & 0xff; e[5] = (pssize >> 8) & 0xff; e[6] = pssize & 0xff;
             e[7] = 0; e[8] = 1;                                  /* NPDS = 1 */
         }
+        e += 1 + ext_data;
+    }
+    if (tag_data) {                                      /* ID=2: ctr | flags | tag */
+        uint32_t ctr = ++ep->tx_pkt_ctr;
+        uint32_t tag = (uint32_t)ep->tx_tag;
+        e[0] = (2 << 4) | (unsigned char)(tag_data - 1);
+        e[1] = ctr >> 24; e[2] = (ctr >> 16) & 0xff; e[3] = (ctr >> 8) & 0xff; e[4] = ctr & 0xff;
+        e[5] = ep->tx_tag_valid ? 1 : 0;
+        e[6] = tag >> 24; e[7] = (tag >> 16) & 0xff; e[8] = (tag >> 8) & 0xff; e[9] = tag & 0xff;
     }
     memcpy(out + hdr, buf, size);
 
@@ -454,6 +476,22 @@ static void datagram_read_notify(xqc_connection_t *conn, void *user_data, const 
     memcpy(&net_val, data, sizeof(uint64_t));
     uint64_t remote_dgram_id = be64toh(net_val);
 
+    if (ep->rtp_tag && ep->rtp_check) {
+        int32_t app_tag = 0;
+        if (data_len >= 12) memcpy(&app_tag, (const uint8_t *)data + 8, sizeof(app_tag));
+        int dup = remote_dgram_id <= ep->max_dgram_id &&
+                  ep->max_dgram_id - remote_dgram_id < 64 &&
+                  (ep->dgram_id_mask & (1ULL << (ep->max_dgram_id - remote_dgram_id)));
+        const char *res;
+        if (!ep->rx_has_elem)            { res = "no_elem";  ep->chk_noelem++; }
+        else if (!ep->rx_tag_valid)      { res = "untagged"; ep->chk_untagged++; }
+        else if (ep->rx_tag == app_tag)  { res = "match";    ep->chk_match++; }
+        else                             { res = "MISMATCH"; ep->chk_mismatch++; }
+        fprintf(ep->rtp_check, "%08x,%u,%u,%d,%d,%lu,%d,%s,%d\n", ep->rx_ssrc, ep->rx_seq,
+                ep->rx_pkt_ctr, ep->rx_tag_valid ? ep->rx_tag : 0, ep->rx_tag_valid,
+                (unsigned long)remote_dgram_id, app_tag, res, dup);
+    }
+
     if (!is_new_datagram(remote_dgram_id, &ep->max_dgram_id, &ep->dgram_id_mask)) {
         LOG_WARN("[quic] duplicate datagram %ld (<=%ld) recv\n", remote_dgram_id, ep->max_dgram_id);
         return;
@@ -509,9 +547,28 @@ static void packet_read_cb(int fd, short what, void *arg) {
         if (ep->rtp_encap) {
             if (n >= RTP_HDR_LEN && (buf[0] & 0xC0) == 0x80) {   /* RTP v2 */
                 ssize_t h = RTP_HDR_LEN + 4 * (buf[0] & 0x0F);  /* + CSRCs */
+                ep->rx_has_elem = 0;
+                ep->rx_ssrc = ((uint32_t)buf[8] << 24) | (buf[9] << 16) | (buf[10] << 8) | buf[11];
+                ep->rx_seq = (buf[2] << 8) | buf[3];
                 if ((buf[0] & 0x10) && n >= h + 4) {            /* X: extension block */
-                    if (buf[h] == 0xBE && buf[h + 1] == 0xDE) ep->rtp_rx_pduset++;
-                    h += 4 + 4 * ((buf[h + 2] << 8) | buf[h + 3]);
+                    ssize_t end = h + 4 + 4 * ((buf[h + 2] << 8) | buf[h + 3]);
+                    if (buf[h] == 0xBE && buf[h + 1] == 0xDE && end <= n) {
+                        ep->rtp_rx_pduset++;
+                        for (ssize_t i = h + 4; i < end; ) {     /* RFC 8285 one-byte elements */
+                            int id = buf[i] >> 4, len = (buf[i] & 0x0F) + 1;
+                            if (id == 0) { i++; continue; }      /* padding */
+                            if (id == 15 || i + 1 + len > end) break;
+                            if (id == 2 && len == 9) {
+                                const unsigned char *d = buf + i + 1;
+                                ep->rx_has_elem = 1;
+                                ep->rx_pkt_ctr = ((uint32_t)d[0] << 24) | (d[1] << 16) | (d[2] << 8) | d[3];
+                                ep->rx_tag_valid = d[4] & 1;
+                                ep->rx_tag = (int32_t)(((uint32_t)d[5] << 24) | (d[6] << 16) | (d[7] << 8) | d[8]);
+                            }
+                            i += 1 + len;
+                        }
+                    }
+                    h = end;
                 }
                 if (h > n) continue;                            /* malformed: drop */
                 pkt = buf + h;
@@ -537,7 +594,14 @@ quic_endpoint_t *quic_client_start(const quic_client_config_t *config) {
     if (!ep) return NULL;
 
     ep->mode = QUIC_MODE_CLIENT;
-    ep->rtp_encap = config->rtp_encap || config->rtp_pdu_set;
+    ep->rtp_tag = config->rtp_tag;
+    if (ep->rtp_tag) {
+        ep->rtp_check = fopen("rtp_check_client.csv", "w");
+        if (ep->rtp_check) setvbuf(ep->rtp_check, NULL, _IOLBF, 0);   /* server is killed, not stopped */
+        if (ep->rtp_check) fprintf(ep->rtp_check,
+            "rtp_ssrc,rtp_seq,rtp_pkt_ctr,he_tag,he_tag_valid,dgram_id,quic_app_tag,result,dup\n");
+    }
+    ep->rtp_encap = config->rtp_encap || config->rtp_pdu_set || config->rtp_tag;
     ep->rtp_pdu_set = config->rtp_pdu_set;
     if (config->qlog && config->qlog[0] != '\0') {
         ep->qlog_file = fopen(config->qlog, "wb");
@@ -694,7 +758,14 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
     if (!ep) return NULL;
 
     ep->mode = QUIC_MODE_SERVER;
-    ep->rtp_encap = config->rtp_encap || config->rtp_pdu_set;
+    ep->rtp_tag = config->rtp_tag;
+    if (ep->rtp_tag) {
+        ep->rtp_check = fopen("rtp_check_server.csv", "w");
+        if (ep->rtp_check) setvbuf(ep->rtp_check, NULL, _IOLBF, 0);   /* server is killed, not stopped */
+        if (ep->rtp_check) fprintf(ep->rtp_check,
+            "rtp_ssrc,rtp_seq,rtp_pkt_ctr,he_tag,he_tag_valid,dgram_id,quic_app_tag,result,dup\n");
+    }
+    ep->rtp_encap = config->rtp_encap || config->rtp_pdu_set || config->rtp_tag;
     ep->rtp_pdu_set = config->rtp_pdu_set;
     if (config->qlog && config->qlog[0] != '\0') {
         ep->qlog_file = fopen(config->qlog, "wb");
@@ -842,6 +913,10 @@ int quic_send(quic_endpoint_t *ep, const uint8_t *data, size_t len) {
         memcpy(buf, &net_val, sizeof(uint64_t));
         memcpy(buf + 8, data, len);
 
+        if (ep->rtp_tag) {               /* tag = first 4 B of the app payload */
+            ep->tx_tag_valid = len >= 4;
+            if (ep->tx_tag_valid) memcpy(&ep->tx_tag, data, sizeof(ep->tx_tag));
+        }
         ret = xqc_datagram_send(ep->conn, buf, len + 8, &ep->quic_dgram_id, 1);
     } else if (ep->stream) {
         ret =  (int)xqc_stream_send(ep->stream, (unsigned char *)data, len, 0);
@@ -850,6 +925,7 @@ int quic_send(quic_endpoint_t *ep, const uint8_t *data, size_t len) {
     if (ret >= 0 && ep->engine) {
         xqc_engine_main_logic(ep->engine);
     }
+    ep->tx_tag_valid = 0;                /* packets written later are untagged */
 
     return ret;
 }
@@ -864,6 +940,15 @@ void quic_endpoint_stop(quic_endpoint_t *ep) {
                ep->rtp_pdu_set, (unsigned long)ep->rtp_rx, (unsigned long)ep->rtp_rx_pduset,
                (unsigned long)ep->rtp_rx_plain);
         fflush(stdout);
+    }
+    if (ep->rtp_tag) {
+        printf("[rtp-check] %s: datagrams %lu  match %lu  MISMATCH %lu  untagged %lu  no_elem %lu\n",
+               ep->mode == QUIC_MODE_CLIENT ? "client" : "server",
+               (unsigned long)(ep->chk_match + ep->chk_mismatch + ep->chk_untagged + ep->chk_noelem),
+               (unsigned long)ep->chk_match, (unsigned long)ep->chk_mismatch,
+               (unsigned long)ep->chk_untagged, (unsigned long)ep->chk_noelem);
+        fflush(stdout);
+        if (ep->rtp_check) { fflush(ep->rtp_check); fclose(ep->rtp_check); ep->rtp_check = NULL; }
     }
 
     if (ep->engine && ep->conn) {

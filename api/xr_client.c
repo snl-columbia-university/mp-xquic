@@ -41,6 +41,7 @@ static int g_send_refused = 0;
    would. */
 static int g_drop_on_unacked = 0;
 static int g_rtp = 0;                   /* --rtp: QUIC-in-RTP encapsulation */
+static int g_rtp_tag = 0;               /* --rtp-tag: end-to-end RTP/QUIC tag check */
 static int g_pdu_set = 0;               /* --pdu-set 1|2: dummy PDU Set marking ext (implies -R) */
 static int g_max_inflight    = 1;       /* --inflight: frames allowed outstanding */
 static double g_ack_timeout_ms = 200.0; /* --ack-timeout-ms: write a frame off after this */
@@ -171,11 +172,11 @@ int main(int argc, char *argv[]) {
         {"peer-ips", 1, 0, 'r'}, {"scheduler", 1, 0, 's'}, {"congestion", 1, 0, 'c'},
         {"out", 1, 0, 'o'}, {"qlog", 1, 0, 'q'}, {"quiet", 0, 0, 'Q'}, {"frames-out", 1, 0, 'F'},
         {"drop-on-unacked", 0, 0, 'D'}, {"inflight", 1, 0, 'w'}, {"ack-timeout-ms", 1, 0, 'T'},
-        {"rtp", 0, 0, 'R'}, {"pdu-set", 1, 0, 'P'}, {0, 0, 0, 0}
+        {"rtp", 0, 0, 'R'}, {"pdu-set", 1, 0, 'P'}, {"rtp-tag", 0, 0, 'G'}, {0, 0, 0, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "t:i:p:l:r:s:c:o:q:QDw:T:F:RP:h", opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "t:i:p:l:r:s:c:o:q:QDw:T:F:RP:Gh", opts, NULL)) != -1) {
         switch (opt) {
             case 't': trace_file = optarg; break; case 'i': target_peer = optarg; break;
             case 'p': peer_port = atoi(optarg); break; case 'l': strcpy(local_buf, optarg); break;
@@ -189,6 +190,7 @@ int main(int argc, char *argv[]) {
             case 'F': g_frames_out = optarg; break;
             case 'R': g_rtp = 1; break;
             case 'P': g_pdu_set = atoi(optarg); break;
+            case 'G': g_rtp_tag = 1; break;
             default: return EXIT_FAILURE;
         }
     }
@@ -200,7 +202,7 @@ int main(int argc, char *argv[]) {
         .num_local_addrs = parse_ips(local_buf, local_ips), .num_peer_addrs = parse_ips(peer_buf, peer_ips),
         .peer_port = peer_port, .enable_datagram = 1, .enable_redundancy = 1, .scheduler = scheduler,
         .congestion = congestion, .qlog = qlog, .recv_cb = on_client_recv,
-        .rtp_encap = g_rtp, .rtp_pdu_set = g_pdu_set
+        .rtp_encap = g_rtp, .rtp_pdu_set = g_pdu_set, .rtp_tag = g_rtp_tag
     };
     for (int i = 0; i < config.num_local_addrs; i++) {
         config.local_ips[i] = local_ips[i];
