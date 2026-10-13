@@ -6,8 +6,8 @@
 #include <time.h>
 #include "quic_api.h"
 
-#define MAX_HITS 4096
 #define MAX_IPS  16
+#define ACK_LOOKBACK 65536   /* records searched per ack, newest first */
 
 // --- Network Packet Structures ---
 
@@ -32,18 +32,51 @@ typedef struct {
     double recv_time_ms;
     double rtt_ms;
     int ack_received;
+    int refused;          // quic_send() rejected this datagram; it never left the host
 } hit_record_t;
 
-static hit_record_t g_records[MAX_HITS];
+static hit_record_t *g_records = NULL;
+static int g_max_hits = 1024;
 static int g_record_count = 0;
 static int g_remote_ack_count = 0;
 static int g_my_client_id = 1;
 static FILE *g_rtt_log_file = NULL;
 
+// --- Cloud-Gaming Replay Options ---
+
+// -Q: suppress per-packet send/ack logging at cloud-gaming packet rates
+static int g_quiet = 0;
+static const char *g_frames_out = NULL;   // -F: per-frame summary CSV
+static int g_send_refused = 0;
+
+// -D: frame-level backpressure. Datagrams have no delivery guarantee and
+// xquic refuses them (-XQC_EAGAIN) when its send queue is full, so without
+// this the sender fires into a void. Skip a frame outright if too many
+// earlier frames are still unacknowledged, the way a real-time encoder would.
+static int g_drop_on_unacked = 0;
+static int g_max_inflight    = 1;       // -w: frames allowed outstanding
+static double g_ack_timeout_ms = 200.0; // -T: write a frame off after this
+static int g_prev_frame_idx  = -1;      // index in g_records of the last sent frame
+static int g_cur_frame_id    = -1;      // frame currently being emitted
+static int g_skip_frame_id   = -2;      // frame being skipped (-2 = none)
+static int g_frames_sent     = 0;
+static int g_frames_skipped  = 0;
+
 static double get_time_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (ts.tv_sec * 1000.0) + (ts.tv_nsec / 1000000.0);
+}
+
+// Frames sent, still unacked, and not yet past the timeout. Only the most
+// recent 64 records can matter, so the scan is bounded.
+static int xr_frames_inflight(double now_ms) {
+    int n = 0, lo = g_record_count - 64;
+    if (lo < 0) lo = 0;
+    for (int i = g_record_count - 1; i >= lo; i--) {
+        if (!g_records[i].ack_received && (now_ms - g_records[i].send_time_ms) < g_ack_timeout_ms) n++;
+    }
+    return n;
 }
 
 // --- IP Parser Helper ---
@@ -85,15 +118,20 @@ static void on_client_recv(const uint8_t *data, size_t len, void *user_data) {
         const hit_ack_t *ack = (const hit_ack_t *)data;
 
         if (ack->client_id == g_my_client_id) {
-            for (int i = 0; i < g_record_count; i++) {
-                if (g_records[i].hit_id == ack->hit_id && !g_records[i].ack_received) {
+            if (ack->hit_id < 0) return;   // fragment, not a tracked frame
+            int lo = g_record_count - ACK_LOOKBACK;
+            if (lo < 0) lo = 0;
+            for (int i = g_record_count - 1; i >= lo; i--) {
+                if (g_records[i].hit_id == ack->hit_id && !g_records[i].ack_received && !g_records[i].refused) {
                     g_records[i].recv_time_ms = recv_time;
                     g_records[i].rtt_ms = recv_time - g_records[i].send_time_ms;
                     g_records[i].ack_received = 1;
 
-                    printf(">>> [LOCAL ACK RECV] hitId=%d | Measured RTT: %.2f ms\n", 
-                           ack->hit_id, g_records[i].rtt_ms);
-                    fflush(stdout);
+                    if (!g_quiet) {
+                        printf(">>> [LOCAL ACK RECV] hitId=%d | Measured RTT: %.2f ms\n",
+                               ack->hit_id, g_records[i].rtt_ms);
+                        fflush(stdout);
+                    }
 
                     if (g_rtt_log_file) {
                         fprintf(g_rtt_log_file, "%d,1,%.2f,%.2f,%.2f\n",
@@ -101,7 +139,7 @@ static void on_client_recv(const uint8_t *data, size_t len, void *user_data) {
                                 g_records[i].send_time_ms,
                                 g_records[i].recv_time_ms,
                                 g_records[i].rtt_ms);
-                        fflush(g_rtt_log_file);
+                        if (!g_quiet) fflush(g_rtt_log_file);
                     }
                     return;
                 }
@@ -122,6 +160,35 @@ static void on_client_recv(const uint8_t *data, size_t len, void *user_data) {
     }
 }
 
+// --- Per-Frame Summary (-F) ---
+
+// One row per frame: fragments sharing a hit_id are consecutive records.
+static void write_frames(const char *path) {
+    FILE *o = fopen(path, "w");
+    if (!o) return;
+    fprintf(o, "frame_id,first_send_ms,n_frags,n_refused,n_acked,first_ack_ms,last_ack_ms,complete_ms\n");
+    for (int i = 0; i < g_record_count; ) {
+        int j = i, refused = 0, acked = 0;
+        double first_ack = 0, last_ack = 0;
+        while (j < g_record_count && g_records[j].hit_id == g_records[i].hit_id) {
+            if (g_records[j].refused) refused++;
+            if (g_records[j].ack_received) {
+                double r = g_records[j].recv_time_ms;
+                if (!acked || r < first_ack) first_ack = r;
+                if (!acked || r > last_ack) last_ack = r;
+                acked++;
+            }
+            j++;
+        }
+        int n = j - i;
+        fprintf(o, "%d,%.3f,%d,%d,%d,", g_records[i].hit_id, g_records[i].send_time_ms, n, refused, acked);
+        if (acked) fprintf(o, "%.3f,%.3f,", first_ack, last_ack); else fprintf(o, ",,");
+        if (acked == n) fprintf(o, "%.3f\n", last_ack - g_records[i].send_time_ms); else fprintf(o, "\n");
+        i = j;
+    }
+    fclose(o);
+}
+
 // --- Summary Helper ---
 
 static int compare_doubles(const void *a, const void *b) {
@@ -133,7 +200,7 @@ static int compare_doubles(const void *a, const void *b) {
 }
 
 static void print_rtt_summary(void) {
-    double rtts[MAX_HITS];
+    double *rtts = malloc((g_record_count > 0 ? g_record_count : 1) * sizeof(double));
     int count = 0;
     int lost = 0;
 
@@ -162,6 +229,7 @@ static void print_rtt_summary(void) {
     }
     printf("=========================================\n");
     fflush(stdout);
+    free(rtts);
 }
 
 void print_usage(const char *prog_name) {
@@ -174,6 +242,12 @@ void print_usage(const char *prog_name) {
     printf("  -s, --scheduler ALG    Scheduler algorithm (default: pmp)\n");
     printf("  -c, --congestion ALG   Congestion algorithm (default: cubic)\n");
     printf("  -o, --out FILE         Output log (default: rtt_results.csv)\n");
+    printf("  -q, --qlog FILE        qlog output (default: client.qlog)\n");
+    printf("  -Q, --quiet            No per-packet send/ack logging\n");
+    printf("  -F, --frames-out FILE  Per-frame summary CSV, written at exit\n");
+    printf("  -D, --drop-on-unacked  Closed loop: skip a frame while -w frames are unacked\n");
+    printf("  -w, --inflight N       Frames allowed outstanding with -D (default: 1)\n");
+    printf("  -T, --ack-timeout-ms M With -D, write a frame off after M ms (default: 200)\n");
     printf("  -h, --help             Show this help message\n");
 }
 
@@ -198,12 +272,17 @@ int main(int argc, char *argv[]) {
         {"congestion", required_argument, 0, 'c'},
         {"qlog",       required_argument, 0, 'q'},
         {"out",        required_argument, 0, 'o'},
+        {"quiet",      no_argument,       0, 'Q'},
+        {"frames-out", required_argument, 0, 'F'},
+        {"drop-on-unacked", no_argument,  0, 'D'},
+        {"inflight",   required_argument, 0, 'w'},
+        {"ack-timeout-ms", required_argument, 0, 'T'},
         {"help",       no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
     int opt, option_index = 0;
-    while ((opt = getopt_long(argc, argv, "t:i:p:l:r:s:c:o:q:h", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "t:i:p:l:r:s:c:o:q:QF:Dw:T:h", long_options, &option_index)) != -1) {
         switch (opt) {
             case 't': trace_file    = optarg; break;
             case 'i': target_peer   = optarg; break;
@@ -214,6 +293,11 @@ int main(int argc, char *argv[]) {
             case 'c': congestion    = optarg; break;
             case 'o': out_log_file  = optarg; break;
             case 'q': out_qlog_file = optarg; break;
+            case 'Q': g_quiet = 1; break;
+            case 'F': g_frames_out = optarg; break;
+            case 'D': g_drop_on_unacked = 1; break;
+            case 'w': g_max_inflight = atoi(optarg); if (g_max_inflight < 1) g_max_inflight = 1; break;
+            case 'T': g_ack_timeout_ms = atof(optarg); break;
             case 'h': print_usage(argv[0]); return EXIT_SUCCESS;
             default:  print_usage(argv[0]); return EXIT_FAILURE;
         }
@@ -301,6 +385,12 @@ int main(int argc, char *argv[]) {
     printf("Replaying trace '%s' for peer '%s'...\n", trace_file, target_peer);
     fflush(stdout);
 
+    g_records = malloc(g_max_hits * sizeof(hit_record_t));
+    if (!g_records) {
+        fprintf(stderr, "Out of memory\n");
+        return EXIT_FAILURE;
+    }
+
     char line[2048];
     int parsed_lines = 0;
     int matched_lines = 0;
@@ -362,25 +452,64 @@ int main(int argc, char *argv[]) {
             usleep(100); 
         }
 
-        hit_request_t req = {
-            .hit_id = hit_id,
-            .client_id = g_my_client_id,
-            .client_prep_ms = client_prep_ms,
-            .server_proc_ms = server_proc_ms
-        };
+        // Frame boundary: every fragment carries the frame id, so a change of
+        // hit_id starts a new frame. Decide once per frame whether to send it.
+        // This must sit AFTER the pacing wait -- a dropped frame still occupies
+        // its slot in the timeline, otherwise the loop races through the trace.
+        if (g_drop_on_unacked && hit_id != g_cur_frame_id) {
+            g_cur_frame_id = hit_id;
+            if (xr_frames_inflight(get_time_ms()) >= g_max_inflight) {
+                g_skip_frame_id = hit_id;      // window full -- drop this frame
+                g_frames_skipped++;
+            } else {
+                g_skip_frame_id = -2;
+                g_frames_sent++;
+            }
+        }
+        if (g_drop_on_unacked && hit_id == g_skip_frame_id) continue;   // every fragment
 
-        if (g_record_count < MAX_HITS) {
-            g_records[g_record_count].hit_id = hit_id;
-            g_records[g_record_count].send_time_ms = get_time_ms();
-            g_records[g_record_count].ack_received = 0;
-            g_record_count++;
+        // col 10 is size_bytes in cloud-gaming traces; the XR trace has a JSON
+        // payload there, which atoi() reads as 0 -> falls back to sizeof().
+        int size_bytes = (col_count > 10) ? atoi(cols[10]) : 0;
+        uint8_t sendbuf[1500];
+        memset(sendbuf, 0, sizeof(sendbuf));
+        hit_request_t *req = (hit_request_t *)sendbuf;
+        req->hit_id = hit_id;
+        req->client_id = g_my_client_id;
+        req->client_prep_ms = client_prep_ms;
+        req->server_proc_ms = server_proc_ms;
+        size_t send_len = (size_t)size_bytes;
+        if (send_len < sizeof(hit_request_t)) send_len = sizeof(hit_request_t);
+        if (send_len > sizeof(sendbuf))       send_len = sizeof(sendbuf);
+
+        // with -D, one record per frame (its first fragment), not per fragment
+        int is_frame_head = !g_drop_on_unacked || g_prev_frame_idx < 0
+                            || g_records[g_prev_frame_idx].hit_id != hit_id;
+        int rec_idx = -1;
+        if (hit_id >= 0 && is_frame_head) {
+            if (g_record_count >= g_max_hits) {
+                g_max_hits *= 2;
+                g_records = realloc(g_records, g_max_hits * sizeof(hit_record_t));
+                if (!g_records) {
+                    fprintf(stderr, "Out of memory\n");
+                    return EXIT_FAILURE;
+                }
+            }
+            g_prev_frame_idx = g_record_count;
+            rec_idx = g_record_count;
+            g_records[g_record_count++] = (hit_record_t){ .hit_id = hit_id, .send_time_ms = get_time_ms() };
         }
 
-        printf(">>> [CLIENT SEND] hitId=%d | rel_offset=%.2fms | prep=%.2fms | srv_proc=%.2fms\n",
-               hit_id, rel_offset_ms, client_prep_ms, server_proc_ms);
-        fflush(stdout);
+        if (!g_quiet) {
+            printf(">>> [CLIENT SEND] hitId=%d | rel_offset=%.2fms | prep=%.2fms | srv_proc=%.2fms | len=%zu\n",
+                   hit_id, rel_offset_ms, client_prep_ms, server_proc_ms, send_len);
+            fflush(stdout);
+        }
 
-        quic_send(client, (const uint8_t *)&req, sizeof(req));
+        if (quic_send(client, sendbuf, send_len) < 0) {
+            g_send_refused++;
+            if (rec_idx >= 0) g_records[rec_idx].refused = 1;
+        }
     }
 
     fclose(f);
@@ -398,8 +527,18 @@ int main(int argc, char *argv[]) {
         usleep(100);
     }
 
+    if (g_drop_on_unacked) {
+        printf("\n Frame flow control (inflight=%d, ack timeout=%.0fms): "
+               "%d sent, %d skipped = %.1f%% skipped\n", g_max_inflight, g_ack_timeout_ms,
+               g_frames_sent, g_frames_skipped,
+               (g_frames_sent + g_frames_skipped) ? 100.0 * g_frames_skipped / (g_frames_sent + g_frames_skipped) : 0.0);
+    }
     print_rtt_summary();
+    if (g_send_refused) printf("Refused by quic_send (never sent): %d\n", g_send_refused);
+    if (g_frames_out) write_frames(g_frames_out);
+    fflush(stdout);   // teardown can abort (xqc_conn_destroy double free); keep the summary
     if (g_rtt_log_file) fclose(g_rtt_log_file);
+    free(g_records);
 
     quic_endpoint_stop(client);
     fflush(stdout);
