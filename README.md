@@ -82,6 +82,38 @@ To run test cases, you need
 
 XQUIC can be built with BabaSSL(Tongsuo) or BoringSSL.
 
+### Build mp-xquic (Linux, BoringSSL submodule)
+
+BoringSSL is a git submodule at `./boringssl`. The upstream `third_party/boringssl` path does not apply here, so always pass `SSL_PATH`.
+Don't use `xqc_build.sh` on Linux: it only handles iOS, Android and HarmonyOS builds, and it overwrites the root `CMakeLists.txt`.
+
+```bash
+sudo apt-get install -y build-essential cmake libevent-dev
+
+# from the mp-xquic repo root
+git submodule update --init --recursive
+
+# 1. BoringSSL (static, PIC). Produces boringssl/build/libssl.a and libcrypto.a
+cmake -S boringssl -B boringssl/build -DBUILD_SHARED_LIBS=0 \
+      -DCMAKE_C_FLAGS="-fPIC" -DCMAKE_CXX_FLAGS="-fPIC"
+cmake --build boringssl/build -j1 --target ssl crypto
+
+# 2. mp-xquic: Release build, no tests
+#    The -Wno-error flags are needed with GCC >= 12 (the repo builds with -Werror)
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DXQC_ENABLE_TESTING=0 \
+      -DXQC_ENABLE_EVENT_LOG=1 -DXQC_ENABLE_BBR2=1 -DXQC_ENABLE_RENO=1 -DGCOV=off \
+      -DSSL_TYPE=boringssl -DSSL_PATH=$PWD/boringssl \
+      -DCMAKE_C_FLAGS="-Wno-error=dangling-pointer -Wno-error=array-bounds -Wno-error=stringop-overflow"
+cmake --build build -j1        # or: cmake --build build -j1 --target xr_client xr_server
+
+# 3. xr_server loads server.crt / server.key from its working directory
+(cd build && openssl req -newkey rsa:2048 -x509 -nodes -keyout server.key -out server.crt \
+    -subj "/CN=test.xquic.com" -days 365)
+```
+
+> **Use `-j1` on the small VMs (xrnet-vtr\*, 2 vCPU / 2 GB RAM).** A parallel `-j` build locks up the machine.
+> On a bigger machine you can use `-j$(nproc)`.
+
 ### Build with BoringSSL
 
 ```bash
