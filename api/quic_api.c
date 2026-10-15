@@ -598,7 +598,9 @@ quic_endpoint_t *quic_client_start(const quic_client_config_t *config) {
             .datagram_acked_notify = datagram_acked_notify,
         }
     };
-    xqc_engine_register_alpn(ep->engine, "raw", 3, &ap_cbs, ep);
+    // alp_ctx is owned (freed) by xquic in xqc_engine_destroy(); ep reaches the callbacks
+    // through the engine / connection user data instead, so pass no context here.
+    xqc_engine_register_alpn(ep->engine, "raw", 3, &ap_cbs, NULL);
 
     ep->quic_fd = socket(AF_INET, SOCK_DGRAM, 0);
     fcntl(ep->quic_fd, F_SETFL, O_NONBLOCK);
@@ -745,7 +747,9 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
             .datagram_acked_notify = datagram_acked_notify,
         }
     };
-    xqc_engine_register_alpn(ep->engine, "raw", 3, &ap_cbs, ep);
+    // alp_ctx is owned (freed) by xquic in xqc_engine_destroy(); ep reaches the callbacks
+    // through the engine / connection user data instead, so pass no context here.
+    xqc_engine_register_alpn(ep->engine, "raw", 3, &ap_cbs, NULL);
 
     ep->quic_fd = socket(AF_INET, SOCK_DGRAM, 0);
     fcntl(ep->quic_fd, F_SETFL, O_NONBLOCK);

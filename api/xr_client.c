@@ -536,11 +536,13 @@ int main(int argc, char *argv[]) {
     print_rtt_summary();
     if (g_send_refused) printf("Refused by quic_send (never sent): %d\n", g_send_refused);
     if (g_frames_out) write_frames(g_frames_out);
-    fflush(stdout);   // teardown can abort (xqc_conn_destroy double free); keep the summary
-    if (g_rtt_log_file) fclose(g_rtt_log_file);
-    free(g_records);
+    fflush(stdout);
 
+    // stop first: acks delivered during teardown still reach on_client_recv
     quic_endpoint_stop(client);
+    if (g_rtt_log_file) { fclose(g_rtt_log_file); g_rtt_log_file = NULL; }
+    free(g_records);
+    g_records = NULL;
     fflush(stdout);
     fflush(stderr);
     exit(EXIT_SUCCESS);
