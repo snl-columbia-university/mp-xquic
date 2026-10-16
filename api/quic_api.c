@@ -1,4 +1,5 @@
 #include "quic_api.h"
+#define DGRAM_WIN 16384   /* datagram ids remembered by the duplicate filter (multiple of 64) */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -80,7 +81,8 @@ struct quic_endpoint {
     uint64_t client_dgram_id;
     uint64_t server_dgram_id;
     uint64_t max_dgram_id;
-    uint64_t dgram_id_mask;
+    uint64_t dgram_id_mask;          // unused since the windowed filter, kept for layout
+    uint64_t dgram_seen[DGRAM_WIN / 64]; // ring bitmap of ids within DGRAM_WIN of max_dgram_id
 
     quic_recv_cb         app_recv_cb;
     void                *app_user_data;
@@ -127,6 +129,34 @@ static xqc_cong_ctrl_callback_t get_cong_ctrl_cb(const char *name) {
     if (strcmp(name, "bbrv2") == 0) return xqc_bbr2_cb;
     if (strcmp(name, "reno") == 0) return xqc_reno_cb;
     return xqc_cubic_cb;
+}
+
+// Duplicate filter for redundant (multipath) datagram copies: remembers the last DGRAM_WIN
+// ids. It used to be a single 64-bit mask -- ~20 ms at ~3200 datagrams/s -- so any cross-path
+// reordering larger than that dropped *first* copies as duplicates (minrtt path switches,
+// start-up while paths come up). Ids older than the window are still treated as duplicates.
+static int is_new_datagram_win(uint64_t id, uint64_t *max_dgram_id, uint64_t *seen) {
+#define SEEN_BIT(i) (seen[((i) % DGRAM_WIN) / 64] & (1ULL << ((i) % 64)))
+#define SEEN_SET(i) (seen[((i) % DGRAM_WIN) / 64] |= (1ULL << ((i) % 64)))
+#define SEEN_CLR(i) (seen[((i) % DGRAM_WIN) / 64] &= ~(1ULL << ((i) % 64)))
+    if (id > *max_dgram_id) {
+        uint64_t diff = id - *max_dgram_id;
+        if (diff >= DGRAM_WIN) {
+            memset(seen, 0, DGRAM_WIN / 8);
+        } else {
+            for (uint64_t i = *max_dgram_id + 1; i < id; i++) SEEN_CLR(i);
+        }
+        SEEN_SET(id);
+        *max_dgram_id = id;
+        return 1;
+    }
+    if (*max_dgram_id - id >= DGRAM_WIN) return 0;
+    if (SEEN_BIT(id)) return 0;
+    SEEN_SET(id);
+    return 1;
+#undef SEEN_BIT
+#undef SEEN_SET
+#undef SEEN_CLR
 }
 
 static int is_new_datagram(uint64_t id, uint64_t *max_dgram_id, uint64_t *dgram_id_mask) {
@@ -302,6 +332,7 @@ static int conn_create_notify(xqc_connection_t *conn, const xqc_cid_t *cid, void
     if (!ep) return -1;
     ep->conn = conn;
     ep->max_dgram_id = 0;
+    memset(ep->dgram_seen, 0, sizeof(ep->dgram_seen));
     ep->dgram_id_mask = 0;
     ep->server_dgram_id = 0;
     ep->quic_dgram_id = 1;
@@ -360,6 +391,7 @@ static int server_accept(xqc_engine_t *eng, xqc_connection_t *conn, const xqc_ci
     if (!ep) return -1;
     ep->conn = conn;
     ep->max_dgram_id = 0;
+    memset(ep->dgram_seen, 0, sizeof(ep->dgram_seen));
     xqc_conn_set_alp_user_data(conn, ep);
     xqc_datagram_set_user_data(conn, ep);
     return 0;
@@ -398,7 +430,7 @@ static void datagram_read_notify(xqc_connection_t *conn, void *user_data, const 
     memcpy(&net_val, data, sizeof(uint64_t));
     uint64_t remote_dgram_id = be64toh(net_val);
 
-    if (!is_new_datagram(remote_dgram_id, &ep->max_dgram_id, &ep->dgram_id_mask)) {
+    if (!is_new_datagram_win(remote_dgram_id, &ep->max_dgram_id, ep->dgram_seen)) {
         LOG_WARN("[quic] duplicate datagram %ld (<=%ld) recv\n", remote_dgram_id, ep->max_dgram_id);
         return;
     }
@@ -528,6 +560,7 @@ quic_endpoint_t *quic_client_start(const quic_client_config_t *config) {
         ep->quic_dgram_id = 1;
         ep->client_dgram_id = 0;
         ep->max_dgram_id = 0;
+        memset(ep->dgram_seen, 0, sizeof(ep->dgram_seen));
         ep->dgram_id_mask = 0;
     }
 
@@ -719,6 +752,7 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
         ep->quic_dgram_id = 1;
         ep->server_dgram_id = 0;
         ep->max_dgram_id = 0;
+        memset(ep->dgram_seen, 0, sizeof(ep->dgram_seen));
         ep->dgram_id_mask = 0;
     }
     if (ep->num_paths == 0) ep->num_paths = 1;
