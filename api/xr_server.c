@@ -32,7 +32,7 @@ typedef struct {
     uint32_t frag_seq;      // 0 = fragment had no per-fragment stamp
 } pending_ack_t;
 
-static quic_endpoint_t *g_server1 = NULL;
+static quic_endpoint_t *g_server = NULL;
 static quic_endpoint_t *g_server2 = NULL;
 static pending_ack_t g_pending_acks[MAX_PENDING] = {0};
 
@@ -175,7 +175,6 @@ int main(int argc, char *argv[]) {
     const char *raw_local_ips = "127.0.0.2,127.0.0.3";
     const char *out_qlog_file = "server.qlog";
 
-
     static struct option long_options[] = {
         {"local-ips",  required_argument, 0, 'l'},
         {"scheduler",  required_argument, 0, 's'},
@@ -212,26 +211,27 @@ int main(int argc, char *argv[]) {
     printf("\n");
     fflush(stdout);
 
-    // --- Server Endpoint 1 Config (Port 8000) ---
-    quic_server_config_t config1 = {
+    // --- Server Endpoint Config (Port 8000) ---
+    quic_server_config_t config = {
         .listen_port = 8000,
         .num_local_addrs = num_local_addrs,
         .enable_datagram = 1,
-        .enable_redundancy = 1,
         .recv_cb = on_server_recv,
         .scheduler = scheduler,
         .congestion = congestion,
+        .enable_redundancy = 1,
+        .sendmmsg_on = 1,
         .qlog = out_qlog_file,
-        .user_data = &g_server1
+        .user_data = &g_server
     };
 
     for (int i = 0; i < num_local_addrs; i++) {
-        config1.local_ips[i] = local_ips[i];
+        config.local_ips[i] = local_ips[i];
     }
 
     printf("Starting QUIC Replay Server 1 on port 8000...\n");
-    g_server1 = quic_server_start(&config1);
-    if (!g_server1) {
+    g_server = quic_server_start(&config);
+    if (!g_server) {
         fprintf(stderr, "Failed to start Server 1!\n");
         return EXIT_FAILURE;
     }
@@ -242,13 +242,13 @@ int main(int argc, char *argv[]) {
     
     // Main Non-Blocking Loop
     while (1) {
-        if (g_server1) quic_endpoint_step(g_server1);
+        if (g_server) quic_endpoint_step(g_server);
 
         double now = get_time_ms();
         for (int i = 0; i < MAX_PENDING; i++) {
             if (g_pending_acks[i].active && now >= g_pending_acks[i].target_send_time_ms) {
                 if (!getenv("XR_MIN_LOG")) printf(">>> [SERVER ACK SEND] hitId=%d to client_%d\n", g_pending_acks[i].ack.hit_id, g_pending_acks[i].ack.client_id);
-                if (g_server1) {
+                if (g_server) {
                     // ack + echo of the fragment seq + server send time (CLOCK_MONOTONIC ms)
                     uint8_t abuf[sizeof(hit_ack_t) + sizeof(uint32_t) + sizeof(double)];
                     size_t alen = sizeof(hit_ack_t);
@@ -259,7 +259,7 @@ int main(int argc, char *argv[]) {
                         memcpy(abuf + alen + sizeof(uint32_t), &t_ack, sizeof(double));
                         alen = sizeof(abuf);
                     }
-                    quic_send(g_server1, abuf, alen);
+                    quic_send(g_server, abuf, alen);
                 }
                 g_pending_acks[i].active = 0;
             }
@@ -268,6 +268,6 @@ int main(int argc, char *argv[]) {
         usleep(100);
     }
 
-    quic_endpoint_stop(g_server1);
+    quic_endpoint_stop(g_server);
     return EXIT_SUCCESS;
 }

@@ -369,6 +369,7 @@ int main(int argc, char *argv[]) {
         .scheduler = scheduler,
         .congestion = congestion,
         .enable_redundancy = 1,
+        .sendmmsg_on = 1,
         .qlog = out_qlog_file,
         .user_data = NULL
     };

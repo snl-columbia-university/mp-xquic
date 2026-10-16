@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+
 #include "quic_api.h"
 #define DGRAM_WIN 16384   /* datagram ids remembered by the duplicate filter (multiple of 64) */
 #include <stdio.h>
@@ -36,8 +38,21 @@ static void kts_log(const char *role, const struct timespec *kts, ssize_t len) {
 }
 #include <event2/event.h>
 #include <xquic/xquic.h>
+#include <sys/socket.h>
 
 #define MAX_PATHS 16
+
+#ifndef XQC_SOCKET_ERROR
+#define XQC_SOCKET_ERROR -1
+#endif
+#ifndef XQC_SOCKET_EAGAIN
+#define XQC_SOCKET_EAGAIN -2
+#endif
+
+typedef union {
+    struct cmsghdr cm;
+    char buf[CMSG_SPACE(sizeof(struct in_pktinfo))];
+} cmsg_pktinfo_t;
 
 typedef enum {
     QUIC_LOG_DEBUG,
@@ -231,54 +246,45 @@ static void qlog_event_write(qlog_event_importance_t imp, const void *buf,
 // QUIC socket callbacks
 static ssize_t write_socket(const unsigned char *buf, size_t size,
                             const struct sockaddr *peer_addr, socklen_t peer_addrlen,
-                            void *user_data) {
+                            void *user_data) 
+{
     quic_endpoint_t *ep = (quic_endpoint_t *)user_data;
-    if (!ep || ep->quic_fd <= 0) return -1;
-    return sendto(ep->quic_fd, buf, size, 0, peer_addr, peer_addrlen);
+    if (!ep || ep->quic_fd < 0) return XQC_SOCKET_ERROR;
+
+    ssize_t res = sendto(ep->quic_fd, buf, size, 0, peer_addr, peer_addrlen);
+    if (res < 0) {
+        return (errno == EAGAIN || errno == EWOULDBLOCK) ? XQC_SOCKET_EAGAIN : XQC_SOCKET_ERROR;
+    }
+    return res;
 }
+
 static ssize_t write_socket_ex(uint64_t path_id, const unsigned char *buf, size_t size,
                                const struct sockaddr *_peer_addr, socklen_t _peer_addrlen,
-                               void *user_data) { 
+                               void *user_data) 
+{ 
     quic_endpoint_t *ep = (quic_endpoint_t *)user_data;
-    if (!ep || ep->quic_fd <= 0) return -1;
+    if (!ep || ep->quic_fd < 0) return XQC_SOCKET_ERROR;
 
+    struct sockaddr_in *peer_addr = (ep->mode == QUIC_MODE_CLIENT) 
+        ? &ep->peer_addrs[(path_id + ep->path_idx) % ep->num_peer_addrs] 
+        : (struct sockaddr_in *)_peer_addr;
 
-    struct sockaddr_in *peer_addr = ep->mode == QUIC_MODE_CLIENT ? &ep->peer_addrs[(path_id + ep->path_idx) % ep->num_peer_addrs] : (struct sockaddr_in *)_peer_addr;
-    struct sockaddr_in *local_addr = ep->mode == QUIC_MODE_CLIENT ? &ep->local_addrs[(path_id / ep->num_peer_addrs) % ep->num_local_addrs] : &ep->local_addrs[path_id % ep->num_local_addrs]; 
+    struct sockaddr_in *local_addr = (ep->mode == QUIC_MODE_CLIENT) 
+        ? &ep->local_addrs[(path_id / ep->num_peer_addrs) % ep->num_local_addrs] 
+        : &ep->local_addrs[path_id % ep->num_local_addrs];
 
-    char local_ip[INET_ADDRSTRLEN];
-    char peer_ip[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &local_addr->sin_addr, local_ip, sizeof(local_ip));
-    inet_ntop(AF_INET, &peer_addr->sin_addr, peer_ip, sizeof(peer_ip));
-    
-
-    struct sockaddr_storage eng_src = {0}, eng_dst = {0};
-    socklen_t len;
-    if (ep->conn) {
-        xqc_path_get_local_addr(ep->conn, path_id, (struct sockaddr *)&eng_src, sizeof(eng_src), &len);
-        xqc_path_get_peer_addr(ep->conn, path_id, (struct sockaddr *)&eng_dst, sizeof(eng_dst), &len);
-    }
-    
-    char eng_src_ip[INET_ADDRSTRLEN], eng_dst_ip[INET_ADDRSTRLEN];
-
-    inet_ntop(AF_INET, &((struct sockaddr_in *)&eng_src)->sin_addr, eng_src_ip, sizeof(eng_src_ip));
-    inet_ntop(AF_INET, &((struct sockaddr_in *)&eng_dst)->sin_addr, eng_dst_ip, sizeof(eng_dst_ip));
-
-
-    LOG_DEBUG("[%s-quic] write_socket_ex called for path_id %lu from %s:%d to %s:%d | engine path %s -> %s\n\n", 
-                ep->mode == QUIC_MODE_CLIENT ? "client" : "server", path_id, 
-                local_ip, ntohs(local_addr->sin_port),
-                peer_ip, ntohs(peer_addr->sin_port), eng_src_ip, eng_dst_ip);
+    const socklen_t namelen = (ep->mode == QUIC_MODE_CLIENT) ? sizeof(*peer_addr) : _peer_addrlen;
 
     struct iovec iov = { (void *)buf, size };
-    char cbuf[CMSG_SPACE(sizeof(struct in_pktinfo))] = {0};
+    cmsg_pktinfo_t cbuf = {0};
+
     struct msghdr msg = {
-        .msg_name = (void *)peer_addr,
-        .msg_namelen = sizeof(*peer_addr),
-        .msg_iov = &iov,
-        .msg_iovlen = 1,
-        .msg_control = cbuf,
-        .msg_controllen = sizeof(cbuf)
+        .msg_name       = (void *)peer_addr,
+        .msg_namelen    = namelen,
+        .msg_iov        = &iov,
+        .msg_iovlen     = 1,
+        .msg_control    = cbuf.buf,
+        .msg_controllen = sizeof(cbuf.buf)
     };
 
     struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
@@ -287,7 +293,96 @@ static ssize_t write_socket_ex(uint64_t path_id, const unsigned char *buf, size_
     cmsg->cmsg_len   = CMSG_LEN(sizeof(struct in_pktinfo));
     ((struct in_pktinfo *)CMSG_DATA(cmsg))->ipi_spec_dst = local_addr->sin_addr;
 
-    return sendmsg(ep->quic_fd, &msg, 0);
+    LOG_DEBUG("[%s-quic] write_socket_ex: calling write_socket for path_id %lu\n",
+            ep->mode == QUIC_MODE_SERVER ? "server" : "client",
+            (unsigned long)path_id);
+
+    ssize_t res = sendmsg(ep->quic_fd, &msg, 0);
+    if (res < 0) {
+        return (errno == EAGAIN || errno == EWOULDBLOCK) ? XQC_SOCKET_EAGAIN : XQC_SOCKET_ERROR;
+    }
+    return res;
+}
+
+// QUIC mmsg callbacks
+static ssize_t write_mmsg(const struct iovec *msg_iov, unsigned int vlen,
+                          const struct sockaddr *peer_addr, socklen_t peer_addrlen,
+                          void *user_data) 
+{
+    quic_endpoint_t *ep = (quic_endpoint_t *)user_data;
+    if (!ep || ep->quic_fd < 0 || vlen == 0 || !msg_iov) {
+        return XQC_SOCKET_ERROR;
+    }
+
+    struct mmsghdr msgs[vlen];
+    memset(msgs, 0, sizeof(msgs));
+
+    for (unsigned int i = 0; i < vlen; i++) {
+        msgs[i].msg_hdr.msg_name    = (void *)peer_addr;
+        msgs[i].msg_hdr.msg_namelen = peer_addrlen;
+        msgs[i].msg_hdr.msg_iov     = (struct iovec *)&msg_iov[i];
+        msgs[i].msg_hdr.msg_iovlen  = 1;
+    }
+
+    int sent = sendmmsg(ep->quic_fd, msgs, vlen, 0);
+    if (sent < 0) {
+        return (errno == EAGAIN || errno == EWOULDBLOCK) ? XQC_SOCKET_EAGAIN : XQC_SOCKET_ERROR;
+    }
+    return sent;
+}
+
+static ssize_t write_mmsg_ex(uint64_t path_id,
+                             const struct iovec *msg_iov, unsigned int vlen,
+                             const struct sockaddr *_peer_addr, socklen_t _peer_addrlen,
+                             void *user_data) 
+{
+    quic_endpoint_t *ep = (quic_endpoint_t *)user_data;
+    if (!ep || ep->quic_fd < 0 || vlen == 0 || !msg_iov) {
+        return XQC_SOCKET_ERROR;
+    }
+
+    struct sockaddr_in *peer_addr = (ep->mode == QUIC_MODE_CLIENT) 
+        ? &ep->peer_addrs[(path_id + ep->path_idx) % ep->num_peer_addrs] 
+        : (struct sockaddr_in *)_peer_addr;
+
+    struct sockaddr_in *local_addr = (ep->mode == QUIC_MODE_CLIENT) 
+        ? &ep->local_addrs[(path_id / ep->num_peer_addrs) % ep->num_local_addrs] 
+        : &ep->local_addrs[path_id % ep->num_local_addrs];
+
+    const socklen_t namelen = (ep->mode == QUIC_MODE_CLIENT) ? sizeof(*peer_addr) : _peer_addrlen;
+
+    struct mmsghdr msgs[vlen];
+    cmsg_pktinfo_t cbufs[vlen];
+
+    memset(msgs, 0, sizeof(msgs));
+    memset(cbufs, 0, sizeof(cbufs));
+
+    for (unsigned int i = 0; i < vlen; i++) {
+        struct msghdr *hdr = &msgs[i].msg_hdr;
+
+        hdr->msg_name       = (void *)peer_addr;
+        hdr->msg_namelen    = namelen;
+        hdr->msg_iov        = (struct iovec *)&msg_iov[i];
+        hdr->msg_iovlen     = 1;
+        hdr->msg_control    = cbufs[i].buf;
+        hdr->msg_controllen = sizeof(cbufs[i].buf);
+
+        struct cmsghdr *cmsg = CMSG_FIRSTHDR(hdr);
+        cmsg->cmsg_level = IPPROTO_IP;
+        cmsg->cmsg_type  = IP_PKTINFO;
+        cmsg->cmsg_len   = CMSG_LEN(sizeof(struct in_pktinfo));
+        ((struct in_pktinfo *)CMSG_DATA(cmsg))->ipi_spec_dst = local_addr->sin_addr;
+    }
+
+    LOG_DEBUG("[%s-quic] write_mmsg_ex: calling sendmmsg for path_id %lu (batch of %u datagrams)\n",
+             ep->mode == QUIC_MODE_SERVER ? "server" : "client",
+             (unsigned long)path_id, vlen);
+
+    int sent = sendmmsg(ep->quic_fd, msgs, vlen, 0);
+    if (sent < 0) {
+        return (errno == EAGAIN || errno == EWOULDBLOCK) ? XQC_SOCKET_EAGAIN : XQC_SOCKET_ERROR;
+    }
+    return sent;
 }
 
 // QUIC certificate callback
@@ -616,6 +711,7 @@ quic_endpoint_t *quic_client_start(const quic_client_config_t *config) {
     
     xqc_config_t cfg;
     xqc_engine_get_default_config(&cfg, XQC_ENGINE_CLIENT);
+    cfg.sendmmsg_on = config->sendmmsg_on;
 
     xqc_engine_callback_t eng_cb = {
         .set_event_timer = set_event_timer,
@@ -629,6 +725,8 @@ quic_endpoint_t *quic_client_start(const quic_client_config_t *config) {
     xqc_transport_callbacks_t trans_cb = {
         .write_socket = write_socket,
         .write_socket_ex = write_socket_ex,
+        .write_mmsg = write_mmsg,
+        .write_mmsg_ex = write_mmsg_ex,
         .cert_verify_cb = cert_verify_cb,
         .save_token = save_token_cb,
         .save_session_cb = save_session_cb,
@@ -725,6 +823,7 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
 
     xqc_config_t cfg;
     xqc_engine_get_default_config(&cfg, XQC_ENGINE_SERVER);
+    cfg.sendmmsg_on = config->sendmmsg_on;
 
     xqc_engine_callback_t eng_cb = {
         .set_event_timer = set_event_timer,
@@ -740,6 +839,8 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
         .server_accept = server_accept,
         .write_socket = write_socket,
         .write_socket_ex = write_socket_ex,
+        .write_mmsg = write_mmsg,
+        .write_mmsg_ex = write_mmsg_ex,
         .cert_verify_cb = cert_verify_cb,
         .ready_to_create_path_notify = ready_to_create_path_notify,
         .path_created_notify = path_created_notify
