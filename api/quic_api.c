@@ -16,22 +16,6 @@
 #include <xquic/xquic.h>
 
 #define MAX_PATHS 16
-#define API_QUEUE_CAPACITY 4096
-#define API_MAX_PAYLOAD 2048
-
-typedef struct {
-    uint8_t data[API_MAX_PAYLOAD];
-    size_t len;
-} api_queue_item_t;
-
-typedef struct {
-    api_queue_item_t items[API_QUEUE_CAPACITY];
-    size_t head;
-    size_t tail;
-    size_t count;
-    pthread_mutex_t lock;
-    pthread_cond_t cond;
-} api_queue_t;
 
 typedef enum {
     QUIC_LOG_DEBUG,
@@ -79,7 +63,6 @@ struct quic_endpoint {
     struct event_base *eb;
     struct event *timer_ev;
     struct event *quic_ev;
-    pthread_t thread;
 
     int quic_fd;
 
@@ -99,15 +82,27 @@ struct quic_endpoint {
     uint64_t max_dgram_id;
     uint64_t dgram_id_mask;
 
-    api_queue_t          rx_queue;
-    pthread_t            worker_thread;
-    int                  worker_running;
-
     quic_recv_cb         app_recv_cb;
     void                *app_user_data;
-    
+
+    int connected;
+    int path_idx;
+
+    xqc_conn_settings_t ep_conn_settings;
+    xqc_conn_ssl_config_t ep_ssl_config;
+
     int datagram_mode;
 };
+
+void quic_endpoint_step(quic_endpoint_t *ep) {
+    if (ep && ep->eb) {
+        event_base_loop(ep->eb, EVLOOP_NONBLOCK);
+    }
+}
+
+int is_connected(quic_endpoint_t *ep) {
+    return ep ? ep->connected : 0;
+}
 
 static xqc_usec_t get_timestamp(void) {
     struct timeval tv;
@@ -158,66 +153,6 @@ static int is_new_datagram(uint64_t id, uint64_t *max_dgram_id, uint64_t *dgram_
     }
 }
 
-//App queue functions
-static void api_enqueue_rx(quic_endpoint_t *ep, const uint8_t *data, size_t len) {
-    if (!ep || len > API_MAX_PAYLOAD) return;
-
-    pthread_mutex_lock(&ep->rx_queue.lock);
-    if (ep->rx_queue.count >= API_QUEUE_CAPACITY) {
-        pthread_mutex_unlock(&ep->rx_queue.lock);
-        fprintf(stderr, "[QUIC API WARNING] RX Queue Full! Dropping packet.\n");
-        return;
-    }
-
-    memcpy(ep->rx_queue.items[ep->rx_queue.tail].data, data, len);
-    ep->rx_queue.items[ep->rx_queue.tail].len = len;
-    ep->rx_queue.tail = (ep->rx_queue.tail + 1) % API_QUEUE_CAPACITY;
-    ep->rx_queue.count++;
-
-    pthread_cond_signal(&ep->rx_queue.cond);
-    pthread_mutex_unlock(&ep->rx_queue.lock);
-}
-static void *api_rx_worker_thread(void *arg) {
-    quic_endpoint_t *ep = (quic_endpoint_t *)arg;
-    uint8_t buffer[API_MAX_PAYLOAD];
-    size_t len;
-
-    while (ep->worker_running) {
-        pthread_mutex_lock(&ep->rx_queue.lock);
-
-        while (ep->rx_queue.count == 0 && ep->worker_running) {
-            pthread_cond_wait(&ep->rx_queue.cond, &ep->rx_queue.lock);
-        }
-
-        if (!ep->worker_running && ep->rx_queue.count == 0) {
-            pthread_mutex_unlock(&ep->rx_queue.lock);
-            break;
-        }
-
-        /* Pop item */
-        api_queue_item_t *item = &ep->rx_queue.items[ep->rx_queue.head];
-        memcpy(buffer, item->data, item->len);
-        len = item->len;
-
-        ep->rx_queue.head = (ep->rx_queue.head + 1) % API_QUEUE_CAPACITY;
-        ep->rx_queue.count--;
-
-        pthread_mutex_unlock(&ep->rx_queue.lock);
-
-        /* Invoke application callback safely on worker thread */
-        if (ep->app_recv_cb) {
-            ep->app_recv_cb(buffer, len, ep->app_user_data);
-        }
-    }
-    return NULL;
-}
-static void init_rx_worker(quic_endpoint_t *ep) {
-    pthread_mutex_init(&ep->rx_queue.lock, NULL);
-    pthread_cond_init(&ep->rx_queue.cond, NULL);
-    ep->worker_running = 1;
-    pthread_create(&ep->worker_thread, NULL, api_rx_worker_thread, ep);
-}
-
 // QUIC logging callback
 static void log_write(xqc_log_level_t lvl, const void *buf, size_t size, void *arg) { 
     LOG_DEBUG("%.*s", (int)size, (char*)buf); 
@@ -247,7 +182,8 @@ static ssize_t write_socket_ex(uint64_t path_id, const unsigned char *buf, size_
     quic_endpoint_t *ep = (quic_endpoint_t *)user_data;
     if (!ep || ep->quic_fd <= 0) return -1;
 
-    struct sockaddr_in *peer_addr = ep->mode == QUIC_MODE_CLIENT ? &ep->peer_addrs[path_id % ep->num_peer_addrs] : (struct sockaddr_in *)_peer_addr;
+
+    struct sockaddr_in *peer_addr = ep->mode == QUIC_MODE_CLIENT ? &ep->peer_addrs[(path_id + ep->path_idx) % ep->num_peer_addrs] : (struct sockaddr_in *)_peer_addr;
     struct sockaddr_in *local_addr = ep->mode == QUIC_MODE_CLIENT ? &ep->local_addrs[(path_id / ep->num_peer_addrs) % ep->num_local_addrs] : &ep->local_addrs[path_id % ep->num_local_addrs]; 
 
     char local_ip[INET_ADDRSTRLEN];
@@ -255,11 +191,24 @@ static ssize_t write_socket_ex(uint64_t path_id, const unsigned char *buf, size_
     inet_ntop(AF_INET, &local_addr->sin_addr, local_ip, sizeof(local_ip));
     inet_ntop(AF_INET, &peer_addr->sin_addr, peer_ip, sizeof(peer_ip));
     
-    LOG_DEBUG("[%s-quic] write_socket_ex called for path_id %lu from %s:%d to %s:%d\n", 
+
+    struct sockaddr_storage eng_src = {0}, eng_dst = {0};
+    socklen_t len;
+    if (ep->conn) {
+        xqc_path_get_local_addr(ep->conn, path_id, (struct sockaddr *)&eng_src, sizeof(eng_src), &len);
+        xqc_path_get_peer_addr(ep->conn, path_id, (struct sockaddr *)&eng_dst, sizeof(eng_dst), &len);
+    }
+    
+    char eng_src_ip[INET_ADDRSTRLEN], eng_dst_ip[INET_ADDRSTRLEN];
+
+    inet_ntop(AF_INET, &((struct sockaddr_in *)&eng_src)->sin_addr, eng_src_ip, sizeof(eng_src_ip));
+    inet_ntop(AF_INET, &((struct sockaddr_in *)&eng_dst)->sin_addr, eng_dst_ip, sizeof(eng_dst_ip));
+
+
+    LOG_DEBUG("[%s-quic] write_socket_ex called for path_id %lu from %s:%d to %s:%d | engine path %s -> %s\n\n", 
                 ep->mode == QUIC_MODE_CLIENT ? "client" : "server", path_id, 
                 local_ip, ntohs(local_addr->sin_port),
-                peer_ip, ntohs(peer_addr->sin_port));
-
+                peer_ip, ntohs(peer_addr->sin_port), eng_src_ip, eng_dst_ip);
 
     struct iovec iov = { (void *)buf, size };
     char cbuf[CMSG_SPACE(sizeof(struct in_pktinfo))] = {0};
@@ -326,7 +275,9 @@ static int stream_read_notify(xqc_stream_t *strm, void *user_data) {
         ssize_t n = xqc_stream_recv(strm, buf, sizeof(buf), &fin);
         LOG_DEBUG("[quic] stream_read_notify called for stream %lu, received %zd bytes\n", (unsigned long)xqc_stream_id(strm), n);
         if (n > 0) {
-            api_enqueue_rx(ep, buf, (size_t)n);
+            if (ep->app_recv_cb) {
+                ep->app_recv_cb(buf, (size_t)n, ep->app_user_data);
+            }
         } else if (fin) {
             LOG_INFO("[quic] stream %lu finished\n", (unsigned long)xqc_stream_id(strm));
             break;
@@ -359,12 +310,31 @@ static int conn_create_notify(xqc_connection_t *conn, const xqc_cid_t *cid, void
     return 0; 
 }
 static int conn_close_notify(xqc_connection_t *conn, const xqc_cid_t *cid, void *user_data, void *proto_data) { 
-    LOG_INFO("[quic] connection closed\n");
     quic_endpoint_t *ep = (quic_endpoint_t *)user_data;
-    if (ep) {
-        ep->conn = NULL;
-        ep->stream = NULL;
+    if (!ep) return 0;
+
+    if (ep->mode == QUIC_MODE_CLIENT && !ep->connected
+        && ep->path_idx + 1 < ep->num_peer_addrs)
+    {
+        char ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &ep->peer_addrs[ep->path_idx].sin_addr, ip, sizeof(ip));
+        LOG_INFO("[quic] connection failed to establish with %s:%u, trying next peer addr\n", ip, ntohs(ep->peer_addrs[ep->path_idx].sin_port));
+        ep->path_idx++;
+        const xqc_cid_t *cidp = xqc_connect(ep->engine, &ep->ep_conn_settings, NULL, 0, "localhost", 0,
+                                            &ep->ep_ssl_config,
+                                            (struct sockaddr*)&ep->peer_addrs[ep->path_idx], sizeof(ep->peer_addrs[ep->path_idx]),
+                                            "raw", ep);
+        if (cidp) {
+            memcpy(&ep->cid, cidp, sizeof(ep->cid));
+            return 0;
+        }
+        LOG_ERROR("[client-quic] retry connect failed\n");
     }
+
+    LOG_INFO("[quic] connection closed\n");
+    ep->conn = NULL;
+    ep->stream = NULL;
+    ep->connected = 0;
     return 0; 
 }
 static void conn_handshake_finished(xqc_connection_t *conn, void *user_data, void *proto_data) {
@@ -372,6 +342,7 @@ static void conn_handshake_finished(xqc_connection_t *conn, void *user_data, voi
     quic_endpoint_t *ep = (quic_endpoint_t *)user_data;
     if (!ep) return;
     ep->conn = conn;
+    ep->connected = 1;
     if (ep->mode == QUIC_MODE_CLIENT && !ep->quic_dgram_id) {
         ep->stream = xqc_stream_create(ep->engine, &ep->cid, NULL, user_data);
         if (ep->stream) {
@@ -435,7 +406,9 @@ static void datagram_read_notify(xqc_connection_t *conn, void *user_data, const 
     const uint8_t *payload = (const uint8_t *)data + 8;
     size_t payload_len = data_len - 8;
 
-    api_enqueue_rx(ep, payload, payload_len);
+    if (ep->app_recv_cb) {
+        ep->app_recv_cb(payload, payload_len, ep->app_user_data);
+    }
 }
 static void datagram_write_notify(xqc_connection_t *conn, void *user_data) { 
     LOG_DEBUG("[quic] datagram sent to peer\n"); 
@@ -485,14 +458,26 @@ static void packet_read_cb(int fd, short what, void *arg) {
     if (n > 0) {
         getsockname(fd, (struct sockaddr*)&local_addr, &local_len);
 
+        struct in_addr hdr_dst = local_addr.sin_addr;
         struct cmsghdr *cmsg;
         for (cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
             if (cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_PKTINFO) {
                 struct in_pktinfo *pi = (struct in_pktinfo *)CMSG_DATA(cmsg);
                 local_addr.sin_addr = pi->ipi_spec_dst; 
+                hdr_dst = pi->ipi_addr;
                 break;
             }
         }
+
+        char src_ip[INET_ADDRSTRLEN], dst_ip[INET_ADDRSTRLEN], hdr_dst_ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &peer_addr.sin_addr, src_ip, sizeof(src_ip));
+        inet_ntop(AF_INET, &local_addr.sin_addr, dst_ip, sizeof(dst_ip));
+        inet_ntop(AF_INET, &hdr_dst, hdr_dst_ip, sizeof(hdr_dst_ip));
+
+        LOG_DEBUG("[%s-quic] packet_read_cb received %zd bytes from %s:%d to %s:%d (header dst %s)\n",
+                    ep->mode == QUIC_MODE_CLIENT ? "client" : "server", n,
+                    src_ip, ntohs(peer_addr.sin_port),
+                    dst_ip, ntohs(local_addr.sin_port), hdr_dst_ip);
 
         xqc_engine_packet_process(ep->engine, buf, n,
                                   (struct sockaddr*)&local_addr, local_len,
@@ -500,12 +485,6 @@ static void packet_read_cb(int fd, short what, void *arg) {
                                   get_timestamp(), ep);
         xqc_engine_finish_recv(ep->engine);
     }
-}
-
-static void *event_loop_worker(void *arg) {
-    quic_endpoint_t *ep = (quic_endpoint_t *)arg;
-    event_base_dispatch(ep->eb);
-    return NULL;
 }
 
 quic_endpoint_t *quic_client_start(const quic_client_config_t *config) {
@@ -524,12 +503,12 @@ quic_endpoint_t *quic_client_start(const quic_client_config_t *config) {
     ep->app_user_data = config->user_data;
     ep->datagram_mode = config->enable_datagram;
 
-    init_rx_worker(ep);
-
     xqc_conn_settings_t conn_settings = {
         .proto_version = XQC_VERSION_V1,
         .ping_on = 1,
         .standby_path_probe_timeout = 500,
+        .init_idle_time_out = CONNECTION_TIMEOUT,
+        .idle_time_out = CONNECTION_TIMEOUT,
         .enable_multipath = 1,
         .mp_enable_reinjection = 0,
         .mp_ping_on = 1,
@@ -643,14 +622,18 @@ quic_endpoint_t *quic_client_start(const quic_client_config_t *config) {
     event_add(ep->timer_ev, &tv);
 
     xqc_conn_ssl_config_t conn_ssl_config = {0};
-    const xqc_cid_t *cidp = xqc_connect(ep->engine, &conn_settings, NULL, 0, "localhost", 0,
-                                        &conn_ssl_config, 
-                                        (struct sockaddr*)&ep->peer_addrs[0], sizeof(ep->peer_addrs[0]),
+
+    ep->path_idx = 0;
+    ep->ep_conn_settings = conn_settings;
+    ep->ep_ssl_config = conn_ssl_config;
+
+    const xqc_cid_t *cidp = xqc_connect(ep->engine, &ep->ep_conn_settings, NULL, 0, "localhost", 0,
+                                        &ep->ep_ssl_config, 
+                                        (struct sockaddr*)&ep->peer_addrs[ep->path_idx], sizeof(ep->peer_addrs[ep->path_idx]),
                                         "raw", ep);
     if (!cidp) { free(ep); return NULL; }
     memcpy(&ep->cid, cidp, sizeof(ep->cid));
 
-    pthread_create(&ep->thread, NULL, event_loop_worker, ep);
     return ep;
 }
 
@@ -669,9 +652,6 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
     ep->app_recv_cb = config->recv_cb;
     ep->app_user_data = config->user_data;
     ep->datagram_mode = config->enable_datagram;
-
-    /* Initialize RX worker thread on server */
-    init_rx_worker(ep);
 
     ep->eb = event_base_new();
 
@@ -707,6 +687,8 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
     xqc_conn_settings_t conn_settings = {
         .proto_version = XQC_VERSION_V1,
         .ping_on = 1,
+        .init_idle_time_out = CONNECTION_TIMEOUT,
+        .idle_time_out = CONNECTION_TIMEOUT,
         .standby_path_probe_timeout = 500,
         .enable_multipath = 1,
         .mp_enable_reinjection = 0,
@@ -786,7 +768,6 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
     struct timeval tv = {0, 10000};
     event_add(ep->timer_ev, &tv);
 
-    pthread_create(&ep->thread, NULL, event_loop_worker, ep);
     return ep;
 }
 
@@ -818,24 +799,8 @@ void quic_endpoint_stop(quic_endpoint_t *ep) {
         xqc_engine_main_logic(ep->engine);
     }
 
-    pthread_mutex_lock(&ep->rx_queue.lock);
-    ep->worker_running = 0;
-    pthread_cond_broadcast(&ep->rx_queue.cond);
-    pthread_mutex_unlock(&ep->rx_queue.lock);
-
-    if (ep->worker_thread && !pthread_equal(pthread_self(), ep->worker_thread)) {
-        pthread_join(ep->worker_thread, NULL);
-    }
-
-    pthread_mutex_destroy(&ep->rx_queue.lock);
-    pthread_cond_destroy(&ep->rx_queue.cond);
-
     if (ep->eb) {
         event_base_loopbreak(ep->eb);
-    }
-
-    if (ep->thread && !pthread_equal(pthread_self(), ep->thread)) {
-        pthread_join(ep->thread, NULL);
     }
 
     if (ep->qlog_file) {
