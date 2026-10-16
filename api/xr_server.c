@@ -1,3 +1,4 @@
+#include <signal.h>
 #include <getopt.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,6 +29,7 @@ typedef struct {
     int active;
     hit_ack_t ack;
     double target_send_time_ms;
+    uint32_t frag_seq;      // 0 = fragment had no per-fragment stamp
 } pending_ack_t;
 
 static quic_endpoint_t *g_server1 = NULL;
@@ -72,11 +74,70 @@ static int parse_ip_list(const char *str, char bufs[MAX_IPS][64], const char *pt
 
 // --- Receive Callback ---
 
+// Per-frame arrival log (server_recv.csv in the cwd): first/last fragment arrival.
+typedef struct { int n; double first_ms, last_ms; } frame_arrival_t;
+static frame_arrival_t *g_arr = NULL;
+static int g_arr_cap = 0;
+
+// XR_FRAG_LOG=1: per-fragment stamps / ack echo / arrival logs (off by default)
+static int frag_log_on(void) { static int v = -1; if (v < 0) v = getenv("XR_FRAG_LOG") != NULL; return v; }
+
+static void write_arrivals(void) {
+    FILE *o = fopen("server_recv.csv", "w");
+    if (!o) return;
+    fprintf(o, "frame_id,n_recv,first_recv_ms,last_recv_ms\n");
+    for (int i = 0; i < g_arr_cap; i++)
+        if (g_arr[i].n) fprintf(o, "%d,%d,%.3f,%.3f\n", i, g_arr[i].n, g_arr[i].first_ms, g_arr[i].last_ms);
+    fclose(o);
+}
+
+// Per-fragment log (frag_recv.csv): one row per unique fragment that reached the server.
+typedef struct { uint32_t seq; int32_t frame; double send_ms, recv_ms; } frag_rec_t;
+static frag_rec_t *g_frag = NULL;
+static size_t g_frag_n = 0, g_frag_cap = 0;
+
+static void write_frags(void) {
+    FILE *o = fopen("frag_recv.csv", "w");
+    if (!o) return;
+    fprintf(o, "frag_seq,frame_id,send_ms,recv_ms\n");
+    for (size_t i = 0; i < g_frag_n; i++)
+        fprintf(o, "%u,%d,%.3f,%.3f\n", g_frag[i].seq, g_frag[i].frame, g_frag[i].send_ms, g_frag[i].recv_ms);
+    fclose(o);
+}
+
+static void on_term(int sig) { (void)sig; if (frag_log_on()) { write_arrivals(); write_frags(); } _exit(0); }
+
 static void on_server_recv(const uint8_t *data, size_t len, void *user_data) {
     if (len >= sizeof(hit_request_t)) {
         const hit_request_t *req = (const hit_request_t *)data;
 
-        printf("<<< [SERVER RECV] hitId=%d from client_%d | Requested processing delay: %.2f ms\n",
+        if (frag_log_on() && req->hit_id >= 0) {
+            double t = get_time_ms();
+            if (req->hit_id >= g_arr_cap) {
+                int cap = g_arr_cap ? g_arr_cap : 8192;
+                while (cap <= req->hit_id) cap *= 2;
+                g_arr = realloc(g_arr, cap * sizeof(*g_arr));
+                memset(g_arr + g_arr_cap, 0, (cap - g_arr_cap) * sizeof(*g_arr));
+                g_arr_cap = cap;
+            }
+            if (len >= sizeof(hit_request_t) + sizeof(uint32_t) + sizeof(double)) {
+                if (g_frag_n == g_frag_cap) {
+                    g_frag_cap = g_frag_cap ? g_frag_cap * 2 : 262144;
+                    g_frag = realloc(g_frag, g_frag_cap * sizeof(*g_frag));
+                }
+                frag_rec_t *fr = &g_frag[g_frag_n++];
+                memcpy(&fr->seq, data + sizeof(hit_request_t), sizeof(fr->seq));
+                memcpy(&fr->send_ms, data + sizeof(hit_request_t) + sizeof(fr->seq), sizeof(fr->send_ms));
+                fr->frame = req->hit_id;
+                fr->recv_ms = t;
+            }
+            frame_arrival_t *a = &g_arr[req->hit_id];
+            if (!a->n) a->first_ms = t;
+            a->last_ms = t;
+            a->n++;
+        }
+
+        if (!getenv("XR_MIN_LOG")) printf("<<< [SERVER RECV] hitId=%d from client_%d | Requested processing delay: %.2f ms\n",
                req->hit_id, req->client_id, req->server_proc_ms);
 
         hit_ack_t ack = {
@@ -89,6 +150,9 @@ static void on_server_recv(const uint8_t *data, size_t len, void *user_data) {
         for (int i = 0; i < MAX_PENDING; i++) {
             if (!g_pending_acks[i].active) {
                 g_pending_acks[i].ack = ack;
+                g_pending_acks[i].frag_seq = 0;
+                if (frag_log_on() && len >= sizeof(hit_request_t) + sizeof(uint32_t) + sizeof(double))
+                    memcpy(&g_pending_acks[i].frag_seq, data + sizeof(hit_request_t), sizeof(uint32_t));
                 g_pending_acks[i].target_send_time_ms = get_time_ms() + req->server_proc_ms;
                 g_pending_acks[i].active = 1;
                 break;
@@ -172,6 +236,8 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
+    signal(SIGTERM, on_term);
+    signal(SIGINT, on_term);
     printf("Server running. Press Ctrl+C to stop.\n");
     
     // Main Non-Blocking Loop
@@ -181,9 +247,19 @@ int main(int argc, char *argv[]) {
         double now = get_time_ms();
         for (int i = 0; i < MAX_PENDING; i++) {
             if (g_pending_acks[i].active && now >= g_pending_acks[i].target_send_time_ms) {
-                printf(">>> [SERVER ACK SEND] hitId=%d to client_%d\n", g_pending_acks[i].ack.hit_id, g_pending_acks[i].ack.client_id);
+                if (!getenv("XR_MIN_LOG")) printf(">>> [SERVER ACK SEND] hitId=%d to client_%d\n", g_pending_acks[i].ack.hit_id, g_pending_acks[i].ack.client_id);
                 if (g_server1) {
-                    quic_send(g_server1, (const uint8_t *)&g_pending_acks[i].ack, sizeof(hit_ack_t));
+                    // ack + echo of the fragment seq + server send time (CLOCK_MONOTONIC ms)
+                    uint8_t abuf[sizeof(hit_ack_t) + sizeof(uint32_t) + sizeof(double)];
+                    size_t alen = sizeof(hit_ack_t);
+                    memcpy(abuf, &g_pending_acks[i].ack, sizeof(hit_ack_t));
+                    if (g_pending_acks[i].frag_seq) {
+                        double t_ack = get_time_ms();
+                        memcpy(abuf + alen, &g_pending_acks[i].frag_seq, sizeof(uint32_t));
+                        memcpy(abuf + alen + sizeof(uint32_t), &t_ack, sizeof(double));
+                        alen = sizeof(abuf);
+                    }
+                    quic_send(g_server1, abuf, alen);
                 }
                 g_pending_acks[i].active = 0;
             }

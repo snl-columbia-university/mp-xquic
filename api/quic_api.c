@@ -13,6 +13,27 @@
 #include <pthread.h>
 #include <arpa/inet.h>
 #include <sys/time.h>
+#include <sys/socket.h>
+
+// XR_KTS: log kernel-receive -> app-read delay for every packet (socket queueing).
+static FILE *g_kts = NULL;
+static long g_kts_n = 0;
+static int kts_on(void) { static int v = -1; if (v < 0) v = getenv("XR_KTS") != NULL; return v; }
+static void kts_log(const char *role, const struct timespec *kts, ssize_t len) {
+    if (!g_kts) {
+        char name[64]; snprintf(name, sizeof(name), "kts_%s.csv", role);
+        g_kts = fopen(name, "w");
+        if (!g_kts) return;
+        setvbuf(g_kts, NULL, _IOFBF, 1 << 20);
+        fprintf(g_kts, "mono_ms,wait_us,len\n");
+    }
+    struct timespec rt, mono;
+    clock_gettime(CLOCK_REALTIME, &rt);
+    clock_gettime(CLOCK_MONOTONIC, &mono);
+    double wait_us = (rt.tv_sec - kts->tv_sec) * 1e6 + (rt.tv_nsec - kts->tv_nsec) / 1e3;
+    fprintf(g_kts, "%.3f,%.1f,%zd\n", mono.tv_sec * 1e3 + mono.tv_nsec / 1e6, wait_us, len);
+    if (++g_kts_n % 4096 == 0) fflush(g_kts);
+}
 #include <event2/event.h>
 #include <xquic/xquic.h>
 
@@ -25,7 +46,15 @@ typedef enum {
     QUIC_LOG_ERROR
 } quic_log_level_t;
 
+/* XR_MIN_LOG=1: bare-minimum logging -- drop DEBUG/INFO lines and the qlog */
+static int quic_min_log(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("XR_MIN_LOG") != NULL;
+    return v;
+}
+
 static void quic_log(quic_log_level_t level, const char *fmt, ...) {
+    if (quic_min_log() && level < QUIC_LOG_WARN) return;
     const char *level_strs[] = { "DEBUG", "INFO", "WARN", "ERROR" };
     struct timeval tv;
     gettimeofday(&tv, NULL);
@@ -185,6 +214,7 @@ static int is_new_datagram(uint64_t id, uint64_t *max_dgram_id, uint64_t *dgram_
 
 // QUIC logging callback
 static void log_write(xqc_log_level_t lvl, const void *buf, size_t size, void *arg) { 
+    if (quic_min_log()) { LOG_WARN("%.*s", (int)size, (char*)buf); return; }   /* engine logs WARN+ only */
     LOG_DEBUG("%.*s", (int)size, (char*)buf); 
 }
 static void qlog_event_write(qlog_event_importance_t imp, const void *buf, 
@@ -431,7 +461,7 @@ static void datagram_read_notify(xqc_connection_t *conn, void *user_data, const 
     uint64_t remote_dgram_id = be64toh(net_val);
 
     if (!is_new_datagram_win(remote_dgram_id, &ep->max_dgram_id, ep->dgram_seen)) {
-        LOG_WARN("[quic] duplicate datagram %ld (<=%ld) recv\n", remote_dgram_id, ep->max_dgram_id);
+        if (!quic_min_log()) LOG_WARN("[quic] duplicate datagram %ld (<=%ld) recv\n", remote_dgram_id, ep->max_dgram_id);
         return;
     }
 
@@ -474,7 +504,7 @@ static void packet_read_cb(int fd, short what, void *arg) {
     if (!ep) return;
 
     struct iovec iov = { .iov_base = buf, .iov_len = sizeof(buf) };
-    char cmsg_buf[CMSG_SPACE(sizeof(struct in_pktinfo))];
+    char cmsg_buf[CMSG_SPACE(sizeof(struct in_pktinfo)) + CMSG_SPACE(sizeof(struct timespec))];
     struct msghdr msg = {
         .msg_name = &peer_addr,
         .msg_namelen = sizeof(peer_addr),
@@ -497,7 +527,9 @@ static void packet_read_cb(int fd, short what, void *arg) {
                 struct in_pktinfo *pi = (struct in_pktinfo *)CMSG_DATA(cmsg);
                 local_addr.sin_addr = pi->ipi_spec_dst; 
                 hdr_dst = pi->ipi_addr;
-                break;
+            } else if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_TIMESTAMPNS) {
+                kts_log(ep->mode == QUIC_MODE_CLIENT ? "client" : "server",
+                        (const struct timespec *)CMSG_DATA(cmsg), n);
             }
         }
 
@@ -526,7 +558,7 @@ quic_endpoint_t *quic_client_start(const quic_client_config_t *config) {
     if (!ep) return NULL;
 
     ep->mode = QUIC_MODE_CLIENT;
-    if (config->qlog && config->qlog[0] != '\0') {
+    if (config->qlog && config->qlog[0] != '\0' && !quic_min_log()) {
         ep->qlog_file = fopen(config->qlog, "wb");
     } else {
         ep->qlog_file = NULL;
@@ -637,6 +669,7 @@ quic_endpoint_t *quic_client_start(const quic_client_config_t *config) {
 
     ep->quic_fd = socket(AF_INET, SOCK_DGRAM, 0);
     fcntl(ep->quic_fd, F_SETFL, O_NONBLOCK);
+    if (kts_on()) { int on = 1; setsockopt(ep->quic_fd, SOL_SOCKET, SO_TIMESTAMPNS, &on, sizeof(on)); }
     int reuse = 1;
     setsockopt(ep->quic_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
     int pktinfo = 1;
@@ -679,7 +712,7 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
     if (!ep) return NULL;
 
     ep->mode = QUIC_MODE_SERVER;
-    if (config->qlog && config->qlog[0] != '\0') {
+    if (config->qlog && config->qlog[0] != '\0' && !quic_min_log()) {
         ep->qlog_file = fopen(config->qlog, "wb");
     } else {
         ep->qlog_file = NULL;
@@ -787,6 +820,7 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
 
     ep->quic_fd = socket(AF_INET, SOCK_DGRAM, 0);
     fcntl(ep->quic_fd, F_SETFL, O_NONBLOCK);
+    if (kts_on()) { int on = 1; setsockopt(ep->quic_fd, SOL_SOCKET, SO_TIMESTAMPNS, &on, sizeof(on)); }
     int reuse = 1;
     setsockopt(ep->quic_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
     int pktinfo = 1;

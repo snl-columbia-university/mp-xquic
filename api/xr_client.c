@@ -111,8 +111,40 @@ static int parse_ip_list(const char *str, char bufs[MAX_IPS][64], const char *pt
 
 // --- Receive Callback ---
 
+// Per-fragment ack log (ack_recv.csv): fragment seq echoed by the server, its send time, our arrival.
+typedef struct { uint32_t seq; double srv_send_ms, recv_ms; } ack_rec_t;
+static ack_rec_t *g_ackrec = NULL;
+static size_t g_ackrec_n = 0, g_ackrec_cap = 0;
+
+// XR_FRAG_LOG=1: per-fragment stamps / ack echo / arrival logs (off by default)
+static int frag_log_on(void) { static int v = -1; if (v < 0) v = getenv("XR_FRAG_LOG") != NULL; return v; }
+
+static void write_ack_recs(const char *dir_of) {
+    char path[1024];
+    const char *slash = dir_of ? strrchr(dir_of, '/') : NULL;
+    if (slash) snprintf(path, sizeof(path), "%.*s/ack_recv.csv", (int)(slash - dir_of), dir_of);
+    else snprintf(path, sizeof(path), "ack_recv.csv");
+    FILE *o = fopen(path, "w");
+    if (!o) return;
+    fprintf(o, "frag_seq,srv_send_ms,recv_ms\n");
+    for (size_t i = 0; i < g_ackrec_n; i++)
+        fprintf(o, "%u,%.3f,%.3f\n", g_ackrec[i].seq, g_ackrec[i].srv_send_ms, g_ackrec[i].recv_ms);
+    fclose(o);
+}
+
 static void on_client_recv(const uint8_t *data, size_t len, void *user_data) {
     double recv_time = get_time_ms();
+
+    if (len >= sizeof(hit_ack_t) + sizeof(uint32_t) + sizeof(double)) {
+        if (g_ackrec_n == g_ackrec_cap) {
+            g_ackrec_cap = g_ackrec_cap ? g_ackrec_cap * 2 : 262144;
+            g_ackrec = realloc(g_ackrec, g_ackrec_cap * sizeof(*g_ackrec));
+        }
+        ack_rec_t *ar = &g_ackrec[g_ackrec_n++];
+        memcpy(&ar->seq, data + sizeof(hit_ack_t), sizeof(uint32_t));
+        memcpy(&ar->srv_send_ms, data + sizeof(hit_ack_t) + sizeof(uint32_t), sizeof(double));
+        ar->recv_ms = recv_time;
+    }
 
     if (len >= sizeof(hit_ack_t)) {
         const hit_ack_t *ack = (const hit_ack_t *)data;
@@ -506,6 +538,15 @@ int main(int argc, char *argv[]) {
             fflush(stdout);
         }
 
+        // per-fragment stamp after the header: global fragment seq + send time (CLOCK_MONOTONIC ms)
+        static uint32_t frag_seq = 0;
+        if (frag_log_on() && send_len >= sizeof(hit_request_t) + sizeof(uint32_t) + sizeof(double)) {
+            uint32_t seq = ++frag_seq;
+            double t_send = get_time_ms();
+            memcpy(sendbuf + sizeof(hit_request_t), &seq, sizeof(seq));
+            memcpy(sendbuf + sizeof(hit_request_t) + sizeof(seq), &t_send, sizeof(t_send));
+        }
+
         if (quic_send(client, sendbuf, send_len) < 0) {
             g_send_refused++;
             if (rec_idx >= 0) g_records[rec_idx].refused = 1;
@@ -536,6 +577,7 @@ int main(int argc, char *argv[]) {
     print_rtt_summary();
     if (g_send_refused) printf("Refused by quic_send (never sent): %d\n", g_send_refused);
     if (g_frames_out) write_frames(g_frames_out);
+    if (frag_log_on()) write_ack_recs(g_frames_out);
     fflush(stdout);
 
     // stop first: acks delivered during teardown still reach on_client_recv
