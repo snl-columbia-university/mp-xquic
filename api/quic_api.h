@@ -29,6 +29,8 @@ typedef struct {
 
     const char *congestion;      /* "cubic", "bbrv1", ""bbrv2", "reno"*/
 
+    int sendmmsg_on;            /* 1 = Enable batch sending, 0 = disable batch sending*/
+    
     quic_recv_cb recv_cb;       /* Application receive callback */
     const char *qlog;                 /* Qlog file path */
     void *user_data;            /* User pointer passed to recv_cb */
@@ -47,6 +49,8 @@ typedef struct {
     const char *scheduler;      /* "minrtt", "pmp", "psp", "rmp", "spmp" */
 
     const char *congestion;      /* "cubic", "bbrv1", ""bbrv2", "reno"*/
+
+    int sendmmsg_on;            /* 1 = Enable batch sending, 0 = disable batch sending*/
 
     quic_recv_cb recv_cb;       /* Application receive callback */
     const char *qlog;                 /* Qlog file path */
