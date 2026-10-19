@@ -61,6 +61,9 @@ static int g_cur_frame_id    = -1;      // frame currently being emitted
 static int g_skip_frame_id   = -2;      // frame being skipped (-2 = none)
 static int g_frames_sent     = 0;
 static int g_frames_skipped  = 0;
+static int g_rtp = 0;                   // -R: QUIC-in-RTP encapsulation
+static int g_pdu_set = 0;               // -P 1|2: dummy PDU Set marking ext (implies -R)
+static int g_rtp_tag = 0;               // -G: end-to-end RTP/QUIC tag check
 
 static double get_time_ms(void) {
     struct timespec ts;
@@ -280,6 +283,9 @@ void print_usage(const char *prog_name) {
     printf("  -D, --drop-on-unacked  Closed loop: skip a frame while -w frames are unacked\n");
     printf("  -w, --inflight N       Frames allowed outstanding with -D (default: 1)\n");
     printf("  -T, --ack-timeout-ms M With -D, write a frame off after M ms (default: 200)\n");
+    printf("  -R, --rtp              QUIC-in-RTP: 12 B RTP header on every UDP datagram (both ends)\n");
+    printf("  -P, --pdu-set 1|2      With RTP: dummy 3GPP PDU Set marking extension (implies -R)\n");
+    printf("  -G, --rtp-tag          With RTP: end-to-end tag check, rtp_check_*.csv (implies -R)\n");
     printf("  -h, --help             Show this help message\n");
 }
 
@@ -309,12 +315,15 @@ int main(int argc, char *argv[]) {
         {"drop-on-unacked", no_argument,  0, 'D'},
         {"inflight",   required_argument, 0, 'w'},
         {"ack-timeout-ms", required_argument, 0, 'T'},
+        {"rtp",        no_argument,       0, 'R'},
+        {"pdu-set",    required_argument, 0, 'P'},
+        {"rtp-tag",    no_argument,       0, 'G'},
         {"help",       no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
     int opt, option_index = 0;
-    while ((opt = getopt_long(argc, argv, "t:i:p:l:r:s:c:o:q:QF:Dw:T:h", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "t:i:p:l:r:s:c:o:q:QF:Dw:T:RP:Gh", long_options, &option_index)) != -1) {
         switch (opt) {
             case 't': trace_file    = optarg; break;
             case 'i': target_peer   = optarg; break;
@@ -330,6 +339,9 @@ int main(int argc, char *argv[]) {
             case 'D': g_drop_on_unacked = 1; break;
             case 'w': g_max_inflight = atoi(optarg); if (g_max_inflight < 1) g_max_inflight = 1; break;
             case 'T': g_ack_timeout_ms = atof(optarg); break;
+            case 'R': g_rtp = 1; break;
+            case 'P': g_pdu_set = atoi(optarg); break;
+            case 'G': g_rtp_tag = 1; break;
             case 'h': print_usage(argv[0]); return EXIT_SUCCESS;
             default:  print_usage(argv[0]); return EXIT_FAILURE;
         }
@@ -370,6 +382,7 @@ int main(int argc, char *argv[]) {
         .congestion = congestion,
         .enable_redundancy = 1,
         .sendmmsg_on = 1,
+        .rtp_encap = g_rtp, .rtp_pdu_set = g_pdu_set, .rtp_tag = g_rtp_tag,
         .qlog = out_qlog_file,
         .user_data = NULL
     };

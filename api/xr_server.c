@@ -35,6 +35,9 @@ typedef struct {
 static quic_endpoint_t *g_server = NULL;
 static quic_endpoint_t *g_server2 = NULL;
 static pending_ack_t g_pending_acks[MAX_PENDING] = {0};
+static int g_rtp = 0;                   // -R: QUIC-in-RTP encapsulation
+static int g_pdu_set = 0;               // -P 1|2: dummy PDU Set marking ext (implies -R)
+static int g_rtp_tag = 0;               // -G: end-to-end RTP/QUIC tag check
 
 static double get_time_ms(void) {
     struct timespec ts;
@@ -166,6 +169,9 @@ void print_usage(const char *prog_name) {
     printf("  -l, --local-ips IPS    Comma-separated local IPs to bind (default: 127.0.0.2,127.0.0.3)\n");
     printf("  -s, --scheduler ALG    Scheduler algorithm (default: pmp)\n");
     printf("  -c, --congestion ALG   Congestion algorithm (default: cubic)\n");
+    printf("  -R, --rtp              QUIC-in-RTP: 12 B RTP header on every UDP datagram (both ends)\n");
+    printf("  -P, --pdu-set 1|2      With RTP: dummy 3GPP PDU Set marking extension (implies -R)\n");
+    printf("  -G, --rtp-tag          With RTP: end-to-end tag check, rtp_check_*.csv (implies -R)\n");
     printf("  -h, --help             Show this help message\n");
 }
 
@@ -180,17 +186,23 @@ int main(int argc, char *argv[]) {
         {"scheduler",  required_argument, 0, 's'},
         {"congestion", required_argument, 0, 'c'},
         {"qlog",       required_argument, 0, 'q'},
+        {"rtp",        no_argument,       0, 'R'},
+        {"pdu-set",    required_argument, 0, 'P'},
+        {"rtp-tag",    no_argument,       0, 'G'},
         {"help",       no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
     int opt, option_index = 0;
-    while ((opt = getopt_long(argc, argv, "l:s:c:q:h", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "l:s:c:q:RP:Gh", long_options, &option_index)) != -1) {
         switch (opt) {
             case 'l': raw_local_ips = optarg; break;
             case 's': scheduler     = optarg; break;
             case 'c': congestion    = optarg; break;
             case 'q': out_qlog_file = optarg; break;
+            case 'R': g_rtp = 1; break;
+            case 'P': g_pdu_set = atoi(optarg); break;
+            case 'G': g_rtp_tag = 1; break;
             case 'h': print_usage(argv[0]); return EXIT_SUCCESS;
             default:  print_usage(argv[0]); return EXIT_FAILURE;
         }
@@ -221,6 +233,7 @@ int main(int argc, char *argv[]) {
         .congestion = congestion,
         .enable_redundancy = 1,
         .sendmmsg_on = 1,
+        .rtp_encap = g_rtp, .rtp_pdu_set = g_pdu_set, .rtp_tag = g_rtp_tag,
         .qlog = out_qlog_file,
         .user_data = &g_server
     };
