@@ -605,6 +605,10 @@ static void engine_timer_cb(int fd, short what, void *arg) {
 
 // QUIC packet read callback
 // QUIC packet read callback
+// XR_RECV_ONE=1: read one datagram per callback (old behaviour), for A/B tests
+static int recv_one(void) { static int v = -1; if (v < 0) v = getenv("XR_RECV_ONE") != NULL; return v; }
+#define RECV_BATCH_MAX 64   /* datagrams per callback; libevent calls again if more are queued */
+
 static void packet_read_cb(int fd, short what, void *arg) {
     quic_endpoint_t *ep = (quic_endpoint_t *)arg;
     if (!ep) return;
@@ -616,10 +620,11 @@ static void packet_read_cb(int fd, short what, void *arg) {
         return;
     }
     const struct sockaddr_in bound = local_addr;
+    const int max_batch = recv_one() ? 1 : RECV_BATCH_MAX;
     int got = 0;
 
-    /* drain the socket, then run the engine once for the batch */
-    while (1) {
+    /* drain the socket (up to max_batch), then run the engine once for the batch */
+    while (got < max_batch) {
         struct iovec iov = { .iov_base = buf, .iov_len = sizeof(buf) };
         char cmsg_buf[CMSG_SPACE(sizeof(struct in_pktinfo)) + CMSG_SPACE(sizeof(struct timespec))];
         struct msghdr msg = {
@@ -727,7 +732,8 @@ quic_endpoint_t *quic_client_start(const quic_client_config_t *config) {
     
     xqc_config_t cfg;
     xqc_engine_get_default_config(&cfg, XQC_ENGINE_CLIENT);
-    cfg.sendmmsg_on = config->sendmmsg_on;
+    /* XR_SENDMMSG=0|1 overrides the app setting (A/B tests) */
+    cfg.sendmmsg_on = getenv("XR_SENDMMSG") ? atoi(getenv("XR_SENDMMSG")) : config->sendmmsg_on;
 
     xqc_engine_callback_t eng_cb = {
         .set_event_timer = set_event_timer,
@@ -839,7 +845,8 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
 
     xqc_config_t cfg;
     xqc_engine_get_default_config(&cfg, XQC_ENGINE_SERVER);
-    cfg.sendmmsg_on = config->sendmmsg_on;
+    /* XR_SENDMMSG=0|1 overrides the app setting (A/B tests) */
+    cfg.sendmmsg_on = getenv("XR_SENDMMSG") ? atoi(getenv("XR_SENDMMSG")) : config->sendmmsg_on;
 
     xqc_engine_callback_t eng_cb = {
         .set_event_timer = set_event_timer,
