@@ -1,9 +1,5 @@
 #define _GNU_SOURCE
 
-#ifndef ENABLE_DEBUG_LOGS
-#define ENABLE_DEBUG_LOGS 0
-#endif
-
 #include "quic_api.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,14 +18,18 @@
 #include <xquic/xquic.h>
 #include <sys/socket.h>
 
-#define MAX_PATHS 16
+#ifndef ACTIVE_LOG_LEVEL
+#define ACTIVE_LOG_LEVEL 4 /* 0=DEBUG, 1=INFO, 2=WARN, 3=ERROR, 4=OFF */
+#endif
 
-#ifndef XQC_SOCKET_ERROR
+#define MAX_PATHS 16
+#define MAX_BATCH_SIZE 64
+#define MAX_DGRAM_SIZE 2000
+#define DGRAM_HEADER_SIZE 2
+#define DGRAM_HEADER_WIN 2048
+
 #define XQC_SOCKET_ERROR -1
-#endif
-#ifndef XQC_SOCKET_EAGAIN
 #define XQC_SOCKET_EAGAIN -2
-#endif
 
 typedef union {
     struct cmsghdr cm;
@@ -63,12 +63,10 @@ static void quic_log(quic_log_level_t level, const char *fmt, ...) {
     va_end(args);
 }
 
-#define LOG_DEBUG(...) quic_log(QUIC_LOG_DEBUG, __VA_ARGS__)
-#define LOG_INFO(...)  quic_log(QUIC_LOG_INFO,  __VA_ARGS__)
-#define LOG_WARN(...)  quic_log(QUIC_LOG_WARN,  __VA_ARGS__)
-#define LOG_ERROR(...) quic_log(QUIC_LOG_ERROR, __VA_ARGS__)
-
-/* --- DATA STRUCTURES & DEFINITIONS --- */
+#define LOG_DEBUG(...) do { if (ACTIVE_LOG_LEVEL <= 0) quic_log(QUIC_LOG_DEBUG, __VA_ARGS__); } while(0)
+#define LOG_INFO(...)  do { if (ACTIVE_LOG_LEVEL <= 1) quic_log(QUIC_LOG_INFO,  __VA_ARGS__); } while(0)
+#define LOG_WARN(...)  do { if (ACTIVE_LOG_LEVEL <= 2) quic_log(QUIC_LOG_WARN,  __VA_ARGS__); } while(0)
+#define LOG_ERROR(...) do { if (ACTIVE_LOG_LEVEL <= 3) quic_log(QUIC_LOG_ERROR, __VA_ARGS__); } while(0)
 
 typedef enum {
     QUIC_MODE_CLIENT,
@@ -95,11 +93,10 @@ struct quic_endpoint {
     int num_local_addrs;
     int num_paths;
 
-    uint64_t quic_dgram_id;
-    uint64_t client_dgram_id;
-    uint64_t server_dgram_id;
-    uint64_t max_dgram_id;
-    uint64_t dgram_id_mask;
+    uint16_t msg_id;
+    uint64_t dgram_header_id;
+    uint16_t max_dgram_header_id;
+    uint64_t dgram_header_win[DGRAM_HEADER_WIN / 64];
 
     quic_recv_cb         app_recv_cb;
     void                *app_user_data;
@@ -148,28 +145,36 @@ static xqc_cong_ctrl_callback_t get_cong_ctrl_cb(const char *name) {
     return xqc_cubic_cb;
 }
 
-static int is_new_datagram(uint64_t id, uint64_t *max_dgram_id, uint64_t *dgram_id_mask) {
-    if (id > *max_dgram_id) {
-        uint64_t diff = id - *max_dgram_id;
-        if (diff >= 64) {
-            *dgram_id_mask = 1;
+static int is_new_datagram_win(uint16_t id, uint16_t *max_dgram_header_id, uint64_t *seen) {
+#define SEEN_BIT(i) (seen[((i) % DGRAM_HEADER_WIN) / 64] & (1ULL << ((i) % 64)))
+#define SEEN_SET(i) (seen[((i) % DGRAM_HEADER_WIN) / 64] |= (1ULL << ((i) % 64)))
+#define SEEN_CLR(i) (seen[((i) % DGRAM_HEADER_WIN) / 64] &= ~(1ULL << ((i) % 64)))
+
+    int16_t diff = (int16_t)(id - *max_dgram_header_id);
+
+    if (diff > 0) {
+        if (diff >= DGRAM_HEADER_WIN) {
+            memset(seen, 0, DGRAM_HEADER_WIN / 8);
         } else {
-            *dgram_id_mask = (*dgram_id_mask << diff) | 1;
+            for (uint16_t i = *max_dgram_header_id + 1; i != id; i++) {
+                SEEN_CLR(i);
+            }
         }
-        *max_dgram_id = id;
+        SEEN_SET(id);
+        *max_dgram_header_id = id;
         return 1;
-    } else {
-        uint64_t diff = *max_dgram_id - id;
-        if (diff >= 64) {
-            return 0;
-        }
-        if (*dgram_id_mask & (1ULL << diff)) {
-            return 0;
-        } else {
-            *dgram_id_mask |= (1ULL << diff);
-            return 1;
-        }
     }
+
+    if (-diff >= DGRAM_HEADER_WIN) return 0;
+    
+    if (SEEN_BIT(id)) return 0;
+    
+    SEEN_SET(id);
+    return 1;
+
+#undef SEEN_BIT
+#undef SEEN_SET
+#undef SEEN_CLR
 }
 
 // QUIC logging callback
@@ -187,6 +192,23 @@ static void qlog_event_write(qlog_event_importance_t imp, const void *buf,
     }
 }
 
+// QUIC socket helper
+static inline void resolve_path_addrs(quic_endpoint_t *ep, uint64_t path_id, 
+                                      const struct sockaddr *_peer_addr, socklen_t _peer_addrlen,
+                                      struct sockaddr_in **peer_addr, struct sockaddr_in **local_addr, 
+                                      socklen_t *namelen) 
+{
+    if (ep->mode == QUIC_MODE_CLIENT) {
+        *peer_addr = &ep->peer_addrs[(path_id + ep->path_idx) % ep->num_peer_addrs];
+        *local_addr = &ep->local_addrs[(path_id / ep->num_peer_addrs) % ep->num_local_addrs];
+        *namelen = sizeof(struct sockaddr_in);
+    } else {
+        *peer_addr = (struct sockaddr_in *)_peer_addr;
+        *local_addr = &ep->local_addrs[path_id % ep->num_local_addrs];
+        *namelen = _peer_addrlen;
+    }
+}
+
 // QUIC socket callbacks
 static ssize_t write_socket(const unsigned char *buf, size_t size,
                             const struct sockaddr *peer_addr, socklen_t peer_addrlen,
@@ -201,7 +223,6 @@ static ssize_t write_socket(const unsigned char *buf, size_t size,
     }
     return res;
 }
-
 static ssize_t write_socket_ex(uint64_t path_id, const unsigned char *buf, size_t size,
                                const struct sockaddr *_peer_addr, socklen_t _peer_addrlen,
                                void *user_data) 
@@ -209,15 +230,9 @@ static ssize_t write_socket_ex(uint64_t path_id, const unsigned char *buf, size_
     quic_endpoint_t *ep = (quic_endpoint_t *)user_data;
     if (!ep || ep->quic_fd < 0) return XQC_SOCKET_ERROR;
 
-    struct sockaddr_in *peer_addr = (ep->mode == QUIC_MODE_CLIENT) 
-        ? &ep->peer_addrs[(path_id + ep->path_idx) % ep->num_peer_addrs] 
-        : (struct sockaddr_in *)_peer_addr;
-
-    struct sockaddr_in *local_addr = (ep->mode == QUIC_MODE_CLIENT) 
-        ? &ep->local_addrs[(path_id / ep->num_peer_addrs) % ep->num_local_addrs] 
-        : &ep->local_addrs[path_id % ep->num_local_addrs];
-
-    const socklen_t namelen = (ep->mode == QUIC_MODE_CLIENT) ? sizeof(*peer_addr) : _peer_addrlen;
+    struct sockaddr_in *peer_addr, *local_addr;
+    socklen_t namelen;
+    resolve_path_addrs(ep, path_id, _peer_addr, _peer_addrlen, &peer_addr, &local_addr, &namelen);
 
     struct iovec iov = { (void *)buf, size };
     cmsg_pktinfo_t cbuf = {0};
@@ -236,11 +251,9 @@ static ssize_t write_socket_ex(uint64_t path_id, const unsigned char *buf, size_
     cmsg->cmsg_type  = IP_PKTINFO;
     cmsg->cmsg_len   = CMSG_LEN(sizeof(struct in_pktinfo));
     ((struct in_pktinfo *)CMSG_DATA(cmsg))->ipi_spec_dst = local_addr->sin_addr;
-#if ENABLE_DEBUG_LOGS
     LOG_DEBUG("[%s-quic] write_socket_ex: calling write_socket for path_id %lu\n",
             ep->mode == QUIC_MODE_SERVER ? "server" : "client",
             (unsigned long)path_id);
-#endif
     ssize_t res = sendmsg(ep->quic_fd, &msg, 0);
     if (res < 0) {
         return (errno == EAGAIN || errno == EWOULDBLOCK) ? XQC_SOCKET_EAGAIN : XQC_SOCKET_ERROR;
@@ -274,7 +287,6 @@ static ssize_t write_mmsg(const struct iovec *msg_iov, unsigned int vlen,
     }
     return sent;
 }
-
 static ssize_t write_mmsg_ex(uint64_t path_id,
                              const struct iovec *msg_iov, unsigned int vlen,
                              const struct sockaddr *_peer_addr, socklen_t _peer_addrlen,
@@ -285,15 +297,9 @@ static ssize_t write_mmsg_ex(uint64_t path_id,
         return XQC_SOCKET_ERROR;
     }
 
-    struct sockaddr_in *peer_addr = (ep->mode == QUIC_MODE_CLIENT) 
-        ? &ep->peer_addrs[(path_id + ep->path_idx) % ep->num_peer_addrs] 
-        : (struct sockaddr_in *)_peer_addr;
-
-    struct sockaddr_in *local_addr = (ep->mode == QUIC_MODE_CLIENT) 
-        ? &ep->local_addrs[(path_id / ep->num_peer_addrs) % ep->num_local_addrs] 
-        : &ep->local_addrs[path_id % ep->num_local_addrs];
-
-    const socklen_t namelen = (ep->mode == QUIC_MODE_CLIENT) ? sizeof(*peer_addr) : _peer_addrlen;
+    struct sockaddr_in *peer_addr, *local_addr;
+    socklen_t namelen;
+    resolve_path_addrs(ep, path_id, _peer_addr, _peer_addrlen, &peer_addr, &local_addr, &namelen);
 
     struct mmsghdr msgs[vlen];
     cmsg_pktinfo_t cbufs[vlen];
@@ -317,11 +323,11 @@ static ssize_t write_mmsg_ex(uint64_t path_id,
         cmsg->cmsg_len   = CMSG_LEN(sizeof(struct in_pktinfo));
         ((struct in_pktinfo *)CMSG_DATA(cmsg))->ipi_spec_dst = local_addr->sin_addr;
     }
-#if ENABLE_DEBUG_LOGS
+    
     LOG_DEBUG("[%s-quic] write_mmsg_ex: calling sendmmsg for path_id %lu (batch of %u datagrams)\n",
              ep->mode == QUIC_MODE_SERVER ? "server" : "client",
              (unsigned long)path_id, vlen);
-#endif
+                      
     int sent = sendmmsg(ep->quic_fd, msgs, vlen, 0);
     if (sent < 0) {
         return (errno == EAGAIN || errno == EWOULDBLOCK) ? XQC_SOCKET_EAGAIN : XQC_SOCKET_ERROR;
@@ -372,9 +378,9 @@ static int stream_read_notify(xqc_stream_t *strm, void *user_data) {
     uint8_t fin = 0;
     while (1) {
         ssize_t n = xqc_stream_recv(strm, buf, sizeof(buf), &fin);
-#if ENABLE_DEBUG_LOGS
+        
         LOG_DEBUG("[quic] stream_read_notify called for stream %lu, received %zd bytes\n", (unsigned long)xqc_stream_id(strm), n);
-#endif
+
         if (n > 0) {
             if (ep->app_recv_cb) {
                 ep->app_recv_cb(buf, (size_t)n, ep->app_user_data);
@@ -404,10 +410,10 @@ static int conn_create_notify(xqc_connection_t *conn, const xqc_cid_t *cid, void
     quic_endpoint_t *ep = (quic_endpoint_t *)user_data;
     if (!ep) return -1;
     ep->conn = conn;
-    ep->max_dgram_id = 0;
-    ep->dgram_id_mask = 0;
-    ep->server_dgram_id = 0;
-    ep->quic_dgram_id = 1;
+    ep->msg_id = 0;
+    ep->dgram_header_id = 0;
+    ep->max_dgram_header_id = 0;
+    memset(ep->dgram_header_win, 0, sizeof(ep->dgram_header_win));
     xqc_datagram_set_user_data(conn, ep);
     xqc_conn_set_alp_user_data(conn, ep);
     return 0; 
@@ -446,7 +452,7 @@ static void conn_handshake_finished(xqc_connection_t *conn, void *user_data, voi
     if (!ep) return;
     ep->conn = conn;
     ep->connected = 1;
-    if (ep->mode == QUIC_MODE_CLIENT && !ep->quic_dgram_id) {
+    if (ep->mode == QUIC_MODE_CLIENT && !ep->datagram_mode) {
         ep->stream = xqc_stream_create(ep->engine, &ep->cid, NULL, user_data);
         if (ep->stream) {
             LOG_INFO("[client-quic] stream %lu created\n", (unsigned long)xqc_stream_id(ep->stream));
@@ -462,7 +468,7 @@ static int server_accept(xqc_engine_t *eng, xqc_connection_t *conn, const xqc_ci
     quic_endpoint_t *ep = (quic_endpoint_t *)user_data;
     if (!ep) return -1;
     ep->conn = conn;
-    ep->max_dgram_id = 0;
+    ep->max_dgram_header_id = 0;
     xqc_conn_set_alp_user_data(conn, ep);
     xqc_datagram_set_user_data(conn, ep);
     return 0;
@@ -493,35 +499,29 @@ int path_created_notify(xqc_connection_t *conn, const xqc_cid_t *cid, uint64_t p
 // QUIC datagram callbacks
 static void datagram_read_notify(xqc_connection_t *conn, void *user_data, const void *data, size_t data_len, uint64_t flags) {
     quic_endpoint_t *ep = (quic_endpoint_t *)user_data;
-    if (!ep || data_len <= 8) return;
+    if (!ep || data_len <= DGRAM_HEADER_SIZE) return;
 
-    uint64_t net_val;
-    memcpy(&net_val, data, sizeof(uint64_t));
-    uint64_t remote_dgram_id = be64toh(net_val);
+    uint16_t net_val;
+    memcpy(&net_val, data, DGRAM_HEADER_SIZE);
+    uint16_t dgram_header_id = ntohs(net_val);
 
-    if (!is_new_datagram(remote_dgram_id, &ep->max_dgram_id, &ep->dgram_id_mask)) {
-#if ENABLE_DEBUG_LOGS
-        LOG_DEBUG("[quic] duplicate datagram %ld (<=%ld) recv\n", remote_dgram_id, ep->max_dgram_id);
-#endif
+    if (!is_new_datagram_win(dgram_header_id, &ep->max_dgram_header_id, ep->dgram_header_win)) {
+        LOG_DEBUG("[quic] duplicate datagram %u (<=%u) recv\n", dgram_header_id, ep->max_dgram_header_id);
         return;
     }
 
-    const uint8_t *payload = (const uint8_t *)data + 8;
-    size_t payload_len = data_len - 8;
+    const uint8_t *payload = (const uint8_t *)data + DGRAM_HEADER_SIZE;
+    size_t payload_len = data_len - DGRAM_HEADER_SIZE;
 
     if (ep->app_recv_cb) {
         ep->app_recv_cb(payload, payload_len, ep->app_user_data);
     }
 }
 static void datagram_write_notify(xqc_connection_t *conn, void *user_data) { 
-#if ENABLE_DEBUG_LOGS
     LOG_DEBUG("[quic] datagram sent to peer\n");
-#endif
 }
 static void datagram_acked_notify(xqc_connection_t *conn, uint64_t dgram_id, void *user_data) { 
-#if ENABLE_DEBUG_LOGS
     LOG_DEBUG("[quic] datagram %lu acked\n", dgram_id); 
-#endif
 }
 static xqc_int_t datagram_lost_notify(xqc_connection_t *conn, uint64_t dgram_id, void *user_data) { 
     LOG_WARN("[quic] datagram %lu lost\n", dgram_id); 
@@ -541,7 +541,6 @@ static void engine_timer_cb(int fd, short what, void *arg) {
     xqc_engine_main_logic(ep->engine);
 }
 
-// QUIC packet read callback
 // QUIC packet read callback
 static void packet_read_cb(int fd, short what, void *arg) {
     quic_endpoint_t *ep = (quic_endpoint_t *)arg;
@@ -570,7 +569,7 @@ static void packet_read_cb(int fd, short what, void *arg) {
         };
 
         ssize_t n = recvmsg(fd, &msg, 0);
-        if (n <= 0) { // Catch both EAGAIN (< 0) and empty/EOF datagrams (== 0)
+        if (n <= 0) {
             break;
         }
 
@@ -585,17 +584,19 @@ static void packet_read_cb(int fd, short what, void *arg) {
                 break;
             }
         }
-#if ENABLE_DEBUG_LOGS
-        char src_ip[INET_ADDRSTRLEN], dst_ip[INET_ADDRSTRLEN], hdr_dst_ip[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &peer_addr.sin_addr, src_ip, sizeof(src_ip));
-        inet_ntop(AF_INET, &local_addr.sin_addr, dst_ip, sizeof(dst_ip));
-        inet_ntop(AF_INET, &hdr_dst, hdr_dst_ip, sizeof(hdr_dst_ip));
 
-        LOG_DEBUG("[%s-quic] packet_read_cb received %zd bytes from %s:%d to %s:%d (header dst %s)\n",
-                  ep->mode == QUIC_MODE_CLIENT ? "client" : "server", n,
-                  src_ip, ntohs(peer_addr.sin_port),
-                  dst_ip, ntohs(local_addr.sin_port), hdr_dst_ip);
-#endif
+        if (ACTIVE_LOG_LEVEL <= QUIC_LOG_DEBUG) {
+            char src_ip[INET_ADDRSTRLEN], dst_ip[INET_ADDRSTRLEN], hdr_dst_ip[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &peer_addr.sin_addr, src_ip, sizeof(src_ip));
+            inet_ntop(AF_INET, &local_addr.sin_addr, dst_ip, sizeof(dst_ip));
+            inet_ntop(AF_INET, &hdr_dst, hdr_dst_ip, sizeof(hdr_dst_ip));
+
+            LOG_DEBUG("[%s-quic] packet_read_cb received %zd bytes from %s:%d to %s:%d (header dst %s)\n",
+                    ep->mode == QUIC_MODE_CLIENT ? "client" : "server", n,
+                    src_ip, ntohs(peer_addr.sin_port),
+                    dst_ip, ntohs(local_addr.sin_port), hdr_dst_ip);
+        }
+
         xqc_engine_packet_process(ep->engine, buf, n,
                                   (struct sockaddr *)&local_addr, sizeof(local_addr),
                                   (struct sockaddr *)&peer_addr, msg.msg_namelen,
@@ -605,6 +606,33 @@ static void packet_read_cb(int fd, short what, void *arg) {
     xqc_engine_finish_recv(ep->engine);
 }
 
+// External QUIC Endpoint Initialization
+static int init_quic_socket_and_events(quic_endpoint_t *ep, uint16_t port) {
+    ep->quic_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (ep->quic_fd < 0) return -1;
+
+    fcntl(ep->quic_fd, F_SETFL, O_NONBLOCK);
+    int reuse = 1;
+    setsockopt(ep->quic_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    int pktinfo = 1;
+    setsockopt(ep->quic_fd, IPPROTO_IP, IP_PKTINFO, &pktinfo, sizeof(pktinfo));
+
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = htonl(INADDR_ANY),
+        .sin_port = htons(port)
+    };
+    if (bind(ep->quic_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) return -1;
+
+    ep->quic_ev = event_new(ep->eb, ep->quic_fd, EV_READ | EV_PERSIST, packet_read_cb, ep);
+    event_add(ep->quic_ev, NULL);
+
+    ep->timer_ev = event_new(ep->eb, -1, 0, engine_timer_cb, ep);
+    struct timeval tv = {0, 10000};
+    event_add(ep->timer_ev, &tv);
+
+    return 0;
+}
 quic_endpoint_t *quic_client_start(const quic_client_config_t *config) {
     if (!config) return NULL;
 
@@ -643,10 +671,10 @@ quic_endpoint_t *quic_client_start(const quic_client_config_t *config) {
     };
 
     if (config->enable_datagram) {
-        ep->quic_dgram_id = 1;
-        ep->client_dgram_id = 0;
-        ep->max_dgram_id = 0;
-        ep->dgram_id_mask = 0;
+        ep->msg_id = 0;
+        ep->dgram_header_id = 0;
+        ep->max_dgram_header_id = 0;
+        memset(ep->dgram_header_win, 0, sizeof(ep->dgram_header_win));
     }
 
     for (size_t i = 0; i < config->num_peer_addrs && i < MAX_PATHS; i++) {
@@ -721,26 +749,10 @@ quic_endpoint_t *quic_client_start(const quic_client_config_t *config) {
     };
     xqc_engine_register_alpn(ep->engine, "raw", 3, &ap_cbs, ep);
 
-    ep->quic_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    fcntl(ep->quic_fd, F_SETFL, O_NONBLOCK);
-    int reuse = 1;
-    setsockopt(ep->quic_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-    int pktinfo = 1;
-    setsockopt(ep->quic_fd, IPPROTO_IP, IP_PKTINFO, &pktinfo, sizeof(pktinfo));
-
-    struct sockaddr_in addr = {
-        .sin_family = AF_INET,
-        .sin_addr.s_addr = htonl(INADDR_ANY),
-        .sin_port = htons(0)
-    };
-    bind(ep->quic_fd, (struct sockaddr*)&addr, sizeof(addr));
-
-    ep->quic_ev = event_new(ep->eb, ep->quic_fd, EV_READ | EV_PERSIST, packet_read_cb, ep);
-    event_add(ep->quic_ev, NULL);
-
-    ep->timer_ev = event_new(ep->eb, -1, 0, engine_timer_cb, ep);
-    struct timeval tv = {0, 10000};
-    event_add(ep->timer_ev, &tv);
+    if (init_quic_socket_and_events(ep, 0) < 0) {
+        free(ep);
+        return NULL;
+    }
 
     xqc_conn_ssl_config_t conn_ssl_config = {0};
 
@@ -838,10 +850,10 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
     }
 
     if (config->enable_datagram) {
-        ep->quic_dgram_id = 1;
-        ep->server_dgram_id = 0;
-        ep->max_dgram_id = 0;
-        ep->dgram_id_mask = 0;
+        ep->msg_id = 0;
+        ep->dgram_header_id = 0;
+        ep->max_dgram_header_id = 0;
+        memset(ep->dgram_header_win, 0, sizeof(ep->dgram_header_win));
     }
     if (ep->num_paths == 0) ep->num_paths = 1;
 
@@ -871,46 +883,93 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
     };
     xqc_engine_register_alpn(ep->engine, "raw", 3, &ap_cbs, ep);
 
-    ep->quic_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    fcntl(ep->quic_fd, F_SETFL, O_NONBLOCK);
-    int reuse = 1;
-    setsockopt(ep->quic_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-    int pktinfo = 1;
-    setsockopt(ep->quic_fd, IPPROTO_IP, IP_PKTINFO, &pktinfo, sizeof(pktinfo));
-
-    struct sockaddr_in addr = {
-        .sin_family = AF_INET,
-        .sin_addr.s_addr = htonl(INADDR_ANY),
-        .sin_port = htons(config->listen_port ? config->listen_port : 8000)
-    };
-    bind(ep->quic_fd, (struct sockaddr*)&addr, sizeof(addr));
-
-    ep->quic_ev = event_new(ep->eb, ep->quic_fd, EV_READ | EV_PERSIST, packet_read_cb, ep);
-    event_add(ep->quic_ev, NULL);
-
-    ep->timer_ev = event_new(ep->eb, -1, 0, engine_timer_cb, ep);
-    struct timeval tv = {0, 10000};
-    event_add(ep->timer_ev, &tv);
+    uint16_t listen_port = config->listen_port ? config->listen_port : 8000;
+    if (init_quic_socket_and_events(ep, listen_port) < 0) {
+        free(ep);
+        return NULL;
+    }
 
     return ep;
 }
 
+// External QUIC send helper
+static inline uint64_t pack_dgram_id(uint16_t msg_id, uint8_t seq, uint8_t max_seq, uint16_t dgram_header_id) {
+    return ((uint64_t)msg_id     << 48) | 
+           ((uint64_t)seq        << 40) |
+           ((uint64_t)max_seq    << 32) | 
+           ((uint64_t)dgram_header_id << 16) |  
+           0x0000;
+}
+
+// External QUIC send endpoints
 int quic_send(quic_endpoint_t *ep, const uint8_t *data, size_t len) {
     if (!ep || !ep->conn) return -1;
 
     if (ep->datagram_mode) {
-        uint8_t buf[2000];
-        if (len + 8 > sizeof(buf)) return -1;
+        uint8_t buf[MAX_DGRAM_SIZE];
+        if (len + DGRAM_HEADER_SIZE > sizeof(buf)) return -1;
 
-        uint64_t dgram_id = (ep->mode == QUIC_MODE_CLIENT) ? ep->client_dgram_id++ : ep->server_dgram_id++;
-        uint64_t net_val = htobe64(dgram_id);
-        memcpy(buf, &net_val, sizeof(uint64_t));
-        memcpy(buf + 8, data, len);
+        uint16_t dgram_header_id = ep->dgram_header_id++;
+        uint64_t dgram_id = pack_dgram_id(ep->msg_id++, 0, 0, dgram_header_id);
 
-        return xqc_datagram_send(ep->conn, buf, len + 8, &ep->quic_dgram_id, 1);
+        uint16_t net_header_id = htons(dgram_header_id);
+        memcpy(buf, &net_header_id, DGRAM_HEADER_SIZE);
+        memcpy(buf + DGRAM_HEADER_SIZE, data, len);
+
+        LOG_DEBUG("[quic] packed dgram: msg_id=%u, seq=0, max_seq=0, wire_id=%u, full_dgram_id=%lu\n", 
+            ep->msg_id - 1, dgram_header_id, (unsigned long)dgram_id);
+
+        return xqc_datagram_send(ep->conn, buf, len + DGRAM_HEADER_SIZE, &dgram_id, 1);
     } else if (ep->stream) {
         return (int)xqc_stream_send(ep->stream, (unsigned char *)data, len, 0);
     }
+    return -1;
+}
+int quic_send_msg(quic_endpoint_t *ep, struct iovec *iov, size_t iov_size) {
+    if (!ep || !ep->conn || !iov || iov_size == 0) return -1;
+
+    if (ep->datagram_mode) {
+        if (iov_size > MAX_BATCH_SIZE) return -1;
+
+        struct iovec batch_iov[MAX_BATCH_SIZE];
+        uint64_t out_dgram_ids[MAX_BATCH_SIZE];
+        static __thread uint8_t buf[MAX_BATCH_SIZE][MAX_DGRAM_SIZE]; 
+
+        uint16_t batch_msg_id = ep->msg_id++;
+        uint8_t max_seq = (uint8_t)(iov_size - 1);
+
+        for (size_t i = 0; i < iov_size; i++) {
+            size_t len = iov[i].iov_len;
+            if (len + DGRAM_HEADER_SIZE > MAX_DGRAM_SIZE) return -1;
+
+            uint16_t dgram_header_id = ep->dgram_header_id++;
+            out_dgram_ids[i] = pack_dgram_id(batch_msg_id, (uint8_t)i, max_seq, dgram_header_id);
+
+            uint16_t net_wire_id = htons(dgram_header_id);
+            memcpy(buf[i], &net_wire_id, DGRAM_HEADER_SIZE);
+            memcpy(buf[i] + DGRAM_HEADER_SIZE, iov[i].iov_base, len);
+
+            LOG_DEBUG("[quic] packed dgram: msg_id=%u, seq=%u, max_seq=%u, wire_id=%u, full_dgram_id=%lu\n", 
+                batch_msg_id, (unsigned int)i, (unsigned int)(iov_size - 1), dgram_header_id, (unsigned long)out_dgram_ids[i]);
+
+            batch_iov[i].iov_base = buf[i];
+            batch_iov[i].iov_len  = len + DGRAM_HEADER_SIZE;
+        }
+
+        size_t sent_cnt = 0;
+        size_t sent_bytes = 0;
+        
+        return xqc_datagram_send_multiple(ep->conn, batch_iov, out_dgram_ids, iov_size, &sent_cnt, &sent_bytes, 1);
+
+    } else if (ep->stream) {
+        int ret = 0;
+        for (size_t i = 0; i < iov_size; i++) {
+            ret = (int)xqc_stream_send(ep->stream, iov[i].iov_base, iov[i].iov_len, 0);
+            if (ret < 0) break;
+        }
+        return ret;
+    }
+
     return -1;
 }
 
