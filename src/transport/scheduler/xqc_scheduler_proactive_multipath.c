@@ -29,6 +29,7 @@ xqc_proactive_multipath_scheduler_get_path(void *scheduler,
     packet_out->po_experimental_redundancy_mask = 0;
     packet_out->po_experimental_redundancy_factor = 1;
 
+
     xqc_list_head_t *pos, *next;
     xqc_path_ctx_t *path;
 
@@ -134,8 +135,9 @@ skip_path:
     if (best_path == NULL) {
         xqc_log(conn->log, XQC_LOG_ERROR, "|No available paths to schedule|conn:%p|", conn);
     } else {
-        xqc_log(conn->log, XQC_LOG_DEBUG, "|best path chosen:%ui|pn:%ui|final_redundancy_mask:%ui|",
+        xqc_log(conn->log, XQC_LOG_DEBUG, "|best path chosen:%ui|pn:%ui|dgram_id:%ui|final_redundancy_mask:%ui|",
                 best_path->path_id, packet_out->po_pkt.pkt_num, 
+                (unsigned long long)packet_out->po_dgram_id,
                 packet_out->po_experimental_redundancy_mask);
     }
 

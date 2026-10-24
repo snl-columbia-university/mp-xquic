@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/uio.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -71,6 +72,11 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config);
  * Send data over QUIC (Datagram or Stream depending on mode).
  */
 int quic_send(quic_endpoint_t *ep, const uint8_t *data, size_t len);
+
+/**
+ * Send batch data over QUIC (Datagram or Stream depending on mode).
+ */
+int quic_send_msg(quic_endpoint_t *ep, struct iovec *iov, size_t iov_size);
 
 /**
  * Stop endpoint event loop and free resources.

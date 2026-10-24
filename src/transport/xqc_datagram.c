@@ -157,6 +157,10 @@ xqc_int_t xqc_datagram_send(xqc_connection_t *conn, void *data,
         return -XQC_EPARAM;
     }
 
+    if (dgram_id == NULL) {
+    return -XQC_EPARAM;
+    }
+
     if (conn->conn_state >= XQC_CONN_STATE_CLOSING) {
         xqc_conn_log(conn, XQC_LOG_INFO, "|conn closing, cannot send datagram|size:%ud|", data_len);
         return -XQC_CLOSING;
@@ -185,7 +189,6 @@ xqc_int_t xqc_datagram_send(xqc_connection_t *conn, void *data,
     int ret;
     xqc_pkt_type_t pkt_type = XQC_PTYPE_SHORT_HEADER;
     int support_0rtt = xqc_conn_is_ready_to_send_early_data(conn);
-    uint64_t dg_id;
 
     if (!(conn->conn_flag & XQC_CONN_FLAG_CAN_SEND_1RTT)) {
         if ((conn->conn_type == XQC_CONN_TYPE_CLIENT) 
@@ -216,7 +219,7 @@ xqc_int_t xqc_datagram_send(xqc_connection_t *conn, void *data,
 
     xqc_conn_check_app_limit(conn);
 
-    ret = xqc_write_datagram_frame_to_packet(conn, pkt_type, data, data_len, &dg_id, XQC_FALSE, qos_level);
+    ret = xqc_write_datagram_frame_to_packet(conn, pkt_type, data, data_len, dgram_id, XQC_TRUE, qos_level);
 
     if (ret < 0) {
         xqc_log(conn->log, XQC_LOG_ERROR, "|write_datagram_frame_to_packet_error|");
@@ -227,16 +230,12 @@ xqc_int_t xqc_datagram_send(xqc_connection_t *conn, void *data,
     /* 0RTT failure requires fallback to 1RTT, save the original send data */
     if (pkt_type == XQC_PTYPE_0RTT) {
         /* buffer 0RTT packet */
-        ret = xqc_conn_buff_0rtt_datagram(conn, data, data_len, dg_id, qos_level);
+        ret = xqc_conn_buff_0rtt_datagram(conn, data, data_len, *dgram_id, qos_level);
         if (ret < 0) {
             xqc_log(conn->log, XQC_LOG_ERROR, "|unable_to_buffer_0rtt_datagram_data_error|");
             XQC_CONN_ERR(conn, TRA_INTERNAL_ERROR);
             return ret;
         }
-    }
-
-    if (dgram_id) {
-        *dgram_id = dg_id;
     }
 
     xqc_engine_remove_wakeup_queue(conn->engine, conn);
@@ -277,7 +276,7 @@ xqc_datagram_send_multiple(xqc_connection_t *conn,
     struct iovec *iov, uint64_t *dgram_id_list, size_t iov_size, 
     size_t *sent_cnt, size_t *sent_bytes, xqc_data_qos_level_t qos_level)
 {
-    return xqc_datagram_send_multiple_internal(conn, iov, dgram_id_list, iov_size, sent_cnt, sent_bytes, qos_level, XQC_FALSE);
+    return xqc_datagram_send_multiple_internal(conn, iov, dgram_id_list, iov_size, sent_cnt, sent_bytes, qos_level, XQC_TRUE);
 }
 
 xqc_int_t 

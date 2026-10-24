@@ -181,7 +181,6 @@ int main(int argc, char *argv[]) {
         double now = get_time_ms();
         for (int i = 0; i < MAX_PENDING; i++) {
             if (g_pending_acks[i].active && now >= g_pending_acks[i].target_send_time_ms) {
-                printf(">>> [SERVER ACK SEND] hitId=%d to client_%d\n", g_pending_acks[i].ack.hit_id, g_pending_acks[i].ack.client_id);
                 if (g_server) {
                     quic_send(g_server, (const uint8_t *)&g_pending_acks[i].ack, sizeof(hit_ack_t));
                 }
