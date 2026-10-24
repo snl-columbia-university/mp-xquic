@@ -896,8 +896,8 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
 static inline uint64_t pack_dgram_id(uint16_t msg_id, uint8_t seq, uint8_t max_seq, uint16_t dgram_header_id) {
     return ((uint64_t)msg_id     << 48) | 
            ((uint64_t)seq        << 40) |
-           ((uint64_t)max_seq    << 16) | 
-           ((uint64_t)dgram_header_id << 24) |  
+           ((uint64_t)max_seq    << 32) | 
+           ((uint64_t)dgram_header_id << 16) |  
            0x0000;
 }
 
