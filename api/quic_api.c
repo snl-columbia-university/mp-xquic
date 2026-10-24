@@ -893,11 +893,12 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
 }
 
 // External QUIC send helper
-static inline uint64_t pack_dgram_id(uint16_t msg_id, uint8_t seq, uint16_t wire_dedup) {
-    return ((uint64_t)msg_id << 48) | 
-           ((uint64_t)seq << 40) | 
-           ((uint64_t)wire_dedup << 24) | 
-           0x000000; // 24 bits reserved for future use
+static inline uint64_t pack_dgram_id(uint16_t msg_id, uint8_t seq, uint8_t max_seq, uint16_t dgram_header_id) {
+    return ((uint64_t)msg_id     << 48) | 
+           ((uint64_t)seq        << 40) |
+           ((uint64_t)max_seq    << 16) | 
+           ((uint64_t)dgram_header_id << 24) |  
+           0x0000;
 }
 
 // External QUIC send endpoints
@@ -909,13 +910,13 @@ int quic_send(quic_endpoint_t *ep, const uint8_t *data, size_t len) {
         if (len + DGRAM_HEADER_SIZE > sizeof(buf)) return -1;
 
         uint16_t dgram_header_id = ep->dgram_header_id++;
-        uint64_t dgram_id = pack_dgram_id(ep->msg_id++, 0, dgram_header_id);
+        uint64_t dgram_id = pack_dgram_id(ep->msg_id++, 0, 0, dgram_header_id);
 
         uint16_t net_header_id = htons(dgram_header_id);
         memcpy(buf, &net_header_id, DGRAM_HEADER_SIZE);
         memcpy(buf + DGRAM_HEADER_SIZE, data, len);
 
-        LOG_DEBUG("[quic] packed dgram: msg_id=%u, seq=0, wire_id=%u, full_dgram_id=%lu\n", 
+        LOG_DEBUG("[quic] packed dgram: msg_id=%u, seq=0, max_seq=0, wire_id=%u, full_dgram_id=%lu\n", 
             ep->msg_id - 1, dgram_header_id, (unsigned long)dgram_id);
 
         return xqc_datagram_send(ep->conn, buf, len + DGRAM_HEADER_SIZE, &dgram_id, 1);
@@ -935,20 +936,21 @@ int quic_send_msg(quic_endpoint_t *ep, struct iovec *iov, size_t iov_size) {
         static __thread uint8_t buf[MAX_BATCH_SIZE][MAX_DGRAM_SIZE]; 
 
         uint16_t batch_msg_id = ep->msg_id++;
+        uint8_t max_seq = (uint8_t)(iov_size - 1);
 
         for (size_t i = 0; i < iov_size; i++) {
             size_t len = iov[i].iov_len;
             if (len + DGRAM_HEADER_SIZE > MAX_DGRAM_SIZE) return -1;
 
             uint16_t dgram_header_id = ep->dgram_header_id++;
-            out_dgram_ids[i] = pack_dgram_id(batch_msg_id, (uint8_t)i, dgram_header_id);
+            out_dgram_ids[i] = pack_dgram_id(batch_msg_id, (uint8_t)i, max_seq, dgram_header_id);
 
             uint16_t net_wire_id = htons(dgram_header_id);
             memcpy(buf[i], &net_wire_id, DGRAM_HEADER_SIZE);
             memcpy(buf[i] + DGRAM_HEADER_SIZE, iov[i].iov_base, len);
 
-            LOG_DEBUG("[quic] packed dgram: msg_id=%u, seq=%u, wire_id=%u, full_dgram_id=%lu\n", 
-                batch_msg_id, (unsigned int)i, dgram_header_id, (unsigned long)out_dgram_ids[i]);
+            LOG_DEBUG("[quic] packed dgram: msg_id=%u, seq=%u, max_seq=%u, wire_id=%u, full_dgram_id=%lu\n", 
+                batch_msg_id, (unsigned int)i, (unsigned int)(iov_size - 1), dgram_header_id, (unsigned long)out_dgram_ids[i]);
 
             batch_iov[i].iov_base = buf[i];
             batch_iov[i].iov_len  = len + DGRAM_HEADER_SIZE;
