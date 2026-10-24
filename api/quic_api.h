@@ -93,6 +93,8 @@ int quic_send(quic_endpoint_t *ep, const uint8_t *data, size_t len);
 /**
  * Stop endpoint event loop and free resources.
  */
+/* test helper: print xquic connection stats incl. FEC counters */
+void quic_endpoint_print_stats(quic_endpoint_t *ep);
 void quic_endpoint_stop(quic_endpoint_t *ep);
 
 /**

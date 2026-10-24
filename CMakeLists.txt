@@ -229,6 +229,7 @@ set(
     "src/transport/scheduler/xqc_scheduler_common.c"
     "src/transport/scheduler/xqc_scheduler_backup.c"
     "src/transport/scheduler/xqc_scheduler_backup_fec.c"
+    "src/transport/scheduler/xqc_scheduler_repair_spread.c"
     "src/transport/scheduler/xqc_scheduler_rap.c"
     "src/transport/scheduler/xqc_scheduler_reactive_multipath.c"
     "src/transport/scheduler/xqc_scheduler_proactive_multipath.c"

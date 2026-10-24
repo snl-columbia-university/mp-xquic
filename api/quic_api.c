@@ -183,7 +183,42 @@ static xqc_scheduler_callback_t get_scheduler_cb(const char *name) {
     if (strcmp(name, "rmp") == 0) return xqc_reactive_multipath_scheduler_cb;
     if (strcmp(name, "spmp") == 0) return xqc_smart_proactive_multipath_scheduler_cb;
     if (strcmp(name, "bi") == 0) return xqc_biphony_scheduler_cb;
+    if (strcmp(name, "bfec") == 0) return xqc_backup_fec_scheduler_cb;
+    if (strcmp(name, "rspread") == 0) return xqc_repair_spread_scheduler_cb;
     return xqc_minrtt_scheduler_cb;
+}
+
+/* --- test-only FEC switches (XR_FEC=xor|rs|pkm, XR_FEC_BLK, XR_FEC_RATE, XR_FEC_MP=stb) --- */
+static int fec_on(void) { const char *v = getenv("XR_FEC"); return v && *v; }
+static void fec_apply(xqc_conn_settings_t *cs) {
+#ifdef XQC_ENABLE_FEC
+    const char *v = getenv("XR_FEC");
+    if (!v || !*v) return;
+    xqc_fec_schemes_e sc = strcmp(v, "rs") == 0 ? XQC_REED_SOLOMON_CODE
+                         : strcmp(v, "pkm") == 0 ? XQC_PACKET_MASK_CODE : XQC_XOR_CODE;
+    cs->enable_encode_fec = 1;
+    cs->enable_decode_fec = 1;
+    cs->fec_params.fec_encoder_schemes[0] = sc;
+    cs->fec_params.fec_decoder_schemes[0] = sc;
+    cs->fec_params.fec_encoder_schemes_num = 1;
+    cs->fec_params.fec_decoder_schemes_num = 1;
+    if (getenv("XR_FEC_BLK")) cs->fec_params.fec_max_symbol_num_per_block = atoi(getenv("XR_FEC_BLK"));
+    if (getenv("XR_FEC_RATE")) cs->fec_params.fec_code_rate = (float)atof(getenv("XR_FEC_RATE"));
+    if (getenv("XR_FEC_MP") && strcmp(getenv("XR_FEC_MP"), "stb") == 0) cs->fec_params.fec_mp_mode = XQC_FEC_MP_USE_STB;
+    printf("[fec] enabled: scheme=%s block=%d rate=%.3f mp=%s\n", v,
+           (int)cs->fec_params.fec_max_symbol_num_per_block, cs->fec_params.fec_code_rate,
+           cs->fec_params.fec_mp_mode == XQC_FEC_MP_USE_STB ? "standby-path" : "default");
+    fflush(stdout);
+#else
+    if (getenv("XR_FEC")) { printf("[fec] XR_FEC set but this build has no XQC_ENABLE_FEC\n"); fflush(stdout); }
+#endif
+}
+static int standby_path(int idx) {         /* XR_STANDBY_PATHS=1,2 */
+    const char *v = getenv("XR_STANDBY_PATHS");
+    if (!v) return 0;
+    char buf[128]; snprintf(buf, sizeof(buf), ",%s,", v);
+    char key[16]; snprintf(key, sizeof(key), ",%d,", idx);
+    return strstr(buf, key) != NULL;
 }
 
 static xqc_cong_ctrl_callback_t get_cong_ctrl_cb(const char *name) {
@@ -677,6 +712,7 @@ static int server_accept(xqc_engine_t *eng, xqc_connection_t *conn, const xqc_ci
     quic_endpoint_t *ep = (quic_endpoint_t *)user_data;
     if (!ep) return -1;
     ep->conn = conn;
+    if (cid) memcpy(&ep->cid, cid, sizeof(ep->cid));
     ep->max_dgram_id = 0;
     memset(ep->dgram_seen, 0, sizeof(ep->dgram_seen));
     xqc_conn_set_alp_user_data(conn, ep);
@@ -691,7 +727,9 @@ void ready_to_create_path_notify(const xqc_cid_t *cid, void *user_data) {
     LOG_INFO("[client-multipath] ready to create new path\n");
     while(ep->num_paths < ep->num_local_addrs * ep->num_peer_addrs && ep->num_paths < MAX_PATHS) {
         uint64_t new_path_id = 0;
-        int ret = xqc_conn_create_path(ep->engine, cid, &new_path_id, 0);
+        int stb = standby_path(ep->num_paths);
+        int ret = xqc_conn_create_path(ep->engine, cid, &new_path_id, stb ? 1 : 0);
+        if (ret == XQC_OK && stb) { printf("[fec] path index %d created as STANDBY (path_id %lu)\n", ep->num_paths, (unsigned long)new_path_id); fflush(stdout); }
         if (ret == XQC_OK) {
             LOG_INFO("[client-multipath] created path %lu\n", new_path_id);
             ep->num_paths++;
@@ -995,6 +1033,7 @@ quic_endpoint_t *quic_client_start(const quic_client_config_t *config) {
     xqc_conn_ssl_config_t conn_ssl_config = {0};
 
     ep->path_idx = 0;
+    fec_apply(&conn_settings);
     ep->ep_conn_settings = conn_settings;
     ep->ep_ssl_config = conn_ssl_config;
 
@@ -1109,6 +1148,7 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
     ep->engine = xqc_engine_create(XQC_ENGINE_SERVER, &cfg, &ssl_cfg, &eng_cb, &trans_cb, ep);
     if (!ep->engine) { free(ep); return NULL; }
 
+    fec_apply(&conn_settings);
     xqc_server_set_conn_settings(ep->engine, &conn_settings);
 
     xqc_app_proto_callbacks_t ap_cbs = {
@@ -1172,13 +1212,13 @@ int quic_send(quic_endpoint_t *ep, const uint8_t *data, size_t len) {
         memcpy(buf + 8, data, len);
 
         if (!ep->rtp_tag) {
-            return xqc_datagram_send(ep->conn, buf, len + 8, &ep->quic_dgram_id, 1);
+            return xqc_datagram_send(ep->conn, buf, len + 8, &ep->quic_dgram_id, fec_on() ? XQC_DATA_QOS_NORMAL : XQC_DATA_QOS_HIGHEST);
         }
         /* tag = first 4 B of the app payload; packets are normally written on the next
            engine tick, so with rtp_tag write them now, while the tag is set */
         ep->tx_tag_valid = len >= 4;
         if (ep->tx_tag_valid) memcpy(&ep->tx_tag, data, sizeof(ep->tx_tag));
-        int ret = xqc_datagram_send(ep->conn, buf, len + 8, &ep->quic_dgram_id, 1);
+        int ret = xqc_datagram_send(ep->conn, buf, len + 8, &ep->quic_dgram_id, fec_on() ? XQC_DATA_QOS_NORMAL : XQC_DATA_QOS_HIGHEST);
         if (ret >= 0 && ep->engine) xqc_engine_main_logic(ep->engine);
         ep->tx_tag_valid = 0;            /* packets written later are untagged */
         return ret;
@@ -1188,8 +1228,18 @@ int quic_send(quic_endpoint_t *ep, const uint8_t *data, size_t len) {
     return -1;
 }
 
+void quic_endpoint_print_stats(quic_endpoint_t *ep) {
+    if (!ep || !ep->engine) return;
+    xqc_conn_stats_t st = xqc_conn_get_stats(ep->engine, &ep->cid);
+    printf("[fec] %s stats: send_count %u lost_count %u lost_dgram %u send_fec %u fec_recovered %u enable_fec %u\n",
+           ep->mode == QUIC_MODE_CLIENT ? "client" : "server", st.send_count, st.lost_count, st.lost_dgram_count,
+           st.send_fec_cnt, st.fec_recover_pkt_cnt, (unsigned)st.enable_fec);
+    fflush(stdout);
+}
+
 void quic_endpoint_stop(quic_endpoint_t *ep) {
     if (!ep) return;
+    if (ep->conn) quic_endpoint_print_stats(ep);
 
     if (ep->rtp_encap) {
         printf("[rtp] %s: sent %lu RTP datagrams (PDU Set ext %d), received %lu RTP "

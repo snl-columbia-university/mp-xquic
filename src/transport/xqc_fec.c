@@ -1332,8 +1332,7 @@ xqc_process_src_symbol(xqc_connection_t *conn, uint64_t block_id, uint64_t symbo
     src_symbol = NULL;
 
     if (block_id != 0
-        && !xqc_if_src_blk_exists(conn->fec_ctl, block_id)
-        && block_id <= conn->fec_ctl->fec_max_fin_blk_id)
+        && conn->fec_ctl->fec_fin_ring[block_id % XQC_FEC_FIN_RING] == (uint64_t)block_id + 1)
     {
         return -XQC_EFEC_TOLERABLE_ERROR;
     }
@@ -1385,8 +1384,7 @@ xqc_process_rpr_symbol(xqc_connection_t *conn, xqc_fec_rpr_syb_t *tmp_rpr_symbol
     block_id = tmp_rpr_symbol->block_id;
 
     if (block_id != 0
-        && !xqc_if_src_blk_exists(conn->fec_ctl, block_id)
-        && block_id <= conn->fec_ctl->fec_max_fin_blk_id)
+        && conn->fec_ctl->fec_fin_ring[block_id % XQC_FEC_FIN_RING] == (uint64_t)block_id + 1)
     {
         return -XQC_EFEC_TOLERABLE_ERROR;
     }

@@ -108,7 +108,7 @@ static void write_frags(void) {
     fclose(o);
 }
 
-static void on_term(int sig) { (void)sig; if (frag_log_on()) { write_arrivals(); write_frags(); } _exit(0); }
+static void on_term(int sig) { (void)sig; if (getenv("XR_FEC") && g_server) quic_endpoint_print_stats(g_server); if (frag_log_on()) { write_arrivals(); write_frags(); } _exit(0); }
 
 static void on_server_recv(const uint8_t *data, size_t len, void *user_data) {
     if (len >= sizeof(hit_request_t)) {
