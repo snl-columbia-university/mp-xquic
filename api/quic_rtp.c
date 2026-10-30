@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include "quic_api.h"
+#include "quic_rtp.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -82,7 +83,7 @@ static size_t write_rtp_header(quic_endpoint_t *ep, unsigned path_idx, size_t si
 
 /* Strip the RTP header of a received UDP packet; returns the QUIC payload length
    (*pkt points at it) or -1 for a malformed packet. Bare QUIC passes through. */
-static ssize_t strip_rtp_header(quic_endpoint_t *ep, unsigned char *buf, ssize_t n, unsigned char **pkt) {
+ssize_t strip_rtp_header(quic_endpoint_t *ep, unsigned char *buf, ssize_t n, unsigned char **pkt) {
     *pkt = buf;
     if (n < RTP_HDR_LEN || (buf[0] & 0xC0) != 0x80) {   /* not RTP v2 */
         ep->rtp_rx_plain++;
@@ -116,4 +117,162 @@ static ssize_t strip_rtp_header(quic_endpoint_t *ep, unsigned char *buf, ssize_t
     *pkt = buf + h;
     ep->rtp_rx++;
     return n - h;
+}
+
+void quic_rtp_init(quic_endpoint_t *ep, int encap, int pdu_set, int tag) {
+    ep->rtp_tag = tag;
+    if (ep->rtp_tag) {
+        ep->rtp_check = fopen(ep->mode == QUIC_MODE_CLIENT ? "rtp_check_client.csv"
+                                                           : "rtp_check_server.csv", "w");
+        if (ep->rtp_check) setvbuf(ep->rtp_check, NULL, _IOLBF, 0);   /* server is killed, not stopped */
+        if (ep->rtp_check) fprintf(ep->rtp_check,
+            "rtp_ssrc,rtp_seq,rtp_pkt_ctr,he_tag,he_tag_valid,dgram_id,quic_app_tag,result,dup\n");
+    }
+    ep->rtp_encap = encap || pdu_set || tag;
+    ep->rtp_pdu_set = pdu_set;
+}
+
+void quic_rtp_stop(quic_endpoint_t *ep) {
+    if (ep->rtp_encap) {
+        printf("[rtp] %s: sent %lu RTP datagrams (PDU Set ext %d), received %lu RTP "
+               "(%lu with BEDE ext) + %lu bare QUIC\n",
+               ep->mode == QUIC_MODE_CLIENT ? "client" : "server", (unsigned long)ep->rtp_tx,
+               ep->rtp_pdu_set, (unsigned long)ep->rtp_rx, (unsigned long)ep->rtp_rx_pduset,
+               (unsigned long)ep->rtp_rx_plain);
+        fflush(stdout);
+    }
+    if (ep->rtp_tag) {
+        printf("[rtp-check] %s: datagrams %lu  match %lu  MISMATCH %lu  untagged %lu  no_elem %lu\n",
+               ep->mode == QUIC_MODE_CLIENT ? "client" : "server",
+               (unsigned long)(ep->chk_match + ep->chk_mismatch + ep->chk_untagged + ep->chk_noelem),
+               (unsigned long)ep->chk_match, (unsigned long)ep->chk_mismatch,
+               (unsigned long)ep->chk_untagged, (unsigned long)ep->chk_noelem);
+        fflush(stdout);
+        if (ep->rtp_check) { fflush(ep->rtp_check); fclose(ep->rtp_check); ep->rtp_check = NULL; }
+    }
+}
+
+ssize_t quic_rtp_sendto(quic_endpoint_t *ep, unsigned path_idx, const unsigned char *buf, size_t size,
+                        const struct sockaddr *peer_addr, socklen_t peer_addrlen)
+{
+    struct iovec iov = { (void *)buf, size };
+    struct msghdr msg = {
+        .msg_name    = (void *)peer_addr,
+        .msg_namelen = peer_addrlen,
+        .msg_iov     = &iov,
+        .msg_iovlen  = 1
+    };
+    return quic_rtp_sendmsg(ep, path_idx, &msg);
+}
+
+ssize_t quic_rtp_sendmsg(quic_endpoint_t *ep, unsigned path_idx, struct msghdr *msg) {
+    unsigned char hbuf[RTP_MAX_HDR];
+    struct iovec *pkt_iov = msg->msg_iov;
+    size_t hdr = write_rtp_header(ep, path_idx, pkt_iov->iov_len, hbuf);
+    struct iovec iov[2] = { { hbuf, hdr }, *pkt_iov };
+
+    msg->msg_iov    = iov;
+    msg->msg_iovlen = 2;
+    ssize_t res = sendmsg(ep->quic_fd, msg, 0);
+    msg->msg_iov    = pkt_iov;
+    msg->msg_iovlen = 1;
+
+    if (res < 0) return res;
+    ep->rtp_tx++;
+    return res >= (ssize_t)hdr ? res - (ssize_t)hdr : 0;   /* xquic expects its own byte count */
+}
+
+int quic_rtp_sendmmsg(quic_endpoint_t *ep, unsigned path_idx, struct mmsghdr *msgs, unsigned int vlen) {
+    struct iovec *pkt_iovs[vlen];
+    struct iovec iovs[vlen][2];
+    unsigned char hbufs[vlen][RTP_MAX_HDR];
+
+    for (unsigned int i = 0; i < vlen; i++) {           /* RTP header in front of each QUIC packet */
+        struct msghdr *hdr = &msgs[i].msg_hdr;
+        pkt_iovs[i] = hdr->msg_iov;
+        iovs[i][0].iov_base = hbufs[i];
+        iovs[i][0].iov_len  = write_rtp_header(ep, path_idx, pkt_iovs[i]->iov_len, hbufs[i]);
+        iovs[i][1] = *pkt_iovs[i];
+        hdr->msg_iov    = iovs[i];
+        hdr->msg_iovlen = 2;
+    }
+
+    int sent = sendmmsg(ep->quic_fd, msgs, vlen, 0);
+
+    for (unsigned int i = 0; i < vlen; i++) {
+        msgs[i].msg_hdr.msg_iov    = pkt_iovs[i];
+        msgs[i].msg_hdr.msg_iovlen = 1;
+    }
+    if (sent > 0) ep->rtp_tx += sent;
+    return sent;
+}
+
+int quic_rtp_send(quic_endpoint_t *ep, const uint8_t *data, size_t len) {
+    if (!ep || !ep->conn) return -1;
+
+    if (ep->datagram_mode) {
+        uint8_t buf[MAX_DGRAM_SIZE];
+        if (len + DGRAM_HEADER_SIZE > sizeof(buf)) return -1;
+
+        uint16_t dgram_header_id = ep->dgram_header_id++;
+        uint64_t dgram_id = pack_dgram_id(ep->msg_id++, 0, 0, dgram_header_id);
+
+        uint16_t net_header_id = htons(dgram_header_id);
+        memcpy(buf, &net_header_id, DGRAM_HEADER_SIZE);
+        memcpy(buf + DGRAM_HEADER_SIZE, data, len);
+
+        LOG_DEBUG("[quic] packed dgram: msg_id=%u, seq=0, max_seq=0, wire_id=%u, full_dgram_id=%lu\n",
+            ep->msg_id - 1, dgram_header_id, (unsigned long)dgram_id);
+
+        /* tag = first 4 B of the app payload; packets are normally written on the next
+           engine tick, so with rtp_tag write them now, while the tag is set */
+        ep->tx_tag_valid = len >= 4;
+        if (ep->tx_tag_valid) memcpy(&ep->tx_tag, data, sizeof(ep->tx_tag));
+        int ret = xqc_datagram_send(ep->conn, buf, len + DGRAM_HEADER_SIZE, &dgram_id, 1);
+        if (ret >= 0 && ep->engine) xqc_engine_main_logic(ep->engine);
+        ep->tx_tag_valid = 0;            /* packets written later are untagged */
+        return ret;
+    } else if (ep->stream) {
+        return (int)xqc_stream_send(ep->stream, (unsigned char *)data, len, 0);
+    }
+    return -1;
+}
+
+void quic_rtp_datagram_read_notify(xqc_connection_t *conn, void *user_data, const void *data,
+                                   size_t data_len, uint64_t flags)
+{
+    quic_endpoint_t *ep = (quic_endpoint_t *)user_data;
+    if (!ep || data_len <= DGRAM_HEADER_SIZE) return;
+
+    uint16_t net_val;
+    memcpy(&net_val, data, DGRAM_HEADER_SIZE);
+    uint16_t dgram_header_id = ntohs(net_val);
+
+    int is_new = is_new_datagram_win(dgram_header_id, &ep->max_dgram_header_id, ep->dgram_header_win);
+
+    if (ep->rtp_check) {
+        int32_t app_tag = 0;
+        if (data_len >= DGRAM_HEADER_SIZE + sizeof(app_tag))
+            memcpy(&app_tag, (const uint8_t *)data + DGRAM_HEADER_SIZE, sizeof(app_tag));
+        const char *res;
+        if (!ep->rx_has_elem)            { res = "no_elem";  ep->chk_noelem++; }
+        else if (!ep->rx_tag_valid)      { res = "untagged"; ep->chk_untagged++; }
+        else if (ep->rx_tag == app_tag)  { res = "match";    ep->chk_match++; }
+        else                             { res = "MISMATCH"; ep->chk_mismatch++; }
+        fprintf(ep->rtp_check, "%08x,%u,%u,%d,%d,%u,%d,%s,%d\n", ep->rx_ssrc, ep->rx_seq,
+                ep->rx_pkt_ctr, ep->rx_tag_valid ? ep->rx_tag : 0, ep->rx_tag_valid,
+                (unsigned)dgram_header_id, app_tag, res, !is_new);
+    }
+
+    if (!is_new) {
+        LOG_DEBUG("[quic] duplicate datagram %u (<=%u) recv\n", dgram_header_id, ep->max_dgram_header_id);
+        return;
+    }
+
+    const uint8_t *payload = (const uint8_t *)data + DGRAM_HEADER_SIZE;
+    size_t payload_len = data_len - DGRAM_HEADER_SIZE;
+
+    if (ep->app_recv_cb) {
+        ep->app_recv_cb(payload, payload_len, ep->app_user_data);
+    }
 }
