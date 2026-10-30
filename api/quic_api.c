@@ -22,11 +22,9 @@
 #define ACTIVE_LOG_LEVEL 4 /* 0=DEBUG, 1=INFO, 2=WARN, 3=ERROR, 4=OFF */
 #endif
 
-#define MAX_PATHS 16
 #define MAX_BATCH_SIZE 64
 #define MAX_DGRAM_SIZE 2000
 #define DGRAM_HEADER_SIZE 2
-#define DGRAM_HEADER_WIN 16384
 
 #define XQC_SOCKET_ERROR -1
 #define XQC_SOCKET_EAGAIN -2
@@ -67,48 +65,6 @@ static void quic_log(quic_log_level_t level, const char *fmt, ...) {
 #define LOG_INFO(...)  do { if (ACTIVE_LOG_LEVEL <= 1) quic_log(QUIC_LOG_INFO,  __VA_ARGS__); } while(0)
 #define LOG_WARN(...)  do { if (ACTIVE_LOG_LEVEL <= 2) quic_log(QUIC_LOG_WARN,  __VA_ARGS__); } while(0)
 #define LOG_ERROR(...) do { if (ACTIVE_LOG_LEVEL <= 3) quic_log(QUIC_LOG_ERROR, __VA_ARGS__); } while(0)
-
-typedef enum {
-    QUIC_MODE_CLIENT,
-    QUIC_MODE_SERVER
-} quic_mode_t;
-
-struct quic_endpoint {
-    quic_mode_t mode;
-    xqc_engine_t *engine;
-    FILE *qlog_file;
-    struct event_base *eb;
-    struct event *timer_ev;
-    struct event *quic_ev;
-
-    int quic_fd;
-
-    xqc_connection_t *conn;
-    xqc_stream_t *stream;
-    xqc_cid_t cid;
-
-    struct sockaddr_in peer_addrs[MAX_PATHS];
-    int num_peer_addrs;
-    struct sockaddr_in local_addrs[MAX_PATHS];
-    int num_local_addrs;
-    int num_paths;
-
-    uint16_t msg_id;
-    uint64_t dgram_header_id;
-    uint16_t max_dgram_header_id;
-    uint64_t dgram_header_win[DGRAM_HEADER_WIN / 64];
-
-    quic_recv_cb         app_recv_cb;
-    void                *app_user_data;
-
-    int connected;
-    int path_idx;
-
-    xqc_conn_settings_t ep_conn_settings;
-    xqc_conn_ssl_config_t ep_ssl_config;
-
-    int datagram_mode;
-};
 
 void quic_endpoint_step(quic_endpoint_t *ep) {
     if (ep && ep->eb) {

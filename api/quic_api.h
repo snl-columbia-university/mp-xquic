@@ -3,7 +3,10 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <sys/uio.h>
+#include <netinet/in.h>
+#include <xquic/xquic.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -11,10 +14,72 @@ extern "C" {
 
 #define CONNECTION_TIMEOUT 10000
 
+#define MAX_PATHS 16
+#define DGRAM_HEADER_WIN 16384
+
+struct event_base;
+struct event;
+
 typedef struct quic_endpoint quic_endpoint_t;
 
 /* Callback function to deliver received payload data to the application */
 typedef void (*quic_recv_cb)(const uint8_t *data, size_t len, void *user_data);
+
+typedef enum {
+    QUIC_MODE_CLIENT,
+    QUIC_MODE_SERVER
+} quic_mode_t;
+
+struct quic_endpoint {
+    quic_mode_t mode;
+    xqc_engine_t *engine;
+    FILE *qlog_file;
+    struct event_base *eb;
+    struct event *timer_ev;
+    struct event *quic_ev;
+
+    int quic_fd;
+
+    xqc_connection_t *conn;
+    xqc_stream_t *stream;
+    xqc_cid_t cid;
+
+    struct sockaddr_in peer_addrs[MAX_PATHS];
+    int num_peer_addrs;
+    struct sockaddr_in local_addrs[MAX_PATHS];
+    int num_local_addrs;
+    int num_paths;
+
+    uint16_t msg_id;
+    uint64_t dgram_header_id;
+    uint16_t max_dgram_header_id;
+    uint64_t dgram_header_win[DGRAM_HEADER_WIN / 64];
+
+    quic_recv_cb         app_recv_cb;
+    void                *app_user_data;
+
+    int connected;
+    int path_idx;
+
+    xqc_conn_settings_t ep_conn_settings;
+    xqc_conn_ssl_config_t ep_ssl_config;
+
+    int datagram_mode;
+
+    int rtp_encap;
+    int rtp_pdu_set;
+    uint16_t rtp_seq[MAX_PATHS];
+    uint16_t rtp_pssn[MAX_PATHS];
+    uint64_t rtp_tx, rtp_rx, rtp_rx_plain, rtp_rx_pduset;
+
+    int rtp_tag;
+    int32_t tx_tag; int tx_tag_valid;
+    uint32_t tx_pkt_ctr;
+    int rx_has_elem, rx_tag_valid;
+    uint32_t rx_ssrc, rx_pkt_ctr; uint16_t rx_seq; int32_t rx_tag;
+    FILE *rtp_check;
+    uint64_t chk_match, chk_mismatch, chk_untagged, chk_noelem;
+};
 
 typedef struct {
     const char *local_ips[4];
