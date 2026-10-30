@@ -542,6 +542,8 @@ static void engine_timer_cb(int fd, short what, void *arg) {
 }
 
 // QUIC packet read callback
+#define RECV_BATCH_MAX 64
+
 static void packet_read_cb(int fd, short what, void *arg) {
     quic_endpoint_t *ep = (quic_endpoint_t *)arg;
     if (!ep) return;
@@ -554,8 +556,9 @@ static void packet_read_cb(int fd, short what, void *arg) {
         return;
     }
     in_port_t bound_port = local_addr.sin_port;
+    int got = 0;
 
-    while (1) {
+    while (got < RECV_BATCH_MAX) {
         struct iovec iov = { .iov_base = buf, .iov_len = sizeof(buf) };
         char cmsg_buf[CMSG_SPACE(sizeof(struct in_pktinfo))];
 
@@ -572,6 +575,7 @@ static void packet_read_cb(int fd, short what, void *arg) {
         if (n <= 0) {
             break;
         }
+        got++;
 
         local_addr.sin_port = bound_port;
         struct in_addr hdr_dst = local_addr.sin_addr;
