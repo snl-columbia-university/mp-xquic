@@ -477,6 +477,7 @@ add_library(
     quic_api
     STATIC
     "api/quic_api.c"  # Adjust path if quic_api.c is in a subfolder (e.g., "simple/quic_api.c")
+    "api/quic_rtp.c"
 )
 
 target_link_libraries(

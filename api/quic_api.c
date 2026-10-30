@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include "quic_api.h"
+#include "quic_rtp.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,15 +19,7 @@
 #include <xquic/xquic.h>
 #include <sys/socket.h>
 
-#ifndef ACTIVE_LOG_LEVEL
-#define ACTIVE_LOG_LEVEL 4 /* 0=DEBUG, 1=INFO, 2=WARN, 3=ERROR, 4=OFF */
-#endif
-
-#define MAX_PATHS 16
 #define MAX_BATCH_SIZE 64
-#define MAX_DGRAM_SIZE 2000
-#define DGRAM_HEADER_SIZE 2
-#define DGRAM_HEADER_WIN 2048
 
 #define XQC_SOCKET_ERROR -1
 #define XQC_SOCKET_EAGAIN -2
@@ -36,14 +29,7 @@ typedef union {
     char buf[CMSG_SPACE(sizeof(struct in_pktinfo))];
 } cmsg_pktinfo_t;
 
-typedef enum {
-    QUIC_LOG_DEBUG,
-    QUIC_LOG_INFO,
-    QUIC_LOG_WARN,
-    QUIC_LOG_ERROR
-} quic_log_level_t;
-
-static void quic_log(quic_log_level_t level, const char *fmt, ...) {
+void quic_log(quic_log_level_t level, const char *fmt, ...) {
     const char *level_strs[] = { "DEBUG", "INFO", "WARN", "ERROR" };
     struct timeval tv;
     gettimeofday(&tv, NULL);
@@ -62,53 +48,6 @@ static void quic_log(quic_log_level_t level, const char *fmt, ...) {
     vfprintf(stream, fmt, args);
     va_end(args);
 }
-
-#define LOG_DEBUG(...) do { if (ACTIVE_LOG_LEVEL <= 0) quic_log(QUIC_LOG_DEBUG, __VA_ARGS__); } while(0)
-#define LOG_INFO(...)  do { if (ACTIVE_LOG_LEVEL <= 1) quic_log(QUIC_LOG_INFO,  __VA_ARGS__); } while(0)
-#define LOG_WARN(...)  do { if (ACTIVE_LOG_LEVEL <= 2) quic_log(QUIC_LOG_WARN,  __VA_ARGS__); } while(0)
-#define LOG_ERROR(...) do { if (ACTIVE_LOG_LEVEL <= 3) quic_log(QUIC_LOG_ERROR, __VA_ARGS__); } while(0)
-
-typedef enum {
-    QUIC_MODE_CLIENT,
-    QUIC_MODE_SERVER
-} quic_mode_t;
-
-struct quic_endpoint {
-    quic_mode_t mode;
-    xqc_engine_t *engine;
-    FILE *qlog_file;
-    struct event_base *eb;
-    struct event *timer_ev;
-    struct event *quic_ev;
-
-    int quic_fd;
-
-    xqc_connection_t *conn;
-    xqc_stream_t *stream;
-    xqc_cid_t cid;
-
-    struct sockaddr_in peer_addrs[MAX_PATHS];
-    int num_peer_addrs;
-    struct sockaddr_in local_addrs[MAX_PATHS];
-    int num_local_addrs;
-    int num_paths;
-
-    uint16_t msg_id;
-    uint64_t dgram_header_id;
-    uint16_t max_dgram_header_id;
-    uint64_t dgram_header_win[DGRAM_HEADER_WIN / 64];
-
-    quic_recv_cb         app_recv_cb;
-    void                *app_user_data;
-
-    int connected;
-    int path_idx;
-
-    xqc_conn_settings_t ep_conn_settings;
-    xqc_conn_ssl_config_t ep_ssl_config;
-
-    int datagram_mode;
-};
 
 void quic_endpoint_step(quic_endpoint_t *ep) {
     if (ep && ep->eb) {
@@ -145,7 +84,7 @@ static xqc_cong_ctrl_callback_t get_cong_ctrl_cb(const char *name) {
     return xqc_cubic_cb;
 }
 
-static int is_new_datagram_win(uint16_t id, uint16_t *max_dgram_header_id, uint64_t *seen) {
+int is_new_datagram_win(uint16_t id, uint16_t *max_dgram_header_id, uint64_t *seen) {
 #define SEEN_BIT(i) (seen[((i) % DGRAM_HEADER_WIN) / 64] & (1ULL << ((i) % 64)))
 #define SEEN_SET(i) (seen[((i) % DGRAM_HEADER_WIN) / 64] |= (1ULL << ((i) % 64)))
 #define SEEN_CLR(i) (seen[((i) % DGRAM_HEADER_WIN) / 64] &= ~(1ULL << ((i) % 64)))
@@ -217,7 +156,8 @@ static ssize_t write_socket(const unsigned char *buf, size_t size,
     quic_endpoint_t *ep = (quic_endpoint_t *)user_data;
     if (!ep || ep->quic_fd < 0) return XQC_SOCKET_ERROR;
 
-    ssize_t res = sendto(ep->quic_fd, buf, size, 0, peer_addr, peer_addrlen);
+    ssize_t res = ep->rtp_encap ? quic_rtp_sendto(ep, 0, buf, size, peer_addr, peer_addrlen)
+                                : sendto(ep->quic_fd, buf, size, 0, peer_addr, peer_addrlen);
     if (res < 0) {
         return (errno == EAGAIN || errno == EWOULDBLOCK) ? XQC_SOCKET_EAGAIN : XQC_SOCKET_ERROR;
     }
@@ -254,7 +194,8 @@ static ssize_t write_socket_ex(uint64_t path_id, const unsigned char *buf, size_
     LOG_DEBUG("[%s-quic] write_socket_ex: calling write_socket for path_id %lu\n",
             ep->mode == QUIC_MODE_SERVER ? "server" : "client",
             (unsigned long)path_id);
-    ssize_t res = sendmsg(ep->quic_fd, &msg, 0);
+    ssize_t res = ep->rtp_encap ? quic_rtp_sendmsg(ep, (unsigned)path_id, &msg)
+                                : sendmsg(ep->quic_fd, &msg, 0);
     if (res < 0) {
         return (errno == EAGAIN || errno == EWOULDBLOCK) ? XQC_SOCKET_EAGAIN : XQC_SOCKET_ERROR;
     }
@@ -281,7 +222,8 @@ static ssize_t write_mmsg(const struct iovec *msg_iov, unsigned int vlen,
         msgs[i].msg_hdr.msg_iovlen  = 1;
     }
 
-    int sent = sendmmsg(ep->quic_fd, msgs, vlen, 0);
+    int sent = ep->rtp_encap ? quic_rtp_sendmmsg(ep, 0, msgs, vlen)
+                             : sendmmsg(ep->quic_fd, msgs, vlen, 0);
     if (sent < 0) {
         return (errno == EAGAIN || errno == EWOULDBLOCK) ? XQC_SOCKET_EAGAIN : XQC_SOCKET_ERROR;
     }
@@ -327,8 +269,9 @@ static ssize_t write_mmsg_ex(uint64_t path_id,
     LOG_DEBUG("[%s-quic] write_mmsg_ex: calling sendmmsg for path_id %lu (batch of %u datagrams)\n",
              ep->mode == QUIC_MODE_SERVER ? "server" : "client",
              (unsigned long)path_id, vlen);
-                      
-    int sent = sendmmsg(ep->quic_fd, msgs, vlen, 0);
+
+    int sent = ep->rtp_encap ? quic_rtp_sendmmsg(ep, (unsigned)path_id, msgs, vlen)
+                             : sendmmsg(ep->quic_fd, msgs, vlen, 0);
     if (sent < 0) {
         return (errno == EAGAIN || errno == EWOULDBLOCK) ? XQC_SOCKET_EAGAIN : XQC_SOCKET_ERROR;
     }
@@ -542,6 +485,8 @@ static void engine_timer_cb(int fd, short what, void *arg) {
 }
 
 // QUIC packet read callback
+#define RECV_BATCH_MAX 64
+
 static void packet_read_cb(int fd, short what, void *arg) {
     quic_endpoint_t *ep = (quic_endpoint_t *)arg;
     if (!ep) return;
@@ -554,8 +499,9 @@ static void packet_read_cb(int fd, short what, void *arg) {
         return;
     }
     in_port_t bound_port = local_addr.sin_port;
+    int got = 0;
 
-    while (1) {
+    while (got < RECV_BATCH_MAX) {
         struct iovec iov = { .iov_base = buf, .iov_len = sizeof(buf) };
         char cmsg_buf[CMSG_SPACE(sizeof(struct in_pktinfo))];
 
@@ -572,6 +518,7 @@ static void packet_read_cb(int fd, short what, void *arg) {
         if (n <= 0) {
             break;
         }
+        got++;
 
         local_addr.sin_port = bound_port;
         struct in_addr hdr_dst = local_addr.sin_addr;
@@ -597,7 +544,12 @@ static void packet_read_cb(int fd, short what, void *arg) {
                     dst_ip, ntohs(local_addr.sin_port), hdr_dst_ip);
         }
 
-        xqc_engine_packet_process(ep->engine, buf, n,
+        unsigned char *pkt = buf;
+        if (ep->rtp_encap && (n = strip_rtp_header(ep, buf, n, &pkt)) < 0) {
+            continue;                                   
+        }
+
+        xqc_engine_packet_process(ep->engine, pkt, n,
                                   (struct sockaddr *)&local_addr, sizeof(local_addr),
                                   (struct sockaddr *)&peer_addr, msg.msg_namelen,
                                   get_timestamp(), ep);
@@ -640,6 +592,7 @@ quic_endpoint_t *quic_client_start(const quic_client_config_t *config) {
     if (!ep) return NULL;
 
     ep->mode = QUIC_MODE_CLIENT;
+    quic_rtp_init(ep, config->rtp_encap, config->rtp_pdu_set, config->rtp_tag);
     if (config->qlog && config->qlog[0] != '\0') {
         ep->qlog_file = fopen(config->qlog, "wb");
     } else {
@@ -741,13 +694,13 @@ quic_endpoint_t *quic_client_start(const quic_client_config_t *config) {
             .stream_write_notify = stream_write_notify,
         },
         .dgram_cbs = {
-            .datagram_read_notify = datagram_read_notify,
+            .datagram_read_notify = ep->rtp_tag ? quic_rtp_datagram_read_notify : datagram_read_notify,
             .datagram_write_notify = datagram_write_notify,
             .datagram_lost_notify = datagram_lost_notify,
             .datagram_acked_notify = datagram_acked_notify,
         }
     };
-    xqc_engine_register_alpn(ep->engine, "raw", 3, &ap_cbs, ep);
+    xqc_engine_register_alpn(ep->engine, "raw", 3, &ap_cbs, NULL);
 
     if (init_quic_socket_and_events(ep, 0) < 0) {
         free(ep);
@@ -777,6 +730,7 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
     if (!ep) return NULL;
 
     ep->mode = QUIC_MODE_SERVER;
+    quic_rtp_init(ep, config->rtp_encap, config->rtp_pdu_set, config->rtp_tag);
     if (config->qlog && config->qlog[0] != '\0') {
         ep->qlog_file = fopen(config->qlog, "wb");
     } else {
@@ -875,13 +829,13 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
             .stream_write_notify = stream_write_notify,
         },
         .dgram_cbs = {
-            .datagram_read_notify = datagram_read_notify,
+            .datagram_read_notify = ep->rtp_tag ? quic_rtp_datagram_read_notify : datagram_read_notify,
             .datagram_write_notify = datagram_write_notify,
             .datagram_lost_notify = datagram_lost_notify,
             .datagram_acked_notify = datagram_acked_notify,
         }
     };
-    xqc_engine_register_alpn(ep->engine, "raw", 3, &ap_cbs, ep);
+    xqc_engine_register_alpn(ep->engine, "raw", 3, &ap_cbs, NULL);
 
     uint16_t listen_port = config->listen_port ? config->listen_port : 8000;
     if (init_quic_socket_and_events(ep, listen_port) < 0) {
@@ -892,18 +846,10 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
     return ep;
 }
 
-// External QUIC send helper
-static inline uint64_t pack_dgram_id(uint16_t msg_id, uint8_t seq, uint8_t max_seq, uint16_t dgram_header_id) {
-    return ((uint64_t)msg_id     << 48) | 
-           ((uint64_t)seq        << 40) |
-           ((uint64_t)max_seq    << 32) | 
-           ((uint64_t)dgram_header_id << 16) |  
-           0x0000;
-}
-
 // External QUIC send endpoints
 int quic_send(quic_endpoint_t *ep, const uint8_t *data, size_t len) {
     if (!ep || !ep->conn) return -1;
+    if (ep->rtp_tag) return quic_rtp_send(ep, data, len);
 
     if (ep->datagram_mode) {
         uint8_t buf[MAX_DGRAM_SIZE];
@@ -975,6 +921,10 @@ int quic_send_msg(quic_endpoint_t *ep, struct iovec *iov, size_t iov_size) {
 
 void quic_endpoint_stop(quic_endpoint_t *ep) {
     if (!ep) return;
+
+    if (ep->rtp_encap) {
+        quic_rtp_stop(ep);
+    }
 
     if (ep->engine && ep->conn) {
         xqc_conn_close(ep->engine, &ep->cid);
