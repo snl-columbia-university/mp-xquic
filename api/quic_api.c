@@ -747,7 +747,7 @@ quic_endpoint_t *quic_client_start(const quic_client_config_t *config) {
             .datagram_acked_notify = datagram_acked_notify,
         }
     };
-    xqc_engine_register_alpn(ep->engine, "raw", 3, &ap_cbs, ep);
+    xqc_engine_register_alpn(ep->engine, "raw", 3, &ap_cbs, NULL);
 
     if (init_quic_socket_and_events(ep, 0) < 0) {
         free(ep);
@@ -881,7 +881,7 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
             .datagram_acked_notify = datagram_acked_notify,
         }
     };
-    xqc_engine_register_alpn(ep->engine, "raw", 3, &ap_cbs, ep);
+    xqc_engine_register_alpn(ep->engine, "raw", 3, &ap_cbs, NULL);
 
     uint16_t listen_port = config->listen_port ? config->listen_port : 8000;
     if (init_quic_socket_and_events(ep, listen_port) < 0) {

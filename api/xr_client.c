@@ -400,9 +400,10 @@ int main(int argc, char *argv[]) {
     }
 
     print_rtt_summary();
-    if (g_rtt_log_file) fclose(g_rtt_log_file);
+    fflush(stdout);
 
     quic_endpoint_stop(client);
+    if (g_rtt_log_file) { fclose(g_rtt_log_file); g_rtt_log_file = NULL; }
     fflush(stdout);
     fflush(stderr);
     exit(EXIT_SUCCESS);
