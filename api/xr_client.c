@@ -9,6 +9,10 @@
 #define MAX_HITS 4096
 #define MAX_IPS  16
 
+// Logging levels: 0 = SILENT, 1 = SUMMARY, 2 = FULL/VERBOSE
+static int g_verbose = 2; // Default to full logging
+#define LOG_PRINT(level, fmt, ...) do { if (g_verbose >= (level)) (printf(fmt, ##__VA_ARGS__), fflush(stdout)); } while(0)
+
 // --- Network Packet Structures ---
 
 typedef struct __attribute__((packed)) {
@@ -91,9 +95,8 @@ static void on_client_recv(const uint8_t *data, size_t len, void *user_data) {
                     g_records[i].rtt_ms = recv_time - g_records[i].send_time_ms;
                     g_records[i].ack_received = 1;
 
-                    printf(">>> [LOCAL ACK RECV] hitId=%d | Measured RTT: %.2f ms\n", 
-                           ack->hit_id, g_records[i].rtt_ms);
-                    fflush(stdout);
+                    LOG_PRINT(2, ">>> [LOCAL ACK RECV] hitId=%d | Measured RTT: %.2f ms\n", 
+                              ack->hit_id, g_records[i].rtt_ms);
 
                     if (g_rtt_log_file) {
                         fprintf(g_rtt_log_file, "%d,1,%.2f,%.2f,%.2f\n",
@@ -108,9 +111,8 @@ static void on_client_recv(const uint8_t *data, size_t len, void *user_data) {
             }
         } else {
             g_remote_ack_count++;
-            printf(">>> [REMOTE ACK RECV] hitId=%d from client_%d | recv_time=%.2f ms\n",
-                   ack->hit_id, ack->client_id, recv_time);
-            fflush(stdout);
+            LOG_PRINT(2, ">>> [REMOTE ACK RECV] hitId=%d from client_%d | recv_time=%.2f ms\n",
+                      ack->hit_id, ack->client_id, recv_time);
 
             if (g_rtt_log_file) {
                 fprintf(g_rtt_log_file, "%d,0,0.0,%.2f,0.0\n",
@@ -133,7 +135,11 @@ static int compare_doubles(const void *a, const void *b) {
 }
 
 static void print_rtt_summary(void) {
-    double rtts[MAX_HITS];
+    if (g_verbose < 1) return;
+
+    double *rtts = malloc((g_record_count > 0 ? g_record_count : 1) * sizeof(double));
+    if (!rtts) return;
+
     int count = 0;
     int lost = 0;
 
@@ -162,6 +168,7 @@ static void print_rtt_summary(void) {
     }
     printf("=========================================\n");
     fflush(stdout);
+    free(rtts);
 }
 
 void print_usage(const char *prog_name) {
@@ -174,6 +181,8 @@ void print_usage(const char *prog_name) {
     printf("  -s, --scheduler ALG    Scheduler algorithm (default: pmp)\n");
     printf("  -c, --congestion ALG   Congestion algorithm (default: cubic)\n");
     printf("  -o, --out FILE         Output log (default: rtt_results.csv)\n");
+    printf("  -v, --verbose LEVEL    Verbosity level: 0=silent, 1=summary, 2=full (default: 2)\n");
+    printf("  -Q, --quiet            Quiet mode (alias for -v 1)\n");
     printf("  -h, --help             Show this help message\n");
 }
 
@@ -198,12 +207,14 @@ int main(int argc, char *argv[]) {
         {"congestion", required_argument, 0, 'c'},
         {"qlog",       required_argument, 0, 'q'},
         {"out",        required_argument, 0, 'o'},
+        {"verbose",    required_argument, 0, 'v'},
+        {"quiet",      no_argument,       0, 'Q'},
         {"help",       no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
     int opt, option_index = 0;
-    while ((opt = getopt_long(argc, argv, "t:i:p:l:r:s:c:o:q:h", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "t:i:p:l:r:s:c:o:q:v:Qh", long_options, &option_index)) != -1) {
         switch (opt) {
             case 't': trace_file    = optarg; break;
             case 'i': target_peer   = optarg; break;
@@ -214,6 +225,8 @@ int main(int argc, char *argv[]) {
             case 'c': congestion    = optarg; break;
             case 'o': out_log_file  = optarg; break;
             case 'q': out_qlog_file = optarg; break;
+            case 'v': g_verbose     = atoi(optarg); break;
+            case 'Q': g_verbose     = 1; break;
             case 'h': print_usage(argv[0]); return EXIT_SUCCESS;
             default:  print_usage(argv[0]); return EXIT_FAILURE;
         }
@@ -265,13 +278,12 @@ int main(int argc, char *argv[]) {
         config.local_ips[i] = local_ips[i];
     }
 
-    printf("Starting QUIC Client [ID: %d | Peer: '%s']...\n", g_my_client_id, target_peer);
-    printf("Local IPs (%d): ", num_local_addrs);
-    for (int i = 0; i < num_local_addrs; i++) printf("%s ", local_ips[i]);
-    printf("\nPeer IPs  (%d): ", num_peer_addrs);
-    for (int i = 0; i < num_peer_addrs; i++) printf("%s ", peer_ips[i]);
-    printf("\n");
-    fflush(stdout);
+    LOG_PRINT(1, "Starting QUIC Client [ID: %d | Peer: '%s']...\n", g_my_client_id, target_peer);
+    LOG_PRINT(1, "Local IPs (%d): ", num_local_addrs);
+    for (int i = 0; i < num_local_addrs; i++) LOG_PRINT(1, "%s ", local_ips[i]);
+    LOG_PRINT(1, "\nPeer IPs  (%d): ", num_peer_addrs);
+    for (int i = 0; i < num_peer_addrs; i++) LOG_PRINT(1, "%s ", peer_ips[i]);
+    LOG_PRINT(1, "\n");
 
     quic_endpoint_t *client = quic_client_start(&config);
     if (!client) {
@@ -299,8 +311,7 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    printf("Replaying trace '%s' for peer '%s'...\n", trace_file, target_peer);
-    fflush(stdout);
+    LOG_PRINT(1, "Replaying trace '%s' for peer '%s'...\n", trace_file, target_peer);
 
     char line[2048];
     int parsed_lines = 0;
@@ -377,9 +388,8 @@ int main(int argc, char *argv[]) {
             g_record_count++;
         }
 
-        printf(">>> [CLIENT SEND] hitId=%d | rel_offset=%.2fms | prep=%.2fms | srv_proc=%.2fms\n",
-               hit_id, rel_offset_ms, client_prep_ms, server_proc_ms);
-        fflush(stdout);
+        LOG_PRINT(2, ">>> [CLIENT SEND] hitId=%d | rel_offset=%.2fms | prep=%.2fms | srv_proc=%.2fms\n",
+                  hit_id, rel_offset_ms, client_prep_ms, server_proc_ms);
 
         quic_send(client, (const uint8_t *)&req, sizeof(req));
     }
@@ -387,9 +397,8 @@ int main(int argc, char *argv[]) {
     fclose(f);
 
     if (matched_lines == 0) {
-        printf("\n[WARNING] Parsed %d rows, but 0 matched peer '%s' + event 'send'!\n", 
-               parsed_lines, target_peer);
-        fflush(stdout);
+        LOG_PRINT(1, "\n[WARNING] Parsed %d rows, but 0 matched peer '%s' + event 'send'!\n", 
+                  parsed_lines, target_peer);
     }
 
     // Process network events to catch final ACKs
@@ -400,10 +409,9 @@ int main(int argc, char *argv[]) {
     }
 
     print_rtt_summary();
-    fflush(stdout);
+    if (g_rtt_log_file) fclose(g_rtt_log_file);
 
     quic_endpoint_stop(client);
-    if (g_rtt_log_file) { fclose(g_rtt_log_file); g_rtt_log_file = NULL; }
     fflush(stdout);
     fflush(stderr);
     exit(EXIT_SUCCESS);
