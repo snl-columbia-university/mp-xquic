@@ -71,7 +71,7 @@ static xqc_scheduler_callback_t get_scheduler_cb(const char *name) {
     if (strcmp(name, "pmp") == 0) return xqc_proactive_multipath_scheduler_cb;
     if (strcmp(name, "psp") == 0) return xqc_proactive_singlepath_scheduler_cb;
     if (strcmp(name, "rmp") == 0) return xqc_reactive_multipath_scheduler_cb;
-    if (strcmp(name, "spmp") == 0) return xqc_smart_proactive_multipath_scheduler_cb;
+    if (strcmp(name, "omp") == 0) return xqc_optimization_multipath_scheduler_cb;
     if (strcmp(name, "bi") == 0) return xqc_biphony_scheduler_cb;
     if (strcmp(name, "bfec") == 0) return xqc_backup_fec_scheduler_cb;
     if (strcmp(name, "rspread") == 0) return xqc_repair_spread_scheduler_cb;
@@ -120,8 +120,13 @@ int is_new_datagram_win(uint16_t id, uint16_t *max_dgram_header_id, uint64_t *se
 }
 
 // QUIC logging callback
-static void log_write(xqc_log_level_t lvl, const void *buf, size_t size, void *arg) { 
-    LOG_DEBUG("%.*s", (int)size, (char*)buf); 
+static void quic_log_write(xqc_log_level_t lvl, const void *buf, size_t size, void *user_data){
+    quic_endpoint_t *ep = (quic_endpoint_t *)user_data;
+    if (ep && ep->qlog_file && buf && size > 0) {
+        fwrite(buf, 1, size, ep->qlog_file);
+        fputc('\n', ep->qlog_file);
+        fflush(ep->qlog_file);
+    }
 }
 static void qlog_event_write(qlog_event_importance_t imp, const void *buf, 
                              size_t size, void *user_data) 
@@ -659,8 +664,8 @@ quic_endpoint_t *quic_client_start(const quic_client_config_t *config) {
     xqc_engine_callback_t eng_cb = {
         .set_event_timer = set_event_timer,
         .log_callbacks = { 
-            .xqc_log_write_err = log_write, 
-            .xqc_log_write_stat = log_write,
+            .xqc_log_write_err = quic_log_write, 
+            .xqc_log_write_stat = quic_log_write,
             .xqc_qlog_event_write = qlog_event_write 
         }
     };
@@ -755,8 +760,8 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
         .set_event_timer = set_event_timer,
         .cid_generate_cb = cid_generate_cb,
         .log_callbacks = { 
-            .xqc_log_write_err = log_write, 
-            .xqc_log_write_stat = log_write,
+            .xqc_log_write_err = quic_log_write, 
+            .xqc_log_write_stat = quic_log_write,
             .xqc_qlog_event_write = qlog_event_write 
         }
     };

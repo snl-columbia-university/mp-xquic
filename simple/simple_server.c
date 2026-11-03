@@ -432,7 +432,7 @@ int main(int argc, char *argv[]) {
                 } else if (strcmp(optarg, "rmp") == 0) {
                     conn_settings.scheduler_callback = xqc_reactive_multipath_scheduler_cb;
                 } else if (strcmp(optarg, "spmp") == 0) {
-                    conn_settings.scheduler_callback = xqc_smart_proactive_multipath_scheduler_cb;
+                    conn_settings.scheduler_callback = xqc_optimization_multipath_scheduler_cb;
                 } else {
                     conn_settings.scheduler_callback = xqc_minrtt_scheduler_cb;
                 }

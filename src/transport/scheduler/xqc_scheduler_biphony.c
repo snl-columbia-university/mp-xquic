@@ -1,8 +1,3 @@
-/**
- * @file xqc_scheduler_biphony.c
- * @brief Biphony multipath scheduler implementation for XQUIC.
- */
-
 #include <stdio.h>
 #include <math.h>
 #include "src/transport/scheduler/xqc_scheduler_common.h"
