@@ -1,8 +1,3 @@
-/**
- * @copyright Copyright (c) 2022, Alibaba Group Holding Limited
- */
-
-
 #include "src/transport/scheduler/xqc_scheduler_proactive_multipath.h"
 #include "src/transport/scheduler/xqc_scheduler_common.h"
 #include "src/transport/xqc_send_ctl.h"
