@@ -476,7 +476,7 @@ target_link_libraries(
 add_library(
     quic_api
     STATIC
-    "api/quic_api.c"  # Adjust path if quic_api.c is in a subfolder (e.g., "simple/quic_api.c")
+    "api/quic_api.c"
     "api/quic_rtp.c"
 )
 
@@ -494,7 +494,7 @@ target_link_libraries(
 # 3. Build api_server executable
 add_executable(
     api_server
-    "api/api_server.c"  # Adjust path if in a subfolder (e.g., "simple/api_server.c")
+    "api/api_server.c"
 )
 
 target_link_libraries(
@@ -512,7 +512,7 @@ target_link_libraries(
 # 4. Build api_client executable
 add_executable(
     api_client
-    "api/api_client.c"  # Adjust path if in a subfolder (e.g., "simple/api_client.c")
+    "api/api_client.c"
 )
 
 target_link_libraries(
@@ -529,7 +529,7 @@ target_link_libraries(
 
 add_executable(
     xr_server
-    "api/xr_server.c"  # Adjust path if in a subfolder (e.g., "simple/api_server.c")
+    "api/xr_server.c"
 )
 
 target_link_libraries(
@@ -547,11 +547,45 @@ target_link_libraries(
 # 4. Build api_client executable
 add_executable(
     xr_client
-    "api/xr_client.c"  # Adjust path if in a subfolder (e.g., "simple/api_client.c")
+    "api/xr_client.c"
 )
 
 target_link_libraries(
     xr_client
+    PRIVATE
+    quic_api
+    xquic-static
+    ${SSL_LIB_PATH}
+    ${LIBEVENT_LIB}
+    -lpthread
+    -lstdc++
+    -lm
+)
+
+add_executable(
+    cg_client
+    "api/cg_client.c"
+)
+
+target_link_libraries(
+    cg_client
+    PRIVATE
+    quic_api
+    xquic-static
+    ${SSL_LIB_PATH}
+    ${LIBEVENT_LIB}
+    -lpthread
+    -lstdc++
+    -lm
+)
+
+add_executable(
+    cg_server
+    "api/cg_server.c"
+)
+
+target_link_libraries(
+    cg_server
     PRIVATE
     quic_api
     xquic-static
