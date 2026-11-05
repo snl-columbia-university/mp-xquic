@@ -37,6 +37,7 @@ struct quic_endpoint {
     struct event_base *eb;
     struct event *timer_ev;
     struct event *quic_ev;
+    struct event *probe_ev;
 
     int quic_fd;
 
