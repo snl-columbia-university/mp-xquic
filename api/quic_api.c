@@ -21,6 +21,8 @@
 
 #define MAX_BATCH_SIZE 64
 
+#define PATH_PROBE_INTERVAL_US 100000
+
 #define XQC_SOCKET_ERROR -1
 #define XQC_SOCKET_EAGAIN -2
 
@@ -362,6 +364,9 @@ static int conn_create_notify(xqc_connection_t *conn, const xqc_cid_t *cid, void
     ep->dgram_header_id = 0;
     ep->max_dgram_header_id = 0;
     memset(ep->dgram_header_win, 0, sizeof(ep->dgram_header_win));
+    if (ep->mode == QUIC_MODE_SERVER) {
+        memcpy(&ep->cid, cid, sizeof(ep->cid));
+    }
     xqc_datagram_set_user_data(conn, ep);
     xqc_conn_set_alp_user_data(conn, ep);
     return 0; 
@@ -489,6 +494,12 @@ static void engine_timer_cb(int fd, short what, void *arg) {
     xqc_engine_main_logic(ep->engine);
 }
 
+static void path_probe_cb(int fd, short what, void *arg) {
+    quic_endpoint_t *ep = (quic_endpoint_t *)arg;
+    if (!ep || !ep->engine || !ep->conn || !ep->connected) return;
+    xqc_conn_send_ping(ep->engine, &ep->cid, NULL);
+}
+
 // QUIC packet read callback
 #define RECV_BATCH_MAX 64
 
@@ -587,6 +598,10 @@ static int init_quic_socket_and_events(quic_endpoint_t *ep, uint16_t port) {
     ep->timer_ev = event_new(ep->eb, -1, 0, engine_timer_cb, ep);
     struct timeval tv = {0, 10000};
     event_add(ep->timer_ev, &tv);
+
+    ep->probe_ev = event_new(ep->eb, -1, EV_PERSIST, path_probe_cb, ep);
+    struct timeval probe_tv = {0, PATH_PROBE_INTERVAL_US};
+    event_add(ep->probe_ev, &probe_tv);
 
     return 0;
 }
@@ -963,6 +978,11 @@ void quic_endpoint_stop(quic_endpoint_t *ep) {
     if (ep->timer_ev) {
         event_free(ep->timer_ev);
         ep->timer_ev = NULL;
+    }
+
+    if (ep->probe_ev) {
+        event_free(ep->probe_ev);
+        ep->probe_ev = NULL;
     }
 
     if (ep->quic_fd >= 0) {

@@ -1,6 +1,7 @@
 #include "src/transport/scheduler/xqc_scheduler_optimization_multipath.h"
 #include "src/transport/scheduler/xqc_scheduler_common.h"
 #include "src/transport/xqc_send_ctl.h"
+#include "xquic/xquic_typedef.h"
 #include <float.h>
 
 #define TARGET_LOSS 1e-4
@@ -78,6 +79,11 @@ xqc_optimization_multipath_scheduler_get_path(void *scheduler, xqc_connection_t 
     // filter paths
     xqc_list_for_each_safe(pos, next, &conn->conn_paths_list) {
         path = xqc_list_entry(pos, xqc_path_ctx_t, path_list);
+        xqc_log(conn->log, XQC_LOG_DEBUG,
+                "|opt_sched_path| path:%ui state:%d app_status:%d srtt:%ui rttvar:%ui latest_rtt:%ui min_rtt:%ui|",
+                path->path_id, path->path_state, path->app_path_status,
+                path->path_send_ctl->ctl_srtt, path->path_send_ctl->ctl_rttvar,
+                path->path_send_ctl->ctl_latest_rtt, path->path_send_ctl->ctl_minrtt);
         if (path->path_state != XQC_PATH_STATE_ACTIVE || path->app_path_status == XQC_APP_PATH_STATUS_FROZEN) continue;
         active_found = 1;
         
