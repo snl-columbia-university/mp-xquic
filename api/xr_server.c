@@ -9,6 +9,10 @@
 #define MAX_IPS 16
 #define MAX_PENDING 4096
 
+// Logging levels: 0 = SILENT, 1 = SUMMARY/STATUS, 2 = FULL/VERBOSE
+static int g_verbose = 2; // Default to full logging
+#define LOG_PRINT(level, fmt, ...) do { if (g_verbose >= (level)) (printf(fmt, ##__VA_ARGS__), fflush(stdout)); } while(0)
+
 // --- Network Packet Structures ---
 
 typedef struct __attribute__((packed)) {
@@ -31,7 +35,6 @@ typedef struct {
 } pending_ack_t;
 
 static quic_endpoint_t *g_server = NULL;
-static quic_endpoint_t *g_server2 = NULL;
 static pending_ack_t g_pending_acks[MAX_PENDING] = {0};
 
 static double get_time_ms(void) {
@@ -76,8 +79,8 @@ static void on_server_recv(const uint8_t *data, size_t len, void *user_data) {
     if (len >= sizeof(hit_request_t)) {
         const hit_request_t *req = (const hit_request_t *)data;
 
-        printf("<<< [SERVER RECV] hitId=%d from client_%d | Requested processing delay: %.2f ms\n",
-               req->hit_id, req->client_id, req->server_proc_ms);
+        LOG_PRINT(2, "<<< [SERVER RECV] hitId=%d from client_%d | Requested processing delay: %.2f ms\n",
+                  req->hit_id, req->client_id, req->server_proc_ms);
 
         hit_ack_t ack = {
             .hit_id = req->hit_id,
@@ -102,6 +105,9 @@ void print_usage(const char *prog_name) {
     printf("  -l, --local-ips IPS    Comma-separated local IPs to bind (default: 127.0.0.2,127.0.0.3)\n");
     printf("  -s, --scheduler ALG    Scheduler algorithm (default: pmp)\n");
     printf("  -c, --congestion ALG   Congestion algorithm (default: cubic)\n");
+    printf("  -q, --qlog FILE        qlog output file (default: server.qlog)\n");
+    printf("  -v, --verbose LEVEL    Verbosity level: 0=silent, 1=status, 2=full (default: 2)\n");
+    printf("  -Q, --quiet            Quiet mode (alias for -v 1)\n");
     printf("  -h, --help             Show this help message\n");
 }
 
@@ -116,17 +122,21 @@ int main(int argc, char *argv[]) {
         {"scheduler",  required_argument, 0, 's'},
         {"congestion", required_argument, 0, 'c'},
         {"qlog",       required_argument, 0, 'q'},
+        {"verbose",    required_argument, 0, 'v'},
+        {"quiet",      no_argument,       0, 'Q'},
         {"help",       no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
     int opt, option_index = 0;
-    while ((opt = getopt_long(argc, argv, "l:s:c:q:h", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "l:s:c:q:v:Qh", long_options, &option_index)) != -1) {
         switch (opt) {
             case 'l': raw_local_ips = optarg; break;
             case 's': scheduler     = optarg; break;
             case 'c': congestion    = optarg; break;
             case 'q': out_qlog_file = optarg; break;
+            case 'v': g_verbose     = atoi(optarg); break;
+            case 'Q': g_verbose     = 1; break;
             case 'h': print_usage(argv[0]); return EXIT_SUCCESS;
             default:  print_usage(argv[0]); return EXIT_FAILURE;
         }
@@ -142,10 +152,11 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    printf("Starting QUIC Servers with %d local IP(s): ", num_local_addrs);
-    for (int i = 0; i < num_local_addrs; i++) printf("%s ", local_ips[i]);
-    printf("\n");
-    fflush(stdout);
+    LOG_PRINT(1, "Starting QUIC Servers with %d local IP(s): ", num_local_addrs);
+    for (int i = 0; i < num_local_addrs; i++) {
+        LOG_PRINT(1, "%s ", local_ips[i]);
+    }
+    LOG_PRINT(1, "\n");
 
     // --- Server Endpoint Config (Port 8000) ---
     quic_server_config_t config = {
@@ -165,14 +176,14 @@ int main(int argc, char *argv[]) {
         config.local_ips[i] = local_ips[i];
     }
 
-    printf("Starting QUIC Replay Server 1 on port 8000...\n");
+    LOG_PRINT(1, "Starting QUIC Replay Server 1 on port 8000...\n");
     g_server = quic_server_start(&config);
     if (!g_server) {
         fprintf(stderr, "Failed to start Server 1!\n");
         return EXIT_FAILURE;
     }
 
-    printf("Server running. Press Ctrl+C to stop.\n");
+    LOG_PRINT(1, "Server running. Press Ctrl+C to stop.\n");
     
     // Main Non-Blocking Loop
     while (1) {

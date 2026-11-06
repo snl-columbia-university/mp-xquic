@@ -19,7 +19,7 @@
 #include <xquic/xquic.h>
 #include <sys/socket.h>
 
-#define MAX_BATCH_SIZE 64
+#define MAX_BATCH_SIZE 128
 
 #define PATH_PROBE_INTERVAL_US 100000
 
@@ -886,7 +886,7 @@ int quic_send(quic_endpoint_t *ep, const uint8_t *data, size_t len) {
         memcpy(buf, &net_header_id, DGRAM_HEADER_SIZE);
         memcpy(buf + DGRAM_HEADER_SIZE, data, len);
 
-        LOG_DEBUG("[quic] packed dgram: msg_id=%u, seq=0, max_seq=0, wire_id=%u, full_dgram_id=%lu\n", 
+        LOG_DEBUG("[quic] packed dgram: msg_id=%u, frag_idx=0, max_frag_idx=0, wire_id=%u, full_dgram_id=%lu\n", 
             ep->msg_id - 1, dgram_header_id, (unsigned long)dgram_id);
 
         return xqc_datagram_send(ep->conn, buf, len + DGRAM_HEADER_SIZE, &dgram_id, 1);
@@ -899,27 +899,30 @@ int quic_send_msg(quic_endpoint_t *ep, struct iovec *iov, size_t iov_size) {
     if (!ep || !ep->conn || !iov || iov_size == 0) return -1;
 
     if (ep->datagram_mode) {
-        if (iov_size > MAX_BATCH_SIZE) return -1;
+        if (iov_size > MAX_BATCH_SIZE) {
+            LOG_WARN("[quic] quic_send_msg: %zu fragments > MAX_BATCH_SIZE %d, message refused\n", iov_size, MAX_BATCH_SIZE);
+            return -1;
+        }
 
         struct iovec batch_iov[MAX_BATCH_SIZE];
         uint64_t out_dgram_ids[MAX_BATCH_SIZE];
         static __thread uint8_t buf[MAX_BATCH_SIZE][MAX_DGRAM_SIZE]; 
 
         uint16_t batch_msg_id = ep->msg_id++;
-        uint8_t max_seq = (uint8_t)(iov_size - 1);
+        uint8_t max_frag_idx = (uint8_t)(iov_size - 1);
 
         for (size_t i = 0; i < iov_size; i++) {
             size_t len = iov[i].iov_len;
             if (len + DGRAM_HEADER_SIZE > MAX_DGRAM_SIZE) return -1;
 
             uint16_t dgram_header_id = ep->dgram_header_id++;
-            out_dgram_ids[i] = pack_dgram_id(batch_msg_id, (uint8_t)i, max_seq, dgram_header_id);
+            out_dgram_ids[i] = pack_dgram_id(batch_msg_id, (uint8_t)i, max_frag_idx, dgram_header_id);
 
             uint16_t net_wire_id = htons(dgram_header_id);
             memcpy(buf[i], &net_wire_id, DGRAM_HEADER_SIZE);
             memcpy(buf[i] + DGRAM_HEADER_SIZE, iov[i].iov_base, len);
 
-            LOG_DEBUG("[quic] packed dgram: msg_id=%u, seq=%u, max_seq=%u, wire_id=%u, full_dgram_id=%lu\n", 
+            LOG_DEBUG("[quic] packed dgram: msg_id=%u, frag_idx=%u, max_frag_idx=%u, wire_id=%u, full_dgram_id=%lu\n", 
                 batch_msg_id, (unsigned int)i, (unsigned int)(iov_size - 1), dgram_header_id, (unsigned long)out_dgram_ids[i]);
 
             batch_iov[i].iov_base = buf[i];
