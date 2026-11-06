@@ -19,7 +19,7 @@
 #include <xquic/xquic.h>
 #include <sys/socket.h>
 
-#define MAX_BATCH_SIZE 64
+#define MAX_BATCH_SIZE 128
 
 #define XQC_SOCKET_ERROR -1
 #define XQC_SOCKET_EAGAIN -2
@@ -875,7 +875,10 @@ int quic_send_msg(quic_endpoint_t *ep, struct iovec *iov, size_t iov_size) {
     if (!ep || !ep->conn || !iov || iov_size == 0) return -1;
 
     if (ep->datagram_mode) {
-        if (iov_size > MAX_BATCH_SIZE) return -1;
+        if (iov_size > MAX_BATCH_SIZE) {
+            LOG_WARN("[quic] quic_send_msg: %zu fragments > MAX_BATCH_SIZE %d, message refused\n", iov_size, MAX_BATCH_SIZE);
+            return -1;
+        }
 
         struct iovec batch_iov[MAX_BATCH_SIZE];
         uint64_t out_dgram_ids[MAX_BATCH_SIZE];

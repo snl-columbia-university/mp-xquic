@@ -48,6 +48,7 @@ typedef struct {
     int rtp;
     int pdu_set;
     int rtp_tag;
+    int client_id;
 } app_config_t;
 
 typedef struct __attribute__((packed)) {
@@ -191,6 +192,7 @@ static void on_client_recv(const uint8_t *data, size_t len, void *user_data) {
         const wire_ack_t *ack = (const wire_ack_t *)data;
 
         if (ack->frame_id < 0) return;
+        g_remote_ack_count++;
 
         int lo = g_frame_count - ACK_LOOKBACK;
         if (lo < 0) lo = 0;
@@ -278,9 +280,10 @@ int main(int argc, char *argv[]) {
     };
 
     int opt, option_index = 0;
-    while ((opt = getopt_long(argc, argv, "t:p:l:r:s:c:o:q:v:QF:Dw:T:RP:Gh", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "t:i:p:l:r:s:c:o:q:v:QF:Dw:T:RP:Gh", long_options, &option_index)) != -1) {
         switch (opt) {
             case 't': cfg.trace_file = optarg; break;
+            case 'i': cfg.client_id = atoi(optarg); break;
             case 'p': cfg.peer_port = atoi(optarg); break;
             case 'l': cfg.raw_local_ips = optarg; break;
             case 'r': cfg.raw_peer_ips = optarg; break;
@@ -421,6 +424,7 @@ int main(int argc, char *argv[]) {
         for (uint32_t i = 0; i < total_frags; i++) {
             size_t frag_len = (bytes_remaining > MAX_PAYLOAD_MPS) ? MAX_PAYLOAD_MPS : bytes_remaining;
             bytes_remaining -= frag_len;
+            if (frag_len < sizeof(wire_frame_t)) frag_len = sizeof(wire_frame_t);
             
             frm->frags[i].frag_idx = i;
             frm->frags[i].payload_len = (uint32_t)frag_len;

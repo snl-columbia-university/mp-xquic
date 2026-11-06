@@ -1,4 +1,5 @@
 #include <getopt.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -45,6 +46,7 @@ typedef struct {
     int rtp;
     int pdu_set;
     int rtp_tag;
+    int client_id;
 } app_config_t;
 
 typedef struct __attribute__((packed)) {
@@ -62,6 +64,23 @@ typedef struct __attribute__((packed)) {
 
 static quic_endpoint_t *g_server = NULL;
 static FILE *frag_log = NULL;
+static volatile sig_atomic_t g_stop = 0;
+
+// SIGINT/SIGTERM: leave the main loop so the endpoint is stopped and frag_log is flushed and closed
+static void on_signal(int sig) { (void)sig; g_stop = 1; }
+
+// ACKs are queued in the receive callback and sent from the main loop after each step, so sending does not
+// interleave with reading a batch of packets. Sent early if the queue fills.
+#define MAX_PENDING_ACKS 4096
+static wire_ack_t g_pending_acks[MAX_PENDING_ACKS];
+static int g_num_pending_acks = 0;
+
+static void flush_pending_acks(void) {
+    for (int i = 0; i < g_num_pending_acks; i++) {
+        quic_send(g_server, (const uint8_t *)&g_pending_acks[i], sizeof(wire_ack_t));
+    }
+    g_num_pending_acks = 0;
+}
 
 // helpers
 static int parse_ip_list(const char *str, char bufs[MAX_IPS][64], const char *ptrs[MAX_IPS]) {
@@ -118,7 +137,8 @@ static void on_server_recv(const uint8_t *data, size_t len, void *user_data) {
         }
 
         if (g_server) {
-            quic_send(g_server, (const uint8_t *)&ack, sizeof(wire_ack_t));
+            if (g_num_pending_acks == MAX_PENDING_ACKS) flush_pending_acks();
+            g_pending_acks[g_num_pending_acks++] = ack;
         }
     }
 }
@@ -152,9 +172,10 @@ int main(int argc, char *argv[]) {
     };
 
     int opt, option_index = 0;
-    while ((opt = getopt_long(argc, argv, "t:p:l:r:s:c:o:q:v:QF:Dw:T:RP:Gh", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "t:i:p:l:r:s:c:o:q:v:QF:Dw:T:RP:Gh", long_options, &option_index)) != -1) {
         switch (opt) {
             case 't': cfg.trace_file = optarg; break;
+            case 'i': cfg.client_id = atoi(optarg); break;
             case 'p': cfg.local_port = atoi(optarg); break;
             case 'l': cfg.raw_local_ips = optarg; break;
             case 'r': cfg.raw_peer_ips = optarg; break;
@@ -223,8 +244,12 @@ int main(int argc, char *argv[]) {
 
     LOG_PRINT(1, "Server running. Waiting for client datagrams...\n");
 
-    while (1) {
+    signal(SIGINT, on_signal);
+    signal(SIGTERM, on_signal);
+
+    while (!g_stop) {
         quic_endpoint_step(g_server);
+        flush_pending_acks();
         usleep(100); 
     }
 
