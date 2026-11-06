@@ -66,19 +66,32 @@ static quic_endpoint_t *g_server = NULL;
 static FILE *frag_log = NULL;
 static volatile sig_atomic_t g_stop = 0;
 
-// SIGINT/SIGTERM: leave the main loop so the endpoint is stopped and frag_log is flushed and closed
+// kill capturing
 static void on_signal(int sig) { (void)sig; g_stop = 1; }
 
-// ACKs are queued in the receive callback and sent from the main loop after each step, so sending does not
-// interleave with reading a batch of packets. Sent early if the queue fills.
+// ack flushing 
 #define MAX_PENDING_ACKS 4096
 static wire_ack_t g_pending_acks[MAX_PENDING_ACKS];
 static int g_num_pending_acks = 0;
 
 static void flush_pending_acks(void) {
+    if (g_num_pending_acks <= 0) return;
+
+    struct iovec iovs[MAX_PENDING_ACKS]; 
+
     for (int i = 0; i < g_num_pending_acks; i++) {
-        quic_send(g_server, (const uint8_t *)&g_pending_acks[i], sizeof(wire_ack_t));
+        iovs[i].iov_base = &g_pending_acks[i];
+        iovs[i].iov_len = sizeof(wire_ack_t);
     }
+
+    int error = quic_send_msg(g_server, iovs, g_num_pending_acks);
+    
+    if (error < 0) {
+        LOG_PRINT(1, "!!! [ACK BATCH SEND FAILED] error = %d\n", error);
+    } else {
+        LOG_PRINT(2, "<<< [ACK BATCH SENT] %d acks flushed\n", g_num_pending_acks);
+    }
+
     g_num_pending_acks = 0;
 }
 
