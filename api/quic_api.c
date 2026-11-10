@@ -701,7 +701,7 @@ quic_endpoint_t *quic_client_start(const quic_client_config_t *config) {
     ep->engine = xqc_engine_create(XQC_ENGINE_CLIENT, &cfg, &ssl_cfg, &eng_cb, &trans_cb, ep);
     if (!ep->engine) { free(ep); return NULL; }
 
-    xqc_engine_set_log_level(ep->engine, XQC_LOG_DEBUG);
+    //xqc_engine_set_log_level(ep->engine, XQC_LOG_INFO);
 
     xqc_app_proto_callbacks_t ap_cbs = {
         .conn_cbs = {
@@ -836,7 +836,7 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
     ep->engine = xqc_engine_create(XQC_ENGINE_SERVER, &cfg, &ssl_cfg, &eng_cb, &trans_cb, ep);
     if (!ep->engine) { free(ep); return NULL; }
 
-    xqc_engine_set_log_level(ep->engine, XQC_LOG_DEBUG);
+    //xqc_engine_set_log_level(ep->engine, XQC_LOG_DEBUG);
 
     xqc_server_set_conn_settings(ep->engine, &conn_settings);
 

@@ -2097,7 +2097,7 @@ xqc_conn_schedule_packets(xqc_connection_t *conn,  xqc_list_head_t *head,
         {
             xqc_list_head_t *pos;
             
-            xqc_log(conn->log, XQC_LOG_INFO, 
+            xqc_log(conn->log, XQC_LOG_DEBUG, 
                                     "|[REDUNDANCY]| cloned packet queuing | base_packet_pns:%d | redundancy_mask:%ui | frame_type:%s|", 
                                     packet_out->po_pkt.pkt_pns, packet_out->po_experimental_redundancy_mask, xqc_frame_type_2_str(conn->engine, packet_out->po_frame_types));
 
@@ -2126,14 +2126,14 @@ xqc_conn_schedule_packets(xqc_connection_t *conn,  xqc_list_head_t *head,
                                 po_copy->po_flag &= ~(XQC_POF_REINJECTED_REPLICA | XQC_POF_REINJECTED_ORIGIN);
                                 po_copy->po_experimental_redundancy_mask = 0; 
                                 
-                                xqc_log(conn->log, XQC_LOG_INFO, 
+                                xqc_log(conn->log, XQC_LOG_DEBUG, 
                                         "|[REDUNDANCY]| cloned packet queued | base_packet_pns:%d | target_path_id:%ui | redundancy_mask:%ui | frame_type:%s|", 
                                         packet_out->po_pkt.pkt_pns, target_path->path_id, packet_out->po_experimental_redundancy_mask, xqc_frame_type_2_str(conn->engine, packet_out->po_frame_types));
 
                                 xqc_send_queue_insert_send(po_copy, &conn->conn_send_queue->sndq_send_packets, conn->conn_send_queue);
                                 xqc_path_send_buffer_append(target_path, po_copy, &target_path->path_schedule_buf[send_type]);
 
-                                xqc_log(conn->log, XQC_LOG_INFO,
+                                xqc_log(conn->log, XQC_LOG_DEBUG,
                                     "|CLONING_DONE|original_pkt:%ui|mask_after:%ui|clone_pkt:%ui|target_path:%ui|",
                                     packet_out->po_pkt.pkt_num,
                                     packet_out->po_experimental_redundancy_mask,

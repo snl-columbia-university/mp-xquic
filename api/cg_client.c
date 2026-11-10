@@ -339,6 +339,8 @@ int main(int argc, char *argv[]) {
     if (!client) return EXIT_FAILURE;
 
     while (!is_connected(client)) { quic_endpoint_step(client); usleep(100); }
+    
+    sleep(1);
 
     FILE *f = fopen(cfg.trace_file, "r");
     if (!f) return EXIT_FAILURE;
