@@ -28,6 +28,7 @@
 #define XQC_FEC_CODE_RATE_DEFAULT       0.95
 #define XQC_REPAIR_LEN                  10         /* (1-XQC_FEC_CODE_RATE_DEFAULT) * XQC_FEC_MAX_SYMBOL_NUM_PBLOCK */
 #define XQC_BLOCK_MODE_LEN              5
+#define XQC_FEC_FIN_RING                4096   /* finished block ids remembered by the decoder */
 #define XQC_SYMBOL_CACHE_LEN            96
 #define XQC_MAX_RPR_KEY_SIZE            10
 #define XQC_MAX_SYMBOL_SIZE             XQC_MAX_PACKET_OUT_SIZE + XQC_ACK_SPACE - XQC_FEC_SPACE
@@ -95,6 +96,7 @@ typedef struct xqc_fec_ctl_s {
     uint32_t                     fec_send_repair_num_total;
     uint32_t                     fec_send_ahead;
     xqc_int_t                    fec_max_fin_blk_id;
+    uint64_t                     fec_fin_ring[XQC_FEC_FIN_RING];   /* block_id + 1 of finished blocks, 0 = empty */
     xqc_stream_id_t              latest_stream_id[XQC_FEC_BLOCK_NUM];
 
     xqc_fec_mp_mode_e            fec_mp_mode;

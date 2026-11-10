@@ -2,6 +2,7 @@
 
 #include "quic_api.h"
 #include "quic_rtp.h"
+#include "quic_fec.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -228,7 +229,7 @@ int quic_rtp_send(quic_endpoint_t *ep, const uint8_t *data, size_t len) {
            engine tick, so with rtp_tag write them now, while the tag is set */
         ep->tx_tag_valid = len >= 4;
         if (ep->tx_tag_valid) memcpy(&ep->tx_tag, data, sizeof(ep->tx_tag));
-        int ret = xqc_datagram_send(ep->conn, buf, len + DGRAM_HEADER_SIZE, &dgram_id, 1);
+        int ret = xqc_datagram_send(ep->conn, buf, len + DGRAM_HEADER_SIZE, &dgram_id, quic_fec_dgram_qos(ep));
         if (ret >= 0 && ep->engine) xqc_engine_main_logic(ep->engine);
         ep->tx_tag_valid = 0;            /* packets written later are untagged */
         return ret;
