@@ -6,9 +6,9 @@
 
 #define TARGET_LOSS 1e-4
 #define MAX_PATHS 16
-#define BETA_LATENCY 1
-#define GAMMA_JITTER 1
-#define ALPHA_BW 1
+#define BETA_LATENCY 1.0f
+#define GAMMA_JITTER 10.0f
+#define ALPHA_BW 0.1f
 
 static size_t
 xqc_optimization_multipath_scheduler_size()
@@ -90,13 +90,13 @@ xqc_optimization_multipath_scheduler_get_path(void *scheduler, xqc_connection_t 
         if (!xqc_scheduler_check_path_can_send(path, packet_out, check_cwnd)) continue;
         cwnd_found = 1;
         
-        if (path->path_send_ctl->ctl_srtt > 0 && xqc_send_ctl_get_est_bw(path->path_send_ctl) > 0 && count < MAX_PATHS) {
+        if (path->path_send_ctl->ctl_srtt > 0 && count < MAX_PATHS) {
             paths[count++] = path;
         }
     }
 
     if (cc_blocked) *cc_blocked = (active_found && !cwnd_found);
-    if (!count) return NULL;
+    if (!count) {xqc_log(conn->log, XQC_LOG_WARN, "|opt_sched| count:%d|", count); return NULL;}
 
     // find primary path
     int best_idx = -1;
@@ -136,7 +136,7 @@ xqc_optimization_multipath_scheduler_get_path(void *scheduler, xqc_connection_t 
             if (next_idx == -1) break;
 
             if (joint_loss > TARGET_LOSS || best_marg < min_cost) {
-                xqc_log(conn->log, XQC_LOG_INFO, 
+                xqc_log(conn->log, XQC_LOG_DEBUG, 
                         "|opt_sched_dup| ADDED path:%ui | reason:%s | loss:%.6f (target:%.6f) | old (lat:%.1f jit:%.1f bw:%.1f = %.1f) | new (lat:%.1f jit:%.1f bw:%.1f = %.1f)|",
                         paths[next_idx]->path_id,
                         (joint_loss > TARGET_LOSS) ? "loss_constraint" : "cost_reduction",
