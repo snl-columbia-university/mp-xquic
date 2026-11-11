@@ -9,6 +9,7 @@
 #define BETA_LATENCY 1.0f
 #define GAMMA_JITTER 10.0f
 #define ALPHA_BW 0.1f
+#define PATH_CAP 6
 
 static size_t
 xqc_optimization_multipath_scheduler_size()
@@ -114,6 +115,7 @@ xqc_optimization_multipath_scheduler_get_path(void *scheduler, xqc_connection_t 
     }
 
     // greedy add redundancy (driven by loss constraint OR latency reduction)
+    int paths_added = 0;
     if (conn->conn_settings.enable_experimental_redundancy && (packet_out->po_frame_types & XQC_FRAME_BIT_DATAGRAM)) {
         while (1) {
             float best_marg = FLT_MAX, next_loss = joint_loss;
@@ -135,7 +137,7 @@ xqc_optimization_multipath_scheduler_get_path(void *scheduler, xqc_connection_t 
 
             if (next_idx == -1) break;
 
-            if (joint_loss > TARGET_LOSS || best_marg < min_cost) {
+            if ((joint_loss > TARGET_LOSS || best_marg < min_cost) && (paths_added < PATH_CAP - 1)) {
                 xqc_log(conn->log, XQC_LOG_DEBUG, 
                         "|opt_sched_dup| ADDED path:%ui | reason:%s | loss:%.6f (target:%.6f) | old (lat:%.1f jit:%.1f bw:%.1f = %.1f) | new (lat:%.1f jit:%.1f bw:%.1f = %.1f)|",
                         paths[next_idx]->path_id,
@@ -148,6 +150,11 @@ xqc_optimization_multipath_scheduler_get_path(void *scheduler, xqc_connection_t 
                 joint_loss = next_loss;
                 min_cost = best_marg;
                 current_lat = best_lat; current_jit = best_jit; current_bw = best_bw;
+                paths_added++;
+            } else if (paths_added == PATH_CAP - 1){
+                xqc_log(conn->log, XQC_LOG_DEBUG, 
+                        "|opt_sched_dup| PATH_CAP met");
+                break;
             } else {
                 xqc_log(conn->log, XQC_LOG_DEBUG, 
                         "|opt_sched_dup| REJECTED path:%ui | old_loss:%.6f target:%.6f | old_cost:%.1f new_cost:%.1f|",
