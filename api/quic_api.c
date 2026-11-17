@@ -2,6 +2,7 @@
 
 #include "quic_api.h"
 #include "quic_rtp.h"
+#include "quic_fec.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -72,6 +73,8 @@ static xqc_scheduler_callback_t get_scheduler_cb(const char *name) {
     if (strcmp(name, "rmp") == 0) return xqc_reactive_multipath_scheduler_cb;
     if (strcmp(name, "spmp") == 0) return xqc_smart_proactive_multipath_scheduler_cb;
     if (strcmp(name, "bi") == 0) return xqc_biphony_scheduler_cb;
+    if (strcmp(name, "bfec") == 0) return xqc_backup_fec_scheduler_cb;
+    if (strcmp(name, "rspread") == 0) return xqc_repair_spread_scheduler_cb;
     return xqc_minrtt_scheduler_cb;
 }
 
@@ -411,6 +414,7 @@ static int server_accept(xqc_engine_t *eng, xqc_connection_t *conn, const xqc_ci
     quic_endpoint_t *ep = (quic_endpoint_t *)user_data;
     if (!ep) return -1;
     ep->conn = conn;
+    if (cid) memcpy(&ep->cid, cid, sizeof(ep->cid));
     ep->max_dgram_header_id = 0;
     xqc_conn_set_alp_user_data(conn, ep);
     xqc_datagram_set_user_data(conn, ep);
@@ -424,7 +428,7 @@ void ready_to_create_path_notify(const xqc_cid_t *cid, void *user_data) {
     LOG_INFO("[client-multipath] ready to create new path\n");
     while(ep->num_paths < ep->num_local_addrs * ep->num_peer_addrs && ep->num_paths < MAX_PATHS) {
         uint64_t new_path_id = 0;
-        int ret = xqc_conn_create_path(ep->engine, cid, &new_path_id, 0);
+        int ret = xqc_conn_create_path(ep->engine, cid, &new_path_id, quic_fec_path_standby(ep, ep->num_paths));
         if (ret == XQC_OK) {
             LOG_INFO("[client-multipath] created path %lu\n", new_path_id);
             ep->num_paths++;
@@ -710,6 +714,7 @@ quic_endpoint_t *quic_client_start(const quic_client_config_t *config) {
     xqc_conn_ssl_config_t conn_ssl_config = {0};
 
     ep->path_idx = 0;
+    quic_fec_init(ep, &config->fec, &conn_settings);
     ep->ep_conn_settings = conn_settings;
     ep->ep_ssl_config = conn_ssl_config;
 
@@ -814,6 +819,7 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
     ep->engine = xqc_engine_create(XQC_ENGINE_SERVER, &cfg, &ssl_cfg, &eng_cb, &trans_cb, ep);
     if (!ep->engine) { free(ep); return NULL; }
 
+    quic_fec_init(ep, &config->fec, &conn_settings);
     xqc_server_set_conn_settings(ep->engine, &conn_settings);
 
     xqc_app_proto_callbacks_t ap_cbs = {
@@ -865,7 +871,7 @@ int quic_send(quic_endpoint_t *ep, const uint8_t *data, size_t len) {
         LOG_DEBUG("[quic] packed dgram: msg_id=%u, frag_idx=0, max_frag_idx=0, wire_id=%u, full_dgram_id=%lu\n", 
             ep->msg_id - 1, dgram_header_id, (unsigned long)dgram_id);
 
-        return xqc_datagram_send(ep->conn, buf, len + DGRAM_HEADER_SIZE, &dgram_id, 1);
+        return xqc_datagram_send(ep->conn, buf, len + DGRAM_HEADER_SIZE, &dgram_id, quic_fec_dgram_qos(ep));
     } else if (ep->stream) {
         return (int)xqc_stream_send(ep->stream, (unsigned char *)data, len, 0);
     }
@@ -908,7 +914,7 @@ int quic_send_msg(quic_endpoint_t *ep, struct iovec *iov, size_t iov_size) {
         size_t sent_cnt = 0;
         size_t sent_bytes = 0;
         
-        return xqc_datagram_send_multiple(ep->conn, batch_iov, out_dgram_ids, iov_size, &sent_cnt, &sent_bytes, 1);
+        return xqc_datagram_send_multiple(ep->conn, batch_iov, out_dgram_ids, iov_size, &sent_cnt, &sent_bytes, quic_fec_dgram_qos(ep));
 
     } else if (ep->stream) {
         int ret = 0;
@@ -928,6 +934,8 @@ void quic_endpoint_stop(quic_endpoint_t *ep) {
     if (ep->rtp_encap) {
         quic_rtp_stop(ep);
     }
+
+    quic_fec_stop(ep);
 
     if (ep->engine && ep->conn) {
         xqc_conn_close(ep->engine, &ep->cid);

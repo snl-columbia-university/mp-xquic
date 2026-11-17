@@ -79,6 +79,9 @@ struct quic_endpoint {
     uint32_t rx_ssrc, rx_pkt_ctr; uint16_t rx_seq; int32_t rx_tag;
     FILE *rtp_check;
     uint64_t chk_match, chk_mismatch, chk_untagged, chk_noelem;
+
+    int fec_on;
+    uint32_t fec_standby_mask;  /* bit i: path index i is created as standby */
 };
 
 
@@ -114,6 +117,14 @@ static inline uint64_t pack_dgram_id(uint16_t msg_id, uint8_t seq, uint8_t max_s
 }
 
 typedef struct {
+    const char *scheme;         /* NULL / "" = FEC off; "xor", "rs" or "pkm"; both ends must match */
+    int block;                  /* source symbols per block; 0 = xquic default */
+    float rate;                 /* code rate; 0 = xquic default */
+    int repairs_on_standby;     /* 1 = send repairs on a standby path (XQC_FEC_MP_USE_STB) */
+    const char *standby_paths;  /* client: path indexes to create as standby, e.g. "3,4,5" */
+} quic_fec_config_t;
+
+typedef struct {
     const char *local_ips[4];
     size_t num_local_addrs;
     
@@ -141,6 +152,7 @@ typedef struct {
                                    the first 4 B of the app payload + a packet counter;
                                    the receiver checks it against the decrypted datagram and
                                    writes rtp_check_<client|server>.csv */
+    quic_fec_config_t fec;      /* FEC for datagrams; all zero = off */
 } quic_client_config_t;
 
 typedef struct {
@@ -171,6 +183,7 @@ typedef struct {
                                    the first 4 B of the app payload + a packet counter;
                                    the receiver checks it against the decrypted datagram and
                                    writes rtp_check_<client|server>.csv */
+    quic_fec_config_t fec;      /* FEC for datagrams; all zero = off */
 } quic_server_config_t;
 
 /**

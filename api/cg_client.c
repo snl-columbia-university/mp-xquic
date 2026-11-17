@@ -48,6 +48,7 @@ typedef struct {
     int rtp;
     int pdu_set;
     int rtp_tag;
+    quic_fec_config_t fec;
     int client_id;
 } app_config_t;
 
@@ -271,7 +272,14 @@ int main(int argc, char *argv[]) {
         .ack_timeout_ms  = get_env_or_default_double("APP_ACK_TIMEOUT_MS", 200.0),
         .rtp             = get_env_or_default_int("APP_RTP", 0),
         .pdu_set         = get_env_or_default_int("APP_PDU_SET", 0),
-        .rtp_tag         = get_env_or_default_int("APP_RTP_TAG", 0)
+        .rtp_tag         = get_env_or_default_int("APP_RTP_TAG", 0),
+        .fec = {
+            .scheme             = get_env_or_default("APP_FEC", ""),
+            .block              = get_env_or_default_int("APP_FEC_BLOCK", 0),
+            .rate               = (float)get_env_or_default_double("APP_FEC_RATE", 0.0),
+            .repairs_on_standby = get_env_or_default_int("APP_FEC_STANDBY", 0),
+            .standby_paths      = get_env_or_default("APP_STANDBY_PATHS", "")
+        }
     };
 
     static struct option long_options[] = {
@@ -280,7 +288,7 @@ int main(int argc, char *argv[]) {
     };
 
     int opt, option_index = 0;
-    while ((opt = getopt_long(argc, argv, "t:i:p:l:r:s:c:o:q:v:QF:Dw:T:RP:Gh", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "t:i:p:l:r:s:c:o:q:v:QF:Dw:T:RP:GE:h", long_options, &option_index)) != -1) {
         switch (opt) {
             case 't': cfg.trace_file = optarg; break;
             case 'i': cfg.client_id = atoi(optarg); break;
@@ -300,6 +308,7 @@ int main(int argc, char *argv[]) {
             case 'R': cfg.rtp = 1; break;
             case 'P': cfg.pdu_set = atoi(optarg); break;
             case 'G': cfg.rtp_tag = 1; break;
+            case 'E': cfg.fec.scheme = optarg; break;
             case 'h': print_usage(argv[0]); return EXIT_SUCCESS;
             default:  print_usage(argv[0]); return EXIT_FAILURE;
         }
@@ -329,6 +338,7 @@ int main(int argc, char *argv[]) {
         .enable_redundancy = 1,
         .sendmmsg_on = 1,
         .rtp_encap = cfg.rtp, .rtp_pdu_set = cfg.pdu_set, .rtp_tag = cfg.rtp_tag,
+        .fec = cfg.fec,
         .qlog = cfg.qlog,
         .user_data = NULL
     };

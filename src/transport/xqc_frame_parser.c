@@ -677,6 +677,7 @@ xqc_try_process_fec_decode(xqc_connection_t *conn, xqc_int_t block_id)
         return;
     }
 after_decoder:
+    conn->fec_ctl->fec_fin_ring[block_id % XQC_FEC_FIN_RING] = (uint64_t)block_id + 1;
     if (block_id > conn->fec_ctl->fec_max_fin_blk_id) {
         conn->fec_ctl->fec_max_fin_blk_id = block_id;
     }
