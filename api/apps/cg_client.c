@@ -5,12 +5,12 @@
 #include <string.h>
 #include <unistd.h>
 #include <time.h>
-#include "quic_api.h"
+#include "../quic_api.h"
 
 #define MAX_IPS 16
 
 // Logging levels: 0 = SILENT, 1 = SUMMARY/STATUS, 2 = FULL/VERBOSE
-static int g_verbose = 2; 
+static int g_verbose = 0; 
 #define LOG_PRINT(level, fmt, ...) do { if (g_verbose >= (level)) (printf(fmt, ##__VA_ARGS__), fflush(stdout)); } while(0)
 
 // config helpers
@@ -33,10 +33,11 @@ static double get_env_or_default_double(const char *env_var, double default_val)
 typedef struct {
     int verbose;
     const char *trace_file;
-    int local_port;
+    int port;
     const char *scheduler;
     const char *congestion;
     const char *qlog;
+    const char *frame_log;
     const char *frag_log;
     const char *raw_local_ips;
     const char *raw_peer_ips;
@@ -63,7 +64,7 @@ typedef struct __attribute__((packed)) {
     uint8_t status;
 } wire_ack_t;
 
-static quic_endpoint_t *g_server = NULL;
+static quic_endpoint_t *client = NULL;
 static FILE *frag_log = NULL;
 static volatile sig_atomic_t g_stop = 0;
 
@@ -85,7 +86,7 @@ static void flush_pending_acks(void) {
         iovs[i].iov_len = sizeof(wire_ack_t);
     }
 
-    int error = quic_send_msg(g_server, iovs, g_num_pending_acks);
+    int error = quic_send_msg(client, iovs, g_num_pending_acks);
     
     if (error < 0) {
         LOG_PRINT(1, "!!! [ACK BATCH SEND FAILED] error = %d\n", error);
@@ -130,7 +131,7 @@ static double get_time_ms(void) {
 }
 
 // recieve callback
-static void on_server_recv(const uint8_t *data, size_t len, void *user_data) {
+static void on_client_recv(const uint8_t *data, size_t len, void *user_data) {
     if (len >= sizeof(wire_frame_t)) {
         const wire_frame_t *frame = (const wire_frame_t *)data;
 
@@ -150,7 +151,7 @@ static void on_server_recv(const uint8_t *data, size_t len, void *user_data) {
             if (g_verbose >= 2) fflush(frag_log);
         }
 
-        if (g_server) {
+        if (client) {
             if (g_num_pending_acks == MAX_PENDING_ACKS) flush_pending_acks();
             g_pending_acks[g_num_pending_acks++] = ack;
         }
@@ -165,11 +166,12 @@ int main(int argc, char *argv[]) {
     app_config_t cfg = {
         .verbose         = get_env_or_default_int("APP_VERBOSE", 2),
         .trace_file      = get_env_or_default("APP_TRACE_FILE", "replay_trace.csv"),
-        .local_port      = get_env_or_default_int("APP_PEER_PORT", 8000), // Mapped to local_port
+        .port       = get_env_or_default_int("APP_PEER_PORT", 8000),
         .scheduler       = get_env_or_default("APP_SCHEDULER", "pmp"),
         .congestion      = get_env_or_default("APP_CONGESTION", "cubic"),
-        .frag_log        = get_env_or_default("APP_FRAG_LOG_FILE", "sfrags.csv"),
-        .qlog            = get_env_or_default("APP_QLOG_FILE", "server.qlog"),
+        .frame_log       = get_env_or_default("APP_FRAME_LOG_FILE", "cframes.csv"),
+        .frag_log        = get_env_or_default("APP_FRAG_LOG_FILE", "cfrags.csv"),
+        .qlog            = get_env_or_default("APP_QLOG_FILE", "client.qlog"),
         .raw_local_ips   = get_env_or_default("APP_LOCAL_IPS", "127.0.0.1"),
         .raw_peer_ips    = get_env_or_default("APP_PEER_IPS", "127.0.0.2,127.0.0.3"),
         .drop_on_unacked = get_env_or_default_int("APP_DROP_ON_UNACKED", 0),
@@ -197,11 +199,12 @@ int main(int argc, char *argv[]) {
         switch (opt) {
             case 't': cfg.trace_file = optarg; break;
             case 'i': cfg.client_id = atoi(optarg); break;
-            case 'p': cfg.local_port = atoi(optarg); break;
+            case 'p': cfg.port = atoi(optarg); break;
             case 'l': cfg.raw_local_ips = optarg; break;
             case 'r': cfg.raw_peer_ips = optarg; break;
             case 's': cfg.scheduler = optarg; break;
             case 'c': cfg.congestion = optarg; break;
+            case 'o': cfg.frame_log = optarg; break;
             case 'q': cfg.qlog = optarg; break;
             case 'v': cfg.verbose = atoi(optarg); break;
             case 'Q': cfg.verbose = 1; break;
@@ -223,25 +226,15 @@ int main(int argc, char *argv[]) {
     char local_bufs[MAX_IPS][64]; const char *local_ips[MAX_IPS];
     int num_local_addrs = parse_ip_list(cfg.raw_local_ips, local_bufs, local_ips);
 
-    if (num_local_addrs == 0) {
-        fprintf(stderr, "Error: Must specify at least one local IP address.\n");
-        return EXIT_FAILURE;
-    }
+    char peer_bufs[MAX_IPS][64]; const char *peer_ips[MAX_IPS];
+    int num_peer_addrs = parse_ip_list(cfg.raw_peer_ips, peer_bufs, peer_ips);
 
-    LOG_PRINT(1, "Starting QUIC ACK server on port %d...\n", cfg.local_port);
-    LOG_PRINT(1, "  Scheduler  : %s\n", cfg.scheduler);
-    LOG_PRINT(1, "  Congestion : %s\n", cfg.congestion);
-    LOG_PRINT(1, "  Local IPs  : ");
-    for (int i = 0; i < num_local_addrs; i++) {
-        LOG_PRINT(1, "%s ", local_ips[i]);
-    }
-    LOG_PRINT(1, "\n");
-
-    quic_server_config_t config = {
-        .listen_port = cfg.local_port,
+    quic_client_config_t config = {
+        .num_peer_addrs = num_peer_addrs,
         .num_local_addrs = num_local_addrs,
+        .peer_port = cfg.port,
         .enable_datagram = 1,
-        .recv_cb = on_server_recv,
+        .recv_cb = on_client_recv,
         .scheduler = cfg.scheduler,
         .congestion = cfg.congestion,
         .enable_redundancy = 1,
@@ -249,34 +242,24 @@ int main(int argc, char *argv[]) {
         .rtp_encap = cfg.rtp, .rtp_pdu_set = cfg.pdu_set, .rtp_tag = cfg.rtp_tag,
         .fec = cfg.fec,
         .qlog = cfg.qlog,
-        .user_data = &g_server
+        .user_data = NULL
     };
-
-    for (int i = 0; i < num_local_addrs; i++) {
-        config.local_ips[i] = local_ips[i];
-    }
+    for (int i = 0; i < num_peer_addrs; i++) config.peer_ips[i] = peer_ips[i];
+    for (int i = 0; i < num_local_addrs; i++) config.local_ips[i] = local_ips[i];
 
     frag_log = fopen(cfg.frag_log, "w");
     if (frag_log) fprintf(frag_log, "frame_id,frag_idx,recv_time_ms\n");
 
-    g_server = quic_server_start(&config);
-    if (!g_server) {
-        fprintf(stderr, "Failed to initialize QUIC server endpoint.\n");
-        return EXIT_FAILURE;
-    }
+    client = quic_client_start(&config);
+    if (!client) { return EXIT_FAILURE; }
 
-    LOG_PRINT(1, "Server running. Waiting for client datagrams...\n");
+    LOG_PRINT(1, "Client started. Connecting to server...\n");
 
-    signal(SIGINT, on_signal);
-    signal(SIGTERM, on_signal);
+    while (!is_connected(client)) { quic_endpoint_step(client); usleep(100); }
 
-    while (!g_stop) {
-        quic_endpoint_step(g_server);
-        flush_pending_acks();
-        usleep(100); 
-    }
+    while (is_connected(client)) { quic_endpoint_step(client); flush_pending_acks(); usleep(100); }
 
-    quic_endpoint_stop(g_server);
+    quic_endpoint_stop(client);
     if (frag_log) fclose(frag_log);
     return EXIT_SUCCESS;
 }
