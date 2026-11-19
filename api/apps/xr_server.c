@@ -10,7 +10,7 @@
 #define MAX_PENDING 4096
 
 // Logging levels: 0 = SILENT, 1 = SUMMARY/STATUS, 2 = FULL/VERBOSE
-static int g_verbose = 2; // Default to full logging
+static int g_verbose = 0; // Default to full logging
 #define LOG_PRINT(level, fmt, ...) do { if (g_verbose >= (level)) (printf(fmt, ##__VA_ARGS__), fflush(stdout)); } while(0)
 
 // --- Network Packet Structures ---

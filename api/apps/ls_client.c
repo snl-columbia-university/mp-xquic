@@ -11,7 +11,7 @@
 #define MAX_PAYLOAD_MPS 1200 // Max safe QUIC datagram payload bytes per fragment
 
 // Logging levels: 0 = SILENT, 1 = SUMMARY/STATUS, 2 = FULL/VERBOSE
-static int g_verbose = 2; 
+static int g_verbose = 0; 
 #define LOG_PRINT(level, fmt, ...) do { if (g_verbose >= (level)) (printf(fmt, ##__VA_ARGS__), fflush(stdout)); } while(0)
 
 // config helpers
