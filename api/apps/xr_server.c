@@ -4,7 +4,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <time.h>
-#include "quic_api.h"
+#include "../quic_api.h"
 
 #define MAX_IPS 16
 #define MAX_PENDING 4096

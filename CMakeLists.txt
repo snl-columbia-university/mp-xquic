@@ -493,45 +493,9 @@ target_link_libraries(
     -lm
 )
 
-# 3. Build api_server executable
-add_executable(
-    api_server
-    "api/api_server.c"
-)
-
-target_link_libraries(
-    api_server
-    PRIVATE
-    quic_api
-    xquic-static
-    ${SSL_LIB_PATH}
-    ${LIBEVENT_LIB}
-    -lpthread
-    -lstdc++
-    -lm
-)
-
-# 4. Build api_client executable
-add_executable(
-    api_client
-    "api/api_client.c"
-)
-
-target_link_libraries(
-    api_client
-    PRIVATE
-    quic_api
-    xquic-static
-    ${SSL_LIB_PATH}
-    ${LIBEVENT_LIB}
-    -lpthread
-    -lstdc++
-    -lm
-)
-
 add_executable(
     xr_server
-    "api/xr_server.c"
+    "api/apps/xr_server.c"
 )
 
 target_link_libraries(
@@ -549,11 +513,45 @@ target_link_libraries(
 # 4. Build api_client executable
 add_executable(
     xr_client
-    "api/xr_client.c"
+    "api/apps/xr_client.c"
 )
 
 target_link_libraries(
     xr_client
+    PRIVATE
+    quic_api
+    xquic-static
+    ${SSL_LIB_PATH}
+    ${LIBEVENT_LIB}
+    -lpthread
+    -lstdc++
+    -lm
+)
+
+add_executable(
+    ls_client
+    "api/apps/ls_client.c"
+)
+
+target_link_libraries(
+    ls_client
+    PRIVATE
+    quic_api
+    xquic-static
+    ${SSL_LIB_PATH}
+    ${LIBEVENT_LIB}
+    -lpthread
+    -lstdc++
+    -lm
+)
+
+add_executable(
+    ls_server
+    "api/apps/ls_server.c"
+)
+
+target_link_libraries(
+    ls_server
     PRIVATE
     quic_api
     xquic-static
@@ -566,7 +564,7 @@ target_link_libraries(
 
 add_executable(
     cg_client
-    "api/cg_client.c"
+    "api/apps/cg_client.c"
 )
 
 target_link_libraries(
@@ -583,7 +581,7 @@ target_link_libraries(
 
 add_executable(
     cg_server
-    "api/cg_server.c"
+    "api/apps/cg_server.c"
 )
 
 target_link_libraries(

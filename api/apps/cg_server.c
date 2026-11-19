@@ -4,7 +4,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <time.h>
-#include "quic_api.h"
+#include "../quic_api.h"
 
 #define MAX_IPS  16
 #define ACK_LOOKBACK 65536
@@ -34,12 +34,12 @@ static double get_env_or_default_double(const char *env_var, double default_val)
 typedef struct {
     int verbose;
     const char *trace_file;
-    int peer_port;
+    int port;
     const char *scheduler;
     const char *congestion;
+    const char *qlog;
     const char *frame_log;
     const char *frag_log;
-    const char *qlog;
     const char *raw_local_ips;
     const char *raw_peer_ips;
     int drop_on_unacked;
@@ -95,6 +95,8 @@ static FILE *frag_log = NULL;
 static int g_send_refused = 0;
 static int g_frames_sent = 0;
 static int g_frames_skipped = 0;
+
+static quic_endpoint_t *server = NULL;
 
 // helpers
 static double get_time_ms(void) {
@@ -187,7 +189,7 @@ static void print_rtt_summary(void) {
 }
 
 // recieve callback
-static void on_client_recv(const uint8_t *data, size_t len, void *user_data) {
+static void on_server_recv(const uint8_t *data, size_t len, void *user_data) {
     double recv_time = get_time_ms();
     if (len >= sizeof(wire_ack_t)) {
         const wire_ack_t *ack = (const wire_ack_t *)data;
@@ -259,12 +261,12 @@ int main(int argc, char *argv[]) {
     app_config_t cfg = {
         .verbose         = get_env_or_default_int("APP_VERBOSE", 2),
         .trace_file      = get_env_or_default("APP_TRACE_FILE", "replay_trace.csv"),
-        .peer_port       = get_env_or_default_int("APP_PEER_PORT", 8000),
+        .port       = get_env_or_default_int("APP_LOCAL_PORT", 8000),
         .scheduler       = get_env_or_default("APP_SCHEDULER", "pmp"),
         .congestion      = get_env_or_default("APP_CONGESTION", "cubic"),
-        .frame_log       = get_env_or_default("APP_FRAME_LOG_FILE", "cframes.csv"),
-        .frag_log        = get_env_or_default("APP_FRAG_LOG_FILE", "cfrags.csv"),
-        .qlog            = get_env_or_default("APP_QLOG_FILE", "client.qlog"),
+        .frame_log       = get_env_or_default("APP_FRAME_LOG_FILE", "sframes.csv"),
+        .frag_log        = get_env_or_default("APP_FRAG_LOG_FILE", "sfrags.csv"),
+        .qlog            = get_env_or_default("APP_QLOG_FILE", "server.qlog"),
         .raw_local_ips   = get_env_or_default("APP_LOCAL_IPS", "127.0.0.1"),
         .raw_peer_ips    = get_env_or_default("APP_PEER_IPS", "127.0.0.2,127.0.0.3"),
         .drop_on_unacked = get_env_or_default_int("APP_DROP_ON_UNACKED", 0),
@@ -292,7 +294,7 @@ int main(int argc, char *argv[]) {
         switch (opt) {
             case 't': cfg.trace_file = optarg; break;
             case 'i': cfg.client_id = atoi(optarg); break;
-            case 'p': cfg.peer_port = atoi(optarg); break;
+            case 'p': cfg.port = atoi(optarg); break;
             case 'l': cfg.raw_local_ips = optarg; break;
             case 'r': cfg.raw_peer_ips = optarg; break;
             case 's': cfg.scheduler = optarg; break;
@@ -319,20 +321,30 @@ int main(int argc, char *argv[]) {
     char local_bufs[MAX_IPS][64]; const char *local_ips[MAX_IPS];
     int num_local_addrs = parse_ip_list(cfg.raw_local_ips, local_bufs, local_ips);
 
-    char peer_bufs[MAX_IPS][64]; const char *peer_ips[MAX_IPS];
-    int num_peer_addrs = parse_ip_list(cfg.raw_peer_ips, peer_bufs, peer_ips);
+    if (num_local_addrs == 0) {
+        fprintf(stderr, "Error: Must specify at least one local IP address.\n");
+        return EXIT_FAILURE;
+    }
 
     frame_log = fopen(cfg.frame_log, "w");
     if (frame_log) fprintf(frame_log, "frame_id,send_time_ms,recv_time_ms,rtt_ms\n");
     frag_log = fopen(cfg.frag_log, "w");
     if (frag_log) fprintf(frag_log, "frame_id,frag_idx,send_time_ms,recv_time_ms,rtt_ms\n");
 
-    quic_client_config_t config = {
-        .num_peer_addrs = num_peer_addrs,
+    LOG_PRINT(1, "Starting QUIC ACK server on port %d...\n", cfg.port);
+    LOG_PRINT(1, "  Scheduler  : %s\n", cfg.scheduler);
+    LOG_PRINT(1, "  Congestion : %s\n", cfg.congestion);
+    LOG_PRINT(1, "  Local IPs  : ");
+    for (int i = 0; i < num_local_addrs; i++) {
+        LOG_PRINT(1, "%s ", local_ips[i]);
+    }
+    LOG_PRINT(1, "\n");
+
+    quic_server_config_t config = {
+        .listen_port = cfg.port,
         .num_local_addrs = num_local_addrs,
-        .peer_port = cfg.peer_port,
         .enable_datagram = 1,
-        .recv_cb = on_client_recv,
+        .recv_cb = on_server_recv,
         .scheduler = cfg.scheduler,
         .congestion = cfg.congestion,
         .enable_redundancy = 1,
@@ -340,15 +352,26 @@ int main(int argc, char *argv[]) {
         .rtp_encap = cfg.rtp, .rtp_pdu_set = cfg.pdu_set, .rtp_tag = cfg.rtp_tag,
         .fec = cfg.fec,
         .qlog = cfg.qlog,
-        .user_data = NULL
+        .user_data = &server
     };
-    for (int i = 0; i < num_peer_addrs; i++) config.peer_ips[i] = peer_ips[i];
-    for (int i = 0; i < num_local_addrs; i++) config.local_ips[i] = local_ips[i];
 
-    quic_endpoint_t *client = quic_client_start(&config);
-    if (!client) return EXIT_FAILURE;
+    for (int i = 0; i < num_local_addrs; i++) {
+        config.local_ips[i] = local_ips[i];
+    }
 
-    while (!is_connected(client)) { quic_endpoint_step(client); usleep(100); }
+    server = quic_server_start(&config);
+    if (!server) {
+        fprintf(stderr, "Failed to initialize QUIC server endpoint.\n");
+        return EXIT_FAILURE;
+    }
+
+    LOG_PRINT(1, "Server running.");
+
+    while (!is_connected(server)) { quic_endpoint_step(server); usleep(100); }
+
+    LOG_PRINT(1, "Client connected.");
+
+    sleep(1);
 
     FILE *f = fopen(cfg.trace_file, "r");
     if (!f) return EXIT_FAILURE;
@@ -389,7 +412,7 @@ int main(int argc, char *argv[]) {
         // wait until time to send frame
         while (1) {
             if (get_time_ms() >= target_time) break;
-            quic_endpoint_step(client);
+            quic_endpoint_step(server);
             usleep(100); 
         }
 
@@ -426,7 +449,7 @@ int main(int argc, char *argv[]) {
         frm->frame_complete_ms = 0.0;
         frm->frags = malloc(total_frags * sizeof(frag_record_t));
 
-        // send frags of frame in bartch
+        // send frags of frame in batch
         struct iovec *iovs = malloc(total_frags * sizeof(struct iovec));
         uint8_t *sendbufs = calloc(total_frags, 1500); 
 
@@ -455,7 +478,7 @@ int main(int argc, char *argv[]) {
         }
 
         // send all fragments in a single call
-        int error = quic_send_msg(client, iovs, total_frags);
+        int error = quic_send_msg(server, iovs, total_frags);
 
         if (error < 0) {
             // error
@@ -472,14 +495,14 @@ int main(int argc, char *argv[]) {
 
     double end_wait = get_time_ms() + 3000.0;
     while (get_time_ms() < end_wait) {
-        quic_endpoint_step(client);
+        quic_endpoint_step(server);
         usleep(100);
     }
 
     print_rtt_summary();
     free_frames();
 
-    quic_endpoint_stop(client);
+    quic_endpoint_stop(server);
     if (frame_log) fclose(frame_log);
     if (frag_log) fclose(frag_log);
     return EXIT_SUCCESS;
