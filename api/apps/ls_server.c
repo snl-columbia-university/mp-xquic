@@ -63,7 +63,7 @@ typedef struct __attribute__((packed)) {
     uint8_t status;
 } wire_ack_t;
 
-static quic_endpoint_t *g_server = NULL;
+static quic_endpoint_t *server = NULL;
 static FILE *frag_log = NULL;
 static volatile sig_atomic_t g_stop = 0;
 
@@ -85,7 +85,7 @@ static void flush_pending_acks(void) {
         iovs[i].iov_len = sizeof(wire_ack_t);
     }
 
-    int error = quic_send_msg(g_server, iovs, g_num_pending_acks);
+    int error = quic_send_msg(server, iovs, g_num_pending_acks);
     
     if (error < 0) {
         LOG_PRINT(1, "!!! [ACK BATCH SEND FAILED] error = %d\n", error);
@@ -150,7 +150,7 @@ static void on_server_recv(const uint8_t *data, size_t len, void *user_data) {
             if (g_verbose >= 2) fflush(frag_log);
         }
 
-        if (g_server) {
+        if (server) {
             if (g_num_pending_acks == MAX_PENDING_ACKS) flush_pending_acks();
             g_pending_acks[g_num_pending_acks++] = ack;
         }
@@ -249,7 +249,7 @@ int main(int argc, char *argv[]) {
         .rtp_encap = cfg.rtp, .rtp_pdu_set = cfg.pdu_set, .rtp_tag = cfg.rtp_tag,
         .fec = cfg.fec,
         .qlog = cfg.qlog,
-        .user_data = &g_server
+        .user_data = &server
     };
 
     for (int i = 0; i < num_local_addrs; i++) {
@@ -259,8 +259,8 @@ int main(int argc, char *argv[]) {
     frag_log = fopen(cfg.frag_log, "w");
     if (frag_log) fprintf(frag_log, "frame_id,frag_idx,recv_time_ms\n");
 
-    g_server = quic_server_start(&config);
-    if (!g_server) {
+    server = quic_server_start(&config);
+    if (!server) {
         fprintf(stderr, "Failed to initialize QUIC server endpoint.\n");
         return EXIT_FAILURE;
     }
@@ -270,13 +270,11 @@ int main(int argc, char *argv[]) {
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
 
-    while (!g_stop) {
-        quic_endpoint_step(g_server);
-        flush_pending_acks();
-        usleep(100); 
-    }
+    while (!is_connected(server)) { quic_endpoint_step(server); usleep(100); }
 
-    quic_endpoint_stop(g_server);
+    while (is_connected(server)) { quic_endpoint_step(server); flush_pending_acks(); usleep(100); }
+
+    quic_endpoint_stop(server);
     if (frag_log) fclose(frag_log);
     return EXIT_SUCCESS;
 }
