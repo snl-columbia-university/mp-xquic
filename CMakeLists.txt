@@ -20,6 +20,7 @@ option (XQC_ENABLE_XOR "enable fec scheme xor" OFF)
 option (XQC_ENABLE_RSC "enable fec scheme reed-solomon code" OFF)
 option (XQC_ENABLE_PKM "enable fec scheme packet mask" OFF)
 option (XQC_PING_ATTACK_PROTECT "enable ping attack protection" OFF)
+option (XQC_BUILD_APPS "build the simple_*/xr_*/ls_*/cg_* programs (host only)" ON)
 
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
@@ -105,7 +106,10 @@ if(ANDROID_ABI OR PLATFORM MATCHES "mac")
     endif()
 endif()
 
-if(NOT (CMAKE_C_COMPILER_ID MATCHES "MSVC" OR CMAKE_CXX_COMPILER_ID MATCHES "MSVC"))
+if(ANDROID)
+    # NDK clang raises a different warning set than the host gcc this tree is kept clean for.
+    set(CMAKE_C_FLAGS_OPTION "-Wno-unused -Wno-pointer-sign -Wno-format-security ")
+elseif(NOT (CMAKE_C_COMPILER_ID MATCHES "MSVC" OR CMAKE_CXX_COMPILER_ID MATCHES "MSVC"))
     set(CMAKE_C_FLAGS_OPTION "-Werror -Wno-unused -Wno-pointer-sign -Wno-format-security ")
 endif()
 
@@ -396,6 +400,9 @@ add_library(
     ${XQC_SOURCE}
 )
 
+# Android consumers link xquic-static: scripts/xquic.lds does not export the
+# custom schedulers quic_api needs, so libxquic.so is not usable there.
+if(NOT ANDROID)
 add_library(
     xquic
     SHARED
@@ -427,6 +434,7 @@ if(CMAKE_BUILD_TYPE STREQUAL MinSizeRel)
     add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
             COMMAND ${CMAKE_STRIP} libxquic.so)
 endif()
+endif() # NOT ANDROID
 
 # =====================================================================
 # Custom Applications: Proactive Multipath Simple Client & Server
@@ -437,7 +445,19 @@ find_library(LIBEVENT_LIB NAMES event)
 if(NOT LIBEVENT_LIB)
     message(FATAL_ERROR "Libevent (libevent) not found! Please install it (e.g., apt install libevent-dev)")
 endif()
+# Cross builds pass -DLIBEVENT_LIB=<libevent_core.a> and -DLIBEVENT_INC_PATH=<include dir>.
+if(LIBEVENT_INC_PATH)
+    include_directories(${LIBEVENT_INC_PATH})
+endif()
 
+# Bionic has pthread in libc and no libstdc++; the final link supplies the C++ runtime.
+if(ANDROID)
+    set(XQC_APP_SYS_LIBS -llog -lm)
+else()
+    set(XQC_APP_SYS_LIBS -lpthread -lstdc++ -lm)
+endif()
+
+if(XQC_BUILD_APPS)
 # 2. Add the Simple Client Target
 add_executable(
     simple_client
@@ -472,6 +492,7 @@ target_link_libraries(
     -lstdc++
     -lm
 )
+endif() # XQC_BUILD_APPS
 
 # 2. Build quic_api wrapper library
 add_library(
@@ -488,10 +509,10 @@ target_link_libraries(
     xquic-static
     ${SSL_LIB_PATH}
     ${LIBEVENT_LIB}
-    -lpthread
-    -lstdc++
-    -lm
+    ${XQC_APP_SYS_LIBS}
 )
+
+if(XQC_BUILD_APPS)
 
 add_executable(
     xr_server
@@ -595,3 +616,4 @@ target_link_libraries(
     -lstdc++
     -lm
 )
+endif() # XQC_BUILD_APPS
