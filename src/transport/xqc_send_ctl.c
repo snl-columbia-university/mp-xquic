@@ -154,6 +154,7 @@ xqc_send_ctl_create(xqc_path_ctx_t *path)
     xqc_timer_set(&send_ctl->path_timer_manager, XQC_TIMER_PATH_IDLE,
                   xqc_monotonic_timestamp(), xqc_path_get_idle_timeout(path) * 1000);
 
+    /*
     if (conn->conn_settings.cong_ctrl_callback.xqc_cong_ctl_init_bbr) {
         send_ctl->ctl_cong_callback = &conn->conn_settings.cong_ctrl_callback;
 
@@ -171,6 +172,21 @@ xqc_send_ctl_create(xqc_path_ctx_t *path)
 
     } else {
         send_ctl->ctl_cong_callback->xqc_cong_ctl_init(send_ctl->ctl_cong, send_ctl, conn->conn_settings.cc_params);
+    }
+    */
+
+    if (path->path_id % 2) {
+        send_ctl->ctl_cong_callback = &xqc_cubic_cb;
+        send_ctl->ctl_cong = xqc_pcalloc(conn->conn_pool, send_ctl->ctl_cong_callback->xqc_cong_ctl_size());
+        send_ctl->ctl_cong_callback->xqc_cong_ctl_init(send_ctl->ctl_cong, 
+                                                    send_ctl, 
+                                                    conn->conn_settings.cc_params);
+    } else {
+        send_ctl->ctl_cong_callback = &xqc_bbr_cb;
+        send_ctl->ctl_cong = xqc_pcalloc(conn->conn_pool, send_ctl->ctl_cong_callback->xqc_cong_ctl_size());
+        send_ctl->ctl_cong_callback->xqc_cong_ctl_init_bbr(send_ctl->ctl_cong,
+                                                        &send_ctl->sampler, 
+                                                        conn->conn_settings.cc_params);
     }
 
     xqc_pacing_init(&send_ctl->ctl_pacing, conn->conn_settings.pacing_on, send_ctl);
