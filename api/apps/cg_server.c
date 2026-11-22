@@ -478,7 +478,7 @@ int main(int argc, char *argv[]) {
         }
 
         // send all fragments in a single call
-        int error = quic_send_msg(server, iovs, total_frags);
+        int error = quic_send_msg(server, iovs, total_frags, (uint8_t)frame_type);
 
         if (error < 0) {
             // error

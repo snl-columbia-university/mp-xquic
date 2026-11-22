@@ -86,7 +86,7 @@ static void flush_pending_acks(void) {
         iovs[i].iov_len = sizeof(wire_ack_t);
     }
 
-    int error = quic_send_msg(client, iovs, g_num_pending_acks);
+    int error = quic_send_msg(client, iovs, g_num_pending_acks, 0);
     
     if (error < 0) {
         LOG_PRINT(1, "!!! [ACK BATCH SEND FAILED] error = %d\n", error);

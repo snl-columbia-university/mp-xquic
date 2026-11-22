@@ -391,7 +391,7 @@ int main(int argc, char *argv[]) {
         LOG_PRINT(2, ">>> [CLIENT SEND] hitId=%d | rel_offset=%.2fms | prep=%.2fms | srv_proc=%.2fms\n",
                   hit_id, rel_offset_ms, client_prep_ms, server_proc_ms);
 
-        quic_send(client, (const uint8_t *)&req, sizeof(req));
+        quic_send(client, (const uint8_t *)&req, sizeof(req), 0);
     }
 
     fclose(f);

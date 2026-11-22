@@ -108,12 +108,12 @@ void quic_log(quic_log_level_t level, const char *fmt, ...);
 
 int is_new_datagram_win(uint16_t id, uint16_t *max_dgram_header_id, uint64_t *seen);
 
-static inline uint64_t pack_dgram_id(uint16_t msg_id, uint8_t seq, uint8_t max_seq, uint16_t dgram_header_id) {
+static inline uint64_t pack_dgram_id(uint16_t msg_id, uint8_t seq, uint8_t max_seq, uint16_t dgram_header_id, uint8_t priority) {
     return ((uint64_t)msg_id     << 48) |
            ((uint64_t)seq        << 40) |
            ((uint64_t)max_seq    << 32) |
            ((uint64_t)dgram_header_id << 16) |
-           0x0000;
+           ((uint64_t)(priority & 0x1));
 }
 
 typedef struct {
@@ -199,12 +199,12 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config);
 /**
  * Send data over QUIC (Datagram or Stream depending on mode).
  */
-int quic_send(quic_endpoint_t *ep, const uint8_t *data, size_t len);
+int quic_send(quic_endpoint_t *ep, const uint8_t *data, size_t len, uint8_t priority);
 
 /**
  * Send batch data over QUIC (Datagram or Stream depending on mode).
  */
-int quic_send_msg(quic_endpoint_t *ep, struct iovec *iov, size_t iov_size);
+int quic_send_msg(quic_endpoint_t *ep, struct iovec *iov, size_t iov_size, uint8_t priority);
 
 /**
  * Stop endpoint event loop and free resources.

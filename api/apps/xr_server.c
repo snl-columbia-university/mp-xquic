@@ -193,7 +193,7 @@ int main(int argc, char *argv[]) {
         for (int i = 0; i < MAX_PENDING; i++) {
             if (g_pending_acks[i].active && now >= g_pending_acks[i].target_send_time_ms) {
                 if (g_server) {
-                    quic_send(g_server, (const uint8_t *)&g_pending_acks[i].ack, sizeof(hit_ack_t));
+                    quic_send(g_server, (const uint8_t *)&g_pending_acks[i].ack, sizeof(hit_ack_t), 0);
                 }
                 g_pending_acks[i].active = 0;
             }

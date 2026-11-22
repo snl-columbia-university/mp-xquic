@@ -369,9 +369,8 @@ xqc_log_TRA_FRAMES_PROCESSED_callback(xqc_log_t *log, const char *func, ...)
 
     case XQC_FRAME_NEW_TOKEN: {
         uint64_t length = va_arg(args, uint64_t);
-        unsigned char *token = va_arg(args, unsigned char *);
         xqc_qlog_implement(log, TRA_FRAMES_PROCESSED, func,
-                          "|type:%d|token_length:%ui|token:%s|", frame_type, length, token);
+                          "|type:%d|token_length:%ui|", frame_type, length);
         break;
     }
 

@@ -218,8 +218,9 @@ static void on_client_recv(const uint8_t *data, size_t len, void *user_data) {
                                     ack->frame_id, ack->frag_idx, frag_rtt);
 
                     if (frag_log) {
-                        fprintf(frag_log, "%d,%d,%.2f,%.2f,%.2f\n",
+                        fprintf(frag_log, "%d,%d,%d,%.2f,%.2f,%.2f\n",
                                 ack->frame_id,
+                                g_frames[i].frame_type,
                                 ack->frag_idx,
                                 g_frames[i].frags[ack->frag_idx].send_time_ms,
                                 recv_time,
@@ -236,8 +237,9 @@ static void on_client_recv(const uint8_t *data, size_t len, void *user_data) {
                                     ack->frame_id, frame_rtt);
 
                         if (frame_log) {
-                            fprintf(frame_log, "%d,%.2f,%.2f,%.2f\n",
+                            fprintf(frame_log, "%d,%d,%.2f,%.2f,%.2f\n",
                                     ack->frame_id,
+                                    g_frames[i].frame_type,
                                     g_frames[i].frame_first_send_ms,
                                     recv_time,
                                     frame_rtt);
@@ -323,9 +325,9 @@ int main(int argc, char *argv[]) {
     int num_peer_addrs = parse_ip_list(cfg.raw_peer_ips, peer_bufs, peer_ips);
 
     frame_log = fopen(cfg.frame_log, "w");
-    if (frame_log) fprintf(frame_log, "frame_id,send_time_ms,recv_time_ms,rtt_ms\n");
+    if (frame_log) fprintf(frame_log, "frame_id,frame_type,send_time_ms,recv_time_ms,rtt_ms\n");
     frag_log = fopen(cfg.frag_log, "w");
-    if (frag_log) fprintf(frag_log, "frame_id,frag_idx,send_time_ms,recv_time_ms,rtt_ms\n");
+    if (frag_log) fprintf(frag_log, "frame_id,frame_type,frag_idx,send_time_ms,recv_time_ms,rtt_ms\n");
 
     quic_client_config_t config = {
         .num_peer_addrs = num_peer_addrs,
@@ -426,7 +428,7 @@ int main(int argc, char *argv[]) {
         frm->frame_complete_ms = 0.0;
         frm->frags = malloc(total_frags * sizeof(frag_record_t));
 
-        // send frags of frame in bartch
+        // send frags of frame in batch
         struct iovec *iovs = malloc(total_frags * sizeof(struct iovec));
         uint8_t *sendbufs = calloc(total_frags, 1500); 
 
@@ -455,7 +457,7 @@ int main(int argc, char *argv[]) {
         }
 
         // send all fragments in a single call
-        int error = quic_send_msg(client, iovs, total_frags);
+        int error = quic_send_msg(client, iovs, total_frags, (uint8_t)frame_type);
 
         if (error < 0) {
             // error

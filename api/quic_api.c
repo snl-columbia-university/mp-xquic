@@ -684,6 +684,7 @@ quic_endpoint_t *quic_client_start(const quic_client_config_t *config) {
 
     ep->engine = xqc_engine_create(XQC_ENGINE_CLIENT, &cfg, &ssl_cfg, &eng_cb, &trans_cb, ep);
     if (!ep->engine) { free(ep); return NULL; }
+    //xqc_engine_set_log_level(ep->engine, XQC_LOG_DEBUG);
 
     xqc_app_proto_callbacks_t ap_cbs = {
         .conn_cbs = {
@@ -819,6 +820,7 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
     ep->engine = xqc_engine_create(XQC_ENGINE_SERVER, &cfg, &ssl_cfg, &eng_cb, &trans_cb, ep);
     if (!ep->engine) { free(ep); return NULL; }
 
+    //xqc_engine_set_log_level(ep->engine, XQC_LOG_DEBUG);
     quic_fec_init(ep, &config->fec, &conn_settings);
     xqc_server_set_conn_settings(ep->engine, &conn_settings);
 
@@ -853,16 +855,16 @@ quic_endpoint_t *quic_server_start(const quic_server_config_t *config) {
 }
 
 // External QUIC send endpoints
-int quic_send(quic_endpoint_t *ep, const uint8_t *data, size_t len) {
+int quic_send(quic_endpoint_t *ep, const uint8_t *data, size_t len, uint8_t priority) {
     if (!ep || !ep->conn) return -1;
-    if (ep->rtp_tag) return quic_rtp_send(ep, data, len);
+    if (ep->rtp_tag) return quic_rtp_send(ep, data, len, priority);
 
     if (ep->datagram_mode) {
         uint8_t buf[MAX_DGRAM_SIZE];
         if (len + DGRAM_HEADER_SIZE > sizeof(buf)) return -1;
 
         uint16_t dgram_header_id = ep->dgram_header_id++;
-        uint64_t dgram_id = pack_dgram_id(ep->msg_id++, 0, 0, dgram_header_id);
+        uint64_t dgram_id = pack_dgram_id(ep->msg_id++, 0, 0, dgram_header_id, priority);
 
         uint16_t net_header_id = htons(dgram_header_id);
         memcpy(buf, &net_header_id, DGRAM_HEADER_SIZE);
@@ -877,7 +879,7 @@ int quic_send(quic_endpoint_t *ep, const uint8_t *data, size_t len) {
     }
     return -1;
 }
-int quic_send_msg(quic_endpoint_t *ep, struct iovec *iov, size_t iov_size) {
+int quic_send_msg(quic_endpoint_t *ep, struct iovec *iov, size_t iov_size, uint8_t priority) {
     if (!ep || !ep->conn || !iov || iov_size == 0) return -1;
 
     if (ep->datagram_mode) {
@@ -898,7 +900,7 @@ int quic_send_msg(quic_endpoint_t *ep, struct iovec *iov, size_t iov_size) {
             if (len + DGRAM_HEADER_SIZE > MAX_DGRAM_SIZE) return -1;
 
             uint16_t dgram_header_id = ep->dgram_header_id++;
-            out_dgram_ids[i] = pack_dgram_id(batch_msg_id, (uint8_t)i, max_frag_idx, dgram_header_id);
+            out_dgram_ids[i] = pack_dgram_id(batch_msg_id, (uint8_t)i, max_frag_idx, dgram_header_id, priority);
 
             uint16_t net_wire_id = htons(dgram_header_id);
             memcpy(buf[i], &net_wire_id, DGRAM_HEADER_SIZE);

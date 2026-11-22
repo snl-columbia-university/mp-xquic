@@ -208,7 +208,7 @@ int quic_rtp_sendmmsg(quic_endpoint_t *ep, unsigned path_idx, struct mmsghdr *ms
     return sent;
 }
 
-int quic_rtp_send(quic_endpoint_t *ep, const uint8_t *data, size_t len) {
+int quic_rtp_send(quic_endpoint_t *ep, const uint8_t *data, size_t len, uint8_t priority) {
     if (!ep || !ep->conn) return -1;
 
     if (ep->datagram_mode) {
@@ -216,7 +216,7 @@ int quic_rtp_send(quic_endpoint_t *ep, const uint8_t *data, size_t len) {
         if (len + DGRAM_HEADER_SIZE > sizeof(buf)) return -1;
 
         uint16_t dgram_header_id = ep->dgram_header_id++;
-        uint64_t dgram_id = pack_dgram_id(ep->msg_id++, 0, 0, dgram_header_id);
+        uint64_t dgram_id = pack_dgram_id(ep->msg_id++, 0, 0, dgram_header_id, priority);
 
         uint16_t net_header_id = htons(dgram_header_id);
         memcpy(buf, &net_header_id, DGRAM_HEADER_SIZE);

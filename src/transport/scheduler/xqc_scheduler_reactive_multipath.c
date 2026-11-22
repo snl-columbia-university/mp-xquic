@@ -29,6 +29,9 @@ xqc_reactive_multipath_scheduler_get_path(void *scheduler,
     packet_out->po_experimental_redundancy_mask = 0;
     packet_out->po_experimental_redundancy_factor = 1;
 
+    uint64_t dgram_id = packet_out->po_dgram_id;
+    uint8_t prio = dgram_id & 0x1;
+
     xqc_list_head_t *pos, *next;
     xqc_path_ctx_t *path;
 
@@ -47,10 +50,11 @@ xqc_reactive_multipath_scheduler_get_path(void *scheduler,
     xqc_list_for_each_safe(pos, next, &conn->conn_paths_list) {
         path = xqc_list_entry(pos, xqc_path_ctx_t, path_list);
 
-        // skip paths that are inactive, frozen, or match the reinjection source
+        // skip paths that are inactive, frozen, match the reinjection source, or are wrong prio
         if (path->path_state != XQC_PATH_STATE_ACTIVE
             || path->app_path_status == XQC_APP_PATH_STATUS_FROZEN
-            || (reinject && (packet_out->po_path_id == path->path_id)))
+            || (reinject && (packet_out->po_path_id == path->path_id))
+            || ((packet_out->po_frame_types & XQC_FRAME_BIT_DATAGRAM) && ((path->path_id % 2) == prio)))
         {
             goto skip_path;
         }
@@ -74,8 +78,6 @@ xqc_reactive_multipath_scheduler_get_path(void *scheduler,
 
         // get path stats for this path
         uint64_t path_srtt = xqc_send_ctl_get_srtt(path->path_send_ctl);
-        float path_loss = xqc_send_ctl_get_spurious_loss_rate(path->path_send_ctl);
-        float path_retrans = xqc_send_ctl_get_retrans_rate(path->path_send_ctl);
         
         // select path based on some combo of stats
         if (best_path == NULL || path_srtt < min_srtt) {

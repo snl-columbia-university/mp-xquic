@@ -23,7 +23,7 @@ ssize_t quic_rtp_sendmsg(quic_endpoint_t *ep, unsigned path_idx, struct msghdr *
 int quic_rtp_sendmmsg(quic_endpoint_t *ep, unsigned path_idx, struct mmsghdr *msgs, unsigned int vlen);
 
 /*replacement for quic_send in quic api when rtp enabled*/
-int quic_rtp_send(quic_endpoint_t *ep, const uint8_t *data, size_t len);
+int quic_rtp_send(quic_endpoint_t *ep, const uint8_t *data, size_t len, uint8_t priority);
 /*replacement for datagram_read_notify in quic api when rtp enabled*/
 void quic_rtp_datagram_read_notify(xqc_connection_t *conn, void *user_data, const void *data,
                                    size_t data_len, uint64_t flags);
